@@ -1127,6 +1127,15 @@ export function App() {
     }
   };
 
+  const refreshUserScriptInventory = async () => {
+    const result = await run(() => call<SettingsResult>("refresh_user_script_inventory"));
+    if (result) {
+      setSettings(result);
+      setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+    }
+    return result;
+  };
+
   const installMarketScript = async (id: string) => {
     const result = await run(() => call<ScriptMarketResult>("install_market_script", { id }));
     if (result) {
@@ -1142,6 +1151,7 @@ export function App() {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
       showResultNotice(t("本地脚本"), result);
+      await refreshUserScriptInventory();
     }
   };
 
@@ -1154,6 +1164,7 @@ export function App() {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
       showResultNotice(t("本地脚本"), result);
+      await refreshUserScriptInventory();
     }
   };
 
@@ -1849,6 +1860,7 @@ export function App() {
     if (next === "userScripts") {
       await refreshSettings(true);
       await refreshScriptMarket(true);
+      await refreshUserScriptInventory();
     }
     // 推荐页面已隐藏，暂不触发推荐内容拉取
     // if (next === "recommendations") await refreshAds(true);
@@ -2986,6 +2998,7 @@ export function App() {
       syncLiveContextEntries,
       refreshAds,
       refreshScriptMarket,
+      refreshUserScriptInventory,
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
@@ -3374,6 +3387,7 @@ type Actions = {
   syncLiveContextEntries: (settings: BackendSettings, silent?: boolean) => Promise<LiveContextEntriesResult | null>;
   refreshAds: () => Promise<void>;
   refreshScriptMarket: () => Promise<void>;
+  refreshUserScriptInventory: () => Promise<SettingsResult | null>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
