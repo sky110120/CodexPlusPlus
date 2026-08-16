@@ -56,6 +56,34 @@ fn write_rollout(path: &Path, provider: &str, thread_id: &str, cwd: &str) {
     fs::write(path, format!("{first}\n{event}\n")).unwrap();
 }
 
+fn write_subagent_rollout(
+    path: &Path,
+    provider: &str,
+    thread_id: &str,
+    parent_thread_id: &str,
+    cwd: &str,
+) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let first = json!({
+        "type": "session_meta",
+        "payload": {
+            "id": thread_id,
+            "model_provider": provider,
+            "cwd": cwd,
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": parent_thread_id,
+                        "depth": 1
+                    }
+                }
+            }
+        }
+    });
+    let event = json!({"type": "event_msg", "payload": {"type": "user_message"}});
+    fs::write(path, format!("{first}\n{event}\n")).unwrap();
+}
+
 fn session_index_line(id: &str, title: &str) -> String {
     json!({
         "id": id,
@@ -541,6 +569,233 @@ fn provider_sync_updates_new_codex_sqlite_directory_db() {
     );
     let backup_dir = result.backup_dir.unwrap();
     assert!(backup_dir.join("db/sqlite/codex-dev.db").exists());
+}
+
+#[test]
+fn provider_sync_keeps_subagent_threads_out_of_full_history_repair() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+
+    let parent_rollout = home.join("sessions/2026/rollout-parent.jsonl");
+    let existing_child_rollout = home.join("sessions/2026/rollout-child-existing.jsonl");
+    let missing_child_rollout = home.join("sessions/2026/rollout-child-missing.jsonl");
+    write_rollout(
+        &parent_rollout,
+        "openai",
+        "parent-thread",
+        "C:/workspace",
+    );
+    write_subagent_rollout(
+        &existing_child_rollout,
+        "openai",
+        "child-existing",
+        "parent-thread",
+        "C:/child-new",
+    );
+    write_subagent_rollout(
+        &missing_child_rollout,
+        "openai",
+        "child-missing",
+        "parent-thread",
+        "C:/child-new",
+    );
+
+    let state_db = home.join("state_5.sqlite");
+    let db = Connection::open(&state_db).unwrap();
+    db.execute(
+        "CREATE TABLE threads (
+            id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER,
+            cwd TEXT, title TEXT, rollout_path TEXT, source TEXT, created_at_ms INTEGER,
+            updated_at_ms INTEGER, thread_source TEXT, git_branch TEXT
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (
+            'parent-thread', 'openai', 0, 0, 'C:/old-parent', 'Parent', ?1,
+            'cli', 100000, 200000, 'user', 'main'
+        )",
+        [parent_rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    let subagent_source = json!({
+        "subagent": {
+            "thread_spawn": {
+                "parent_thread_id": "parent-thread",
+                "depth": 1
+            }
+        }
+    })
+    .to_string();
+    for (thread_id, rollout_path) in [
+        ("child-existing", &existing_child_rollout),
+        ("child-missing", &missing_child_rollout),
+    ] {
+        let source = if thread_id == "child-existing" {
+            subagent_source.as_str()
+        } else {
+            "cli"
+        };
+        db.execute(
+            "INSERT INTO threads VALUES (
+                ?1, 'openai', 0, 0, 'C:/old-child', ?1, ?2, ?3,
+                100000, 200000, 'user', 'main'
+            )",
+            (
+                thread_id,
+                rollout_path.to_string_lossy().to_string(),
+                source,
+            ),
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    let catalog_db = sqlite_dir.join("codex-dev.db");
+    create_local_thread_catalog_db(&catalog_db, &[("child-existing", "openai")]);
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.changed_session_files, 1);
+    assert_eq!(result.sqlite_catalog_rows_inserted, 1);
+    for rollout in [&existing_child_rollout, &missing_child_rollout] {
+        let first: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(rollout)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["payload"]["model_provider"], "openai");
+    }
+
+    let db = Connection::open(&state_db).unwrap();
+    let parent: (String, i64, String) = db
+        .query_row(
+            "SELECT model_provider, has_user_event, cwd FROM threads WHERE id = 'parent-thread'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        parent,
+        ("apigather".to_string(), 1, "C:/workspace".to_string())
+    );
+    for child_id in ["child-existing", "child-missing"] {
+        let child: (String, i64, String) = db
+            .query_row(
+                "SELECT model_provider, has_user_event, cwd FROM threads WHERE id = ?1",
+                [child_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            child,
+            ("openai".to_string(), 0, "C:/old-child".to_string())
+        );
+    }
+
+    let catalog = Connection::open(&catalog_db).unwrap();
+    let existing_provider: String = catalog
+        .query_row(
+            "SELECT model_provider FROM local_thread_catalog WHERE thread_id = 'child-existing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(existing_provider, "openai");
+    let missing_child_count: i64 = catalog
+        .query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 'child-missing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing_child_count, 0);
+    let parent_provider: String = catalog
+        .query_row(
+            "SELECT model_provider FROM local_thread_catalog WHERE thread_id = 'parent-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_provider, "apigather");
+}
+
+#[test]
+fn provider_sync_uses_spawn_edges_to_exclude_legacy_subagent_rollouts() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    let parent_rollout = home.join("sessions/2026/rollout-parent.jsonl");
+    let child_rollout = home.join("sessions/2026/rollout-legacy-child.jsonl");
+    write_rollout(&parent_rollout, "openai", "parent-thread", "C:/workspace");
+    write_rollout(&child_rollout, "openai", "legacy-child", "C:/child-new");
+
+    let state_db = home.join("state_5.sqlite");
+    let db = Connection::open(&state_db).unwrap();
+    db.execute(
+        "CREATE TABLE threads (
+            id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER,
+            cwd TEXT, source TEXT
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent-thread', 'openai', 0, 0, 'C:/old', 'cli')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('legacy-child', 'openai', 0, 0, 'C:/old-child', 'cli')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES ('parent-thread', 'legacy-child')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.changed_session_files, 1);
+    let first: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&child_rollout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["payload"]["model_provider"], "openai");
+    let db = Connection::open(&state_db).unwrap();
+    let child: (String, i64, String) = db
+        .query_row(
+            "SELECT model_provider, has_user_event, cwd FROM threads WHERE id = 'legacy-child'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        child,
+        ("openai".to_string(), 0, "C:/old-child".to_string())
+    );
 }
 
 #[test]

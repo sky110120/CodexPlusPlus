@@ -126,6 +126,7 @@ struct SessionChanges {
     changes: Vec<SessionChange>,
     skipped_locked_rollout_files: Vec<PathBuf>,
     encrypted_content_counts: HashMap<String, usize>,
+    subagent_thread_ids: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -523,7 +524,11 @@ pub fn run_provider_sync_with_target(
         );
     }
     let sync_result = (|| -> anyhow::Result<ProviderSyncResult> {
-        let collected = collect_session_changes(&home, &target_provider)?;
+        let sqlite_paths = provider_sync_db_paths(&home);
+        let mut subagent_thread_ids = load_subagent_thread_ids(&sqlite_paths)?;
+        let collected =
+            collect_session_changes(&home, &target_provider, &subagent_thread_ids)?;
+        subagent_thread_ids.extend(collected.subagent_thread_ids.iter().cloned());
         let encrypted_content_warning =
             build_encrypted_content_warning(&collected.encrypted_content_counts, &target_provider);
         let rewrite_changes = collected
@@ -546,15 +551,18 @@ pub fn run_provider_sync_with_target(
             .filter_map(|change| Some((change.thread_id.clone()?, change.cwd.clone()?)))
             .filter(|(thread_id, _)| !projectless_thread_ids.contains(thread_id))
             .collect::<HashMap<_, _>>();
-        let sqlite_paths = provider_sync_db_paths(&home);
         let sqlite_update_count = count_sqlite_updates_for_paths(
             &sqlite_paths,
             &target_provider,
             &thread_ids_with_user_events,
             &cwd_by_thread_id,
+            &subagent_thread_ids,
         )?;
-        let catalog_insert_count =
-            count_missing_local_thread_catalog_rows(&sqlite_paths, &target_provider)?;
+        let catalog_insert_count = count_missing_local_thread_catalog_rows(
+            &sqlite_paths,
+            &target_provider,
+            &subagent_thread_ids,
+        )?;
         let global_state_update_count =
             count_global_state_updates(&home.join(".codex-global-state.json"))?;
         if rewrite_changes.is_empty()
@@ -582,10 +590,14 @@ pub fn run_provider_sync_with_target(
                 &target_provider,
                 &thread_ids_with_user_events,
                 &cwd_by_thread_id,
+                &subagent_thread_ids,
             )?;
             let mut sqlite_updates = sqlite_updates;
-            sqlite_updates.catalog_insert_rows =
-                repair_missing_local_thread_catalog_rows(&sqlite_paths, &target_provider)?;
+            sqlite_updates.catalog_insert_rows = repair_missing_local_thread_catalog_rows(
+                &sqlite_paths,
+                &target_provider,
+                &subagent_thread_ids,
+            )?;
             let updated_workspace_roots =
                 apply_global_state_update(&home.join(".codex-global-state.json"))?;
             prune_backups(&home)?;
@@ -666,6 +678,41 @@ fn provider_sync_db_paths(home: &Path) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn load_subagent_thread_ids(paths: &[PathBuf]) -> anyhow::Result<HashSet<String>> {
+    let mut thread_ids = HashSet::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let db = Connection::open(path)?;
+        let edge_columns = table_columns(&db, "thread_spawn_edges")?;
+        if edge_columns.contains("child_thread_id") {
+            let mut stmt = db.prepare(
+                "SELECT child_thread_id FROM thread_spawn_edges WHERE COALESCE(child_thread_id, '') <> ''",
+            )?;
+            for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                thread_ids.insert(item?);
+            }
+        }
+
+        let thread_columns = table_columns(&db, "threads")?;
+        if thread_columns.contains("id") && thread_columns.contains("source") {
+            let mut stmt = db.prepare(
+                "SELECT id, COALESCE(source, '') FROM threads WHERE COALESCE(id, '') <> ''",
+            )?;
+            for item in stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (thread_id, source) = item?;
+                if source_text_is_subagent(&source) {
+                    thread_ids.insert(thread_id);
+                }
+            }
+        }
+    }
+    Ok(thread_ids)
 }
 
 pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTargetList {
@@ -862,7 +909,11 @@ fn release_lock(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result<SessionChanges> {
+fn collect_session_changes(
+    home: &Path,
+    target_provider: &str,
+    subagent_thread_ids: &HashSet<String>,
+) -> anyhow::Result<SessionChanges> {
     let mut collected = SessionChanges::default();
     for path in rollout_files(home)? {
         let text = match fs::read_to_string(&path) {
@@ -875,6 +926,19 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
         };
         let rewrite = rewrite_rollout_session_meta_providers(&text, target_provider)?;
         if rewrite.session_meta_count == 0 {
+            continue;
+        }
+        if rollout_session_meta_is_subagent(&text) {
+            if let Some(thread_id) = &rewrite.thread_id {
+                collected.subagent_thread_ids.insert(thread_id.clone());
+            }
+            continue;
+        }
+        if rewrite
+            .thread_id
+            .as_ref()
+            .is_some_and(|thread_id| subagent_thread_ids.contains(thread_id))
+        {
             continue;
         }
         let has_user_event = text.contains("\"user_message\"") || text.contains("\"user_input\"");
@@ -900,6 +964,31 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
         });
     }
     Ok(collected)
+}
+
+fn rollout_session_meta_is_subagent(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        record.get("type").and_then(Value::as_str) == Some("session_meta")
+            && record
+                .get("payload")
+                .and_then(|payload| payload.get("source"))
+                .is_some_and(source_value_is_subagent)
+    })
+}
+
+fn source_value_is_subagent(source: &Value) -> bool {
+    source
+        .as_object()
+        .is_some_and(|source| source.contains_key("subagent"))
+}
+
+fn source_text_is_subagent(source: &str) -> bool {
+    serde_json::from_str::<Value>(source)
+        .map(|source| source_value_is_subagent(&source))
+        .unwrap_or_else(|_| source.contains("\"subagent\""))
 }
 
 fn remote_control_rollout_for_thread(
@@ -1963,11 +2052,33 @@ fn rollout_thread_provider_state(text: &str) -> Option<(String, HashSet<String>)
     thread_id.map(|thread_id| (thread_id, providers))
 }
 
+fn provider_update_thread_ids(
+    db: &Connection,
+    table: &str,
+    id_column: &str,
+    target_provider: &str,
+    subagent_thread_ids: &HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        "SELECT {id_column} FROM {table} WHERE COALESCE({id_column}, '') <> '' AND COALESCE(model_provider, '') <> ?1"
+    );
+    let mut stmt = db.prepare(&sql)?;
+    let mut thread_ids = Vec::new();
+    for item in stmt.query_map([target_provider], |row| row.get::<_, String>(0))? {
+        let thread_id = item?;
+        if !subagent_thread_ids.contains(&thread_id) {
+            thread_ids.push(thread_id);
+        }
+    }
+    Ok(thread_ids)
+}
+
 fn count_sqlite_updates(
     path: &Path,
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -1976,22 +2087,31 @@ fn count_sqlite_updates(
     let columns = table_columns(&db, "threads")?;
     let catalog_columns = table_columns(&db, "local_thread_catalog")?;
     let mut total = 0;
-    if columns.contains("model_provider") {
-        total += db.query_row(
-            "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
+    if columns.contains("id") && columns.contains("model_provider") {
+        total += provider_update_thread_ids(
+            &db,
+            "threads",
+            "id",
+            target_provider,
+            subagent_thread_ids,
+        )?
+        .len();
     }
-    if catalog_columns.contains("model_provider") {
-        total += db.query_row(
-            "SELECT COUNT(*) FROM local_thread_catalog WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
+    if catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider") {
+        total += provider_update_thread_ids(
+            &db,
+            "local_thread_catalog",
+            "thread_id",
+            target_provider,
+            subagent_thread_ids,
+        )?
+        .len();
     }
     if columns.contains("has_user_event") {
         for thread_id in user_event_thread_ids {
+            if subagent_thread_ids.contains(thread_id) {
+                continue;
+            }
             total += db.query_row(
                 "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
                 [thread_id],
@@ -2001,6 +2121,9 @@ fn count_sqlite_updates(
     }
     if columns.contains("cwd") {
         for (thread_id, cwd) in cwd_by_thread_id {
+            if subagent_thread_ids.contains(thread_id) {
+                continue;
+            }
             total += db.query_row(
                 "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(cwd, '') <> ?2",
                 (thread_id, cwd),
@@ -2016,6 +2139,7 @@ fn count_sqlite_updates_for_paths(
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
     let mut total = 0;
     for path in paths {
@@ -2024,6 +2148,7 @@ fn count_sqlite_updates_for_paths(
             target_provider,
             user_event_thread_ids,
             cwd_by_thread_id,
+            subagent_thread_ids,
         )?;
     }
     Ok(total)
@@ -2034,6 +2159,7 @@ fn apply_sqlite_update(
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     if !path.exists() {
         return Ok(SqliteUpdateCounts::default());
@@ -2046,20 +2172,39 @@ fn apply_sqlite_update(
     }
     let tx = db.transaction()?;
     let mut counts = SqliteUpdateCounts::default();
-    if columns.contains("model_provider") {
-        counts.provider_rows += tx.execute(
-            "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-        )?;
+    if columns.contains("id") && columns.contains("model_provider") {
+        for thread_id in provider_update_thread_ids(
+            &tx,
+            "threads",
+            "id",
+            target_provider,
+            subagent_thread_ids,
+        )? {
+            counts.provider_rows += tx.execute(
+                "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
+                (target_provider, thread_id),
+            )?;
+        }
     }
-    if catalog_columns.contains("model_provider") {
-        counts.provider_rows += tx.execute(
-            "UPDATE local_thread_catalog SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-        )?;
+    if catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider") {
+        for thread_id in provider_update_thread_ids(
+            &tx,
+            "local_thread_catalog",
+            "thread_id",
+            target_provider,
+            subagent_thread_ids,
+        )? {
+            counts.provider_rows += tx.execute(
+                "UPDATE local_thread_catalog SET model_provider = ?1 WHERE thread_id = ?2 AND COALESCE(model_provider, '') <> ?1",
+                (target_provider, thread_id),
+            )?;
+        }
     }
     if columns.contains("has_user_event") {
         for thread_id in user_event_thread_ids {
+            if subagent_thread_ids.contains(thread_id) {
+                continue;
+            }
             counts.user_event_rows += tx.execute(
                 "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
                 [thread_id],
@@ -2068,6 +2213,9 @@ fn apply_sqlite_update(
     }
     if columns.contains("cwd") {
         for (thread_id, cwd) in cwd_by_thread_id {
+            if subagent_thread_ids.contains(thread_id) {
+                continue;
+            }
             counts.cwd_rows += tx.execute(
                 "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
                 (cwd, thread_id),
@@ -2083,6 +2231,7 @@ fn apply_sqlite_update_for_paths(
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     let mut total = SqliteUpdateCounts::default();
     for path in paths {
@@ -2091,6 +2240,7 @@ fn apply_sqlite_update_for_paths(
             target_provider,
             user_event_thread_ids,
             cwd_by_thread_id,
+            subagent_thread_ids,
         )?);
     }
     Ok(total)
@@ -2214,8 +2364,14 @@ fn apply_remote_control_catalog_updates(
 fn count_missing_local_thread_catalog_rows(
     paths: &[PathBuf],
     target_provider: &str,
+    subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
-    let source_threads = collect_catalog_repair_threads(paths, target_provider, None)?;
+    let source_threads = collect_catalog_repair_threads(
+        paths,
+        target_provider,
+        None,
+        Some(subagent_thread_ids),
+    )?;
     if source_threads.is_empty() {
         return Ok(0);
     }
@@ -2244,8 +2400,15 @@ fn count_missing_local_thread_catalog_rows(
 fn repair_missing_local_thread_catalog_rows(
     paths: &[PathBuf],
     target_provider: &str,
+    subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
-    repair_missing_local_thread_catalog_rows_filtered(paths, target_provider, None, true)
+    repair_missing_local_thread_catalog_rows_filtered(
+        paths,
+        target_provider,
+        None,
+        true,
+        Some(subagent_thread_ids),
+    )
 }
 
 fn repair_missing_local_thread_catalog_rows_for_threads(
@@ -2258,6 +2421,7 @@ fn repair_missing_local_thread_catalog_rows_for_threads(
         target_provider,
         Some(thread_ids),
         false,
+        None,
     )
 }
 
@@ -2266,8 +2430,14 @@ fn repair_missing_local_thread_catalog_rows_filtered(
     target_provider: &str,
     thread_ids: Option<&HashSet<String>>,
     update_full_sync_state: bool,
+    subagent_thread_ids: Option<&HashSet<String>>,
 ) -> anyhow::Result<usize> {
-    let source_threads = collect_catalog_repair_threads(paths, target_provider, thread_ids)?;
+    let source_threads = collect_catalog_repair_threads(
+        paths,
+        target_provider,
+        thread_ids,
+        subagent_thread_ids,
+    )?;
     if source_threads.is_empty() {
         return Ok(0);
     }
@@ -2337,6 +2507,7 @@ fn collect_catalog_repair_threads(
     paths: &[PathBuf],
     target_provider: &str,
     thread_ids: Option<&HashSet<String>>,
+    subagent_thread_ids: Option<&HashSet<String>>,
 ) -> anyhow::Result<HashMap<String, CatalogRepairThread>> {
     let mut threads = HashMap::new();
     for path in paths {
@@ -2382,6 +2553,12 @@ fn collect_catalog_repair_threads(
         })?;
         for item in rows {
             let thread = item?;
+            if source_text_is_subagent(&thread.source_kind)
+                || subagent_thread_ids
+                    .is_some_and(|thread_ids| thread_ids.contains(&thread.id))
+            {
+                continue;
+            }
             if thread_ids.is_some_and(|thread_ids| !thread_ids.contains(&thread.id)) {
                 continue;
             }
