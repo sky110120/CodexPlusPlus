@@ -1834,6 +1834,7 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
         }
     });
 
+    std::thread::sleep(Duration::from_millis(1));
     let result = run_remote_control_session_finalization_for_thread_with_target(
         Some(&home),
         "mobile",
