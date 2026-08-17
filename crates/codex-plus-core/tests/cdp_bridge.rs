@@ -1707,21 +1707,6 @@ fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
 }
 
 #[test]
-fn injection_script_clears_project_state_when_moving_to_projectless() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("async function clearThreadWorkspaceHints"));
-    assert!(script.contains("async function clearThreadWritableRoots"));
-    assert!(script.contains("async function clearThreadProjectlessOutputDirectories"));
-    assert!(script.contains("thread-workspace-root-hints"));
-    assert!(script.contains("thread-writable-roots"));
-    assert!(script.contains("thread-projectless-output-directories"));
-    assert!(script.contains("await clearThreadWorkspaceHints(ref)"));
-    assert!(script.contains("await clearThreadWritableRoots(ref)"));
-    assert!(script.contains("await clearThreadProjectlessOutputDirectories(ref)"));
-}
-
-#[test]
 fn injection_script_applies_fast_service_tier_contract() {
     let cases = run_service_tier_contract_harness();
 

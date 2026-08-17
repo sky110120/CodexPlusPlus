@@ -113,13 +113,6 @@ pub trait BridgeDataService: Send + Sync {
         &self,
         title: String,
     ) -> anyhow::Result<Option<SessionRef>>;
-    async fn move_thread_workspace(
-        &self,
-        session: SessionRef,
-        target_cwd: String,
-    ) -> anyhow::Result<Value>;
-    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value>;
-    async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value>;
     async fn recover_remote_control_session(&self, _thread_id: String) -> anyhow::Result<Value> {
         anyhow::bail!("Remote Control session recovery is unavailable")
     }
@@ -250,26 +243,6 @@ pub async fn handle_bridge_request(
                 .unwrap_or_default()
                 .to_string();
             archived_thread_value(ctx.data.find_archived_thread_by_title(title).await)
-        }
-        "/move-thread-workspace" => {
-            let target_cwd = payload
-                .get("target_cwd")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            ctx.data
-                .move_thread_workspace(session_from_payload(&payload), target_cwd)
-                .await
-        }
-        "/thread-sort-key" => {
-            ctx.data
-                .thread_sort_key(session_from_payload(&payload))
-                .await
-        }
-        "/thread-sort-keys" => {
-            ctx.data
-                .thread_sort_keys(sessions_from_payload(&payload))
-                .await
         }
         "/remote-control-session/recover" => {
             let thread_id = payload
