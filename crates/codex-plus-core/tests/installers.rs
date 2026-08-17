@@ -111,6 +111,10 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
         .expect("read macOS DMG packaging script");
 
     assert!(script.contains("ln -s /Applications \"$STAGE/Applications\""));
+    assert!(script.contains("mktemp -d \"$DIST/.dmg-tmp.XXXXXX\""));
+    assert!(script.contains("MAX_ATTEMPTS=\"${DMG_CREATE_MAX_ATTEMPTS:-3}\""));
+    assert!(script.contains("sleep \"$((attempt * 2))\""));
+    assert!(script.contains("mv -f \"$DMG_TMP\" \"$DMG\""));
 }
 
 #[test]

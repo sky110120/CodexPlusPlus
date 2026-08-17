@@ -2,76 +2,12 @@ name: Release assets
 
 on:
   release:
-    types: [published]
+    types: [created]
 
 permissions:
   contents: write
 
 jobs:
-  windows-installer:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install NSIS
-        run: choco install nsis -y
-
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
-
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
-
-      - name: Build binaries
-        run: cargo build --release
-
-      - name: Stage Windows app files
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
-          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
-          Copy-Item target/release/codex-plus-plus-manager.exe dist/windows/app/
-
-      - name: Build Windows zip asset
-        shell: pwsh
-        run: |
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
-          New-Item -ItemType Directory -Force dist/windows | Out-Null
-          Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
-
-      - name: Build Windows installer
-        shell: pwsh
-        run: |
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
-          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $makensis)) {
-            $makensis = "makensis"
-          }
-          Push-Location scripts/installer/windows
-          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
-          Pop-Location
-
-      - name: Upload Windows installer
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: |
-            dist/windows/*.exe
-            dist/windows/*.zip
-
   macos-dmg:
     name: macOS DMG (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -79,9 +15,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
           - arch: arm64
             runner: macos-14
             target: aarch64-apple-darwin
@@ -89,7 +22,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.target_commitish }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -146,15 +79,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name }}
+          draft: true
           files: |
             dist/macos/*.dmg
             dist/macos/*.zip
 
   latest-json:
     name: Upload static latest.json
+    if: ${{ !github.event.release.draft }}
     runs-on: ubuntu-latest
     needs:
-      - windows-installer
       - macos-dmg
     steps:
       - name: Generate latest.json

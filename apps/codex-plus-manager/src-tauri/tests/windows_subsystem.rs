@@ -175,7 +175,7 @@ fn macos_packager_hides_silent_launcher_but_not_manager() {
 }
 
 #[test]
-fn github_release_workflow_builds_separate_macos_x64_and_arm64_dmgs() {
+fn github_release_workflow_builds_only_macos_arm64_dmg() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = manifest_dir
         .parent()
@@ -185,10 +185,14 @@ fn github_release_workflow_builds_separate_macos_x64_and_arm64_dmgs() {
         .join(".github/workflows/release-assets.yml");
     let workflow = std::fs::read_to_string(&workflow).expect("read release assets workflow");
 
-    assert!(workflow.contains("macos-15-intel"));
-    assert!(workflow.contains("x86_64-apple-darwin"));
+    assert!(!workflow.contains("windows-latest"));
+    assert!(!workflow.contains("macos-15-intel"));
+    assert!(!workflow.contains("x86_64-apple-darwin"));
     assert!(workflow.contains("macos-14"));
     assert!(workflow.contains("aarch64-apple-darwin"));
+    assert!(workflow.contains("types: [created]"));
+    assert!(workflow.contains("draft: true"));
+    assert!(!workflow.contains("types: [published]"));
     assert!(workflow.contains("package-dmg.sh \"$VERSION\" \"${{ matrix.arch }}\""));
     assert!(workflow.contains("target/${{ matrix.target }}/release"));
 }
@@ -204,9 +208,31 @@ fn github_release_workflow_uploads_static_latest_json() {
         .join(".github/workflows/release-assets.yml");
     let workflow = std::fs::read_to_string(&workflow).expect("read release assets workflow");
 
+    assert!(workflow.contains("if: ${{ !github.event.release.draft }}"));
     assert!(workflow.contains("latest-json:"));
     assert!(workflow.contains("latest.json"));
     assert!(workflow.contains("gh release upload \"$TAG\" latest.json --clobber"));
+}
+
+#[test]
+fn pr_build_workflow_builds_only_macos_arm64_and_keeps_checks() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .join(".github/workflows/pr-build.yml");
+    let workflow = std::fs::read_to_string(&workflow).expect("read PR build workflow");
+
+    assert!(!workflow.contains("windows-latest"));
+    assert!(!workflow.contains("macos-15-intel"));
+    assert!(!workflow.contains("x86_64-apple-darwin"));
+    assert!(workflow.contains("macos-14"));
+    assert!(workflow.contains("aarch64-apple-darwin"));
+    assert!(workflow.contains("npm test"));
+    assert!(workflow.contains("npm run check"));
+    assert!(workflow.contains("cargo test --workspace"));
 }
 
 #[test]

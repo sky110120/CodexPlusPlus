@@ -1,5 +1,26 @@
 use sha2::{Digest, Sha256};
 
+#[test]
+fn compile_time_injected_scripts_are_pinned_to_lf() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let gitattributes =
+        std::fs::read_to_string(root.join(".gitattributes")).expect("read .gitattributes");
+    assert!(gitattributes.contains("assets/inject/*.js text eol=lf"));
+
+    for path in [
+        "assets/inject/renderer-inject.js",
+        "assets/inject/pet-real-mouse-inject.js",
+        "assets/inject/stepwise-inject.js",
+    ] {
+        let bytes = std::fs::read(root.join(path))
+            .unwrap_or_else(|error| panic!("failed to read injected script {path}: {error}"));
+        assert!(
+            !bytes.windows(2).any(|window| window == b"\r\n"),
+            "injected script must stay LF on every checkout: {path}"
+        );
+    }
+}
+
 fn assert_sha256(relative_path: &str, expected: &str) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

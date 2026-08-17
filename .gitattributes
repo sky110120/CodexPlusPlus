@@ -7,6 +7,10 @@
 *.sh text eol=lf
 .github/workflows/*.yml text eol=lf
 
+# Compile-time injected scripts are embedded with include_str! and must stay LF
+# even on Windows checkouts so source contract tests remain deterministic.
+assets/inject/*.js text eol=lf
+
 # Keep every byte-exact upstream theme asset stable on all checkout platforms.
 assets/inject/upstream/**/*.js text eol=lf
 assets/inject/upstream/**/*.css text eol=lf

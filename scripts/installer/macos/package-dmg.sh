@@ -14,6 +14,9 @@ ICON_ICNS="$DIST/$ICON_NAME"
 
 rm -rf "$DIST"
 mkdir -p "$STAGE"
+DMG_TMP_DIR="$(mktemp -d "$DIST/.dmg-tmp.XXXXXX")"
+trap 'rm -rf "$DMG_TMP_DIR"' EXIT
+DMG_TMP="$DMG_TMP_DIR/CodexPlusPlus-${VERSION}-macos-${ARCH}.dmg"
 
 prepare_icon() {
   local iconset="$DIST/codex-plus-plus.iconset"
@@ -145,5 +148,21 @@ verify_app "$STAGE/Codex++ 管理工具.app"
 
 ln -s /Applications "$STAGE/Applications"
 
-hdiutil create -volname "Codex++" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+MAX_ATTEMPTS="${DMG_CREATE_MAX_ATTEMPTS:-3}"
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  if hdiutil create -volname "Codex++" -srcfolder "$STAGE" -ov -format UDZO "$DMG_TMP"; then
+    break
+  fi
+  status=$?
+  rm -f "$DMG_TMP"
+  if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+    echo "error: hdiutil create failed after $MAX_ATTEMPTS attempts" >&2
+    exit "$status"
+  fi
+  echo "hdiutil create failed (attempt $attempt/$MAX_ATTEMPTS); retrying..." >&2
+  sleep "$((attempt * 2))"
+done
+mv -f "$DMG_TMP" "$DMG"
 echo "$DMG"
