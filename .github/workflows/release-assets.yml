@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to create/update as a draft, e.g. v1.2.49
+        description: Release tag to create/update as a draft, e.g. v1.2.48
         required: true
-        default: v1.2.49
+        default: v1.2.48
       target:
         description: Branch or commit to build and tag
         required: false
