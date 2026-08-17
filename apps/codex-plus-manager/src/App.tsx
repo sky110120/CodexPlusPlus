@@ -283,6 +283,7 @@ export type RelayProfile = {
   protocol: RelayProtocol;
   relayMode: RelayMode;
   officialMixApiKey: boolean;
+  hideOfficialUsageAlert: boolean;
   testModel: string;
   configContents: string;
   authContents: string;
@@ -609,6 +610,7 @@ type RemoveEnvConflictsResult = CommandResult<{
 
 type ProviderSyncPayload = {
   syncStatus?: string;
+  syncMessage?: string;
   targetProvider?: string;
   changedSessionFiles?: number;
   skippedLockedRolloutFiles?: string[];
@@ -617,9 +619,11 @@ type ProviderSyncPayload = {
   sqliteUserEventRowsUpdated?: number;
   sqliteCwdRowsUpdated?: number;
   sqliteCatalogRowsInserted?: number;
+  sqliteCatalogRowsRemoved?: number;
   updatedWorkspaceRoots?: number;
   prunedSessionIndexEntries?: number;
   encryptedContentWarning?: string | null;
+  backupDir?: string | null;
 };
 
 type SessionIndexCleanupCandidate = {
@@ -747,17 +751,22 @@ function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>)
   const changed = result.changedSessionFiles ?? 0;
   const rows = result.sqliteRowsUpdated ?? 0;
   const insertedCatalogRows = result.sqliteCatalogRowsInserted ?? 0;
+  const removedCatalogRows = result.sqliteCatalogRowsRemoved ?? 0;
   const pruned = result.prunedSessionIndexEntries ?? 0;
   const target = result.targetProvider || t("当前 provider");
   const skipped = result.skippedLockedRolloutFiles?.length ?? 0;
   const prunedText = pruned ? tf("，清理 {0} 条失效任务索引", [pruned]) : "";
   const skippedText = skipped ? tf("，跳过 {0} 个占用文件", [skipped]) : "";
   const catalogText = insertedCatalogRows ? tf("，补齐 {0} 条侧边栏索引", [insertedCatalogRows]) : "";
-  return tf("已同步到 {0}：修复 {1} 个会话文件，更新 {2} 行数据库索引{3}{4}{5}。", [
+  const catalogCleanupText = removedCatalogRows
+    ? tf("，清理 {0} 条误列的子任务侧边栏索引", [removedCatalogRows])
+    : "";
+  return tf("已同步到 {0}：修复 {1} 个会话文件，更新 {2} 行数据库索引{3}{4}{5}{6}。", [
     target,
     changed,
     rows,
     catalogText,
+    catalogCleanupText,
     prunedText,
     skippedText,
   ]);
@@ -898,6 +907,7 @@ const defaultSettings: BackendSettings = {
       protocol: "responses",
       relayMode: "official",
       officialMixApiKey: false,
+      hideOfficialUsageAlert: false,
       testModel: "",
       configContents: "",
       authContents: "",
@@ -2250,9 +2260,17 @@ export function App() {
         call<CommandResult<ProviderSyncPayload>>("sync_providers_now", { targetProvider }),
       );
       if (result) {
-        let finalResult = result;
+        const syncSucceeded = isSuccessStatus(result.status) && result.syncStatus === "synced";
+        let finalResult =
+          isSuccessStatus(result.status) && !syncSucceeded
+            ? {
+                ...result,
+                status: "failed",
+                message: result.syncMessage || t("历史会话修复失败，请查看错误提示后重试。"),
+              }
+            : result;
         let cleanupFailure: { status: Status; message: string } | null = null;
-        if (isSuccessStatus(result.status)) {
+        if (syncSucceeded) {
           const preview = await run(() =>
             call<CommandResult<SessionIndexCleanupPreviewPayload>>("preview_session_index_cleanup"),
           );
@@ -2297,7 +2315,7 @@ export function App() {
               : completion.result.message),
           result: completion.result,
         });
-        if (targetProvider) {
+        if (targetProvider && syncSucceeded) {
           const next = {
             ...settingsForm,
             providerSyncLastSelectedProvider: targetProvider,
@@ -6871,6 +6889,21 @@ function RelayProfileEditor({
             <p className="field-hint">{t("当前继承公共配置；修改后将为该供应商保存独立设置。")}</p>
           ) : null}
         </Field>
+        {profile.relayMode === "official" ? (
+          <Field className="relay-field-official-usage-alert" label={t("官方登录")}>
+            <label className="inline-check">
+              <input
+                checked={profile.hideOfficialUsageAlert}
+                onChange={(event) => updateDraft({ hideOfficialUsageAlert: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>{t("关闭官方低额度提示")}</span>
+            </label>
+            <p className="field-hint">
+              {t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}
+            </p>
+          </Field>
+        ) : null}
         <div className="relay-advanced-toggle">
           <Button
             aria-expanded={showAdvanced}
@@ -9055,6 +9088,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             protocol: "responses" as RelayProtocol,
             relayMode: "official" as RelayMode,
             officialMixApiKey: false,
+            hideOfficialUsageAlert: false,
             testModel: "",
             configContents: "",
             authContents: "",
@@ -9135,6 +9169,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         protocol: "responses",
         relayMode: "aggregate",
         officialMixApiKey: false,
+        hideOfficialUsageAlert: false,
         testModel: profile.testModel || "",
         configContents: "",
         authContents: "",
@@ -9165,6 +9200,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
     relayMode,
     officialMixApiKey,
+    hideOfficialUsageAlert: profile.hideOfficialUsageAlert === true,
     testModel: profile.testModel || "",
     configContents: relayMode === "official" && !officialMixApiKey ? "" : profile.configContents || "",
     authContents: relayMode === "official" && !officialMixApiKey ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "",
@@ -9899,6 +9935,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     protocol: "responses" as RelayProtocol,
     relayMode: "official" as RelayMode,
     officialMixApiKey: false,
+    hideOfficialUsageAlert: false,
     testModel: "",
     configContents: "",
     authContents: "",
@@ -9936,6 +9973,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       protocol: "responses",
       relayMode: "aggregate",
       officialMixApiKey: false,
+      hideOfficialUsageAlert: false,
       testModel: "",
       configContents: "",
       authContents: "",
@@ -10075,6 +10113,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     protocol: "responses",
     relayMode: "aggregate",
     officialMixApiKey: false,
+    hideOfficialUsageAlert: false,
     configContents: "",
     authContents: "",
     sub2apiEnabled: false,
