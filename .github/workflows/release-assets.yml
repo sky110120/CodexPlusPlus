@@ -1,14 +1,25 @@
 name: Release assets
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create/update as a draft, e.g. v1.2.49
+        required: true
+        default: v1.2.49
+      target:
+        description: Branch or commit to build and tag
+        required: false
+        default: my-dev
   release:
-    types: [created]
+    types: [published]
 
 permissions:
   contents: write
 
 jobs:
   macos-dmg:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     name: macOS DMG (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -22,7 +33,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.target_commitish }}
+          ref: ${{ inputs.target || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -47,15 +58,19 @@ jobs:
 
       - name: Build macOS DMG
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
           VERSION="${VERSION#V}"
+          VERSION="${VERSION//\//-}"
           BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
 
       - name: Build macOS zip asset
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
           VERSION="${VERSION#V}"
+          VERSION="${VERSION//\//-}"
           mkdir -p dist/macos/app-${{ matrix.arch }}
           cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
           cp "target/${{ matrix.target }}/release/codex-plus-plus-manager" "dist/macos/app-${{ matrix.arch }}/"
@@ -78,7 +93,8 @@ jobs:
       - name: Upload macOS DMG
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ inputs.target }}
           draft: true
           files: |
             dist/macos/*.dmg
@@ -86,10 +102,8 @@ jobs:
 
   latest-json:
     name: Upload static latest.json
-    if: ${{ !github.event.release.draft }}
+    if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
-    needs:
-      - macos-dmg
     steps:
       - name: Generate latest.json
         env:
