@@ -369,6 +369,21 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
     thread_id: &str,
     target_provider: &str,
 ) -> ProviderSyncResult {
+    run_remote_control_session_finalization_for_thread_with_target_with_before_apply_hook(
+        codex_home,
+        thread_id,
+        target_provider,
+        None,
+    )
+}
+
+#[doc(hidden)]
+pub fn run_remote_control_session_finalization_for_thread_with_target_with_before_apply_hook(
+    codex_home: Option<&Path>,
+    thread_id: &str,
+    target_provider: &str,
+    before_apply_hook: Option<Box<dyn FnOnce() + Send>>,
+) -> ProviderSyncResult {
     let thread_id = thread_id.trim();
     let target_provider = target_provider.trim();
     if thread_id.is_empty()
@@ -452,6 +467,9 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             .cloned()
             .collect::<Vec<_>>();
         let backup_dir = create_backup(&home, target_provider, &rewrite_changes)?;
+        if let Some(hook) = before_apply_hook {
+            hook();
+        }
         let applied = apply_session_changes(&rewrite_changes)?;
         if !rollout_file_matches_provider(&rollout_path, thread_id, target_provider)? {
             let mut deferred = result(

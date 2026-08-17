@@ -5,6 +5,7 @@ use codex_plus_data::{
     run_provider_sync_with_target,
     run_remote_control_session_catalog_recovery_for_thread_with_target,
     run_remote_control_session_finalization_for_thread_with_target,
+    run_remote_control_session_finalization_for_thread_with_target_with_before_apply_hook,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -12,7 +13,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 static CODEX_HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1806,41 +1807,26 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
     let catalog_db = sqlite_dir.join("codex-dev.db");
     create_local_thread_catalog_db(&catalog_db, &[]);
 
-    let backup_root = home.join("backups_state/provider-sync");
-    let watched_rollout = rollout.clone();
-    let writer = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let backup_started = backup_root.exists()
-                && fs::read_dir(&backup_root)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false);
-            if backup_started {
+    let rollout_for_hook = rollout.clone();
+    let result =
+        run_remote_control_session_finalization_for_thread_with_target_with_before_apply_hook(
+            Some(&home),
+            "mobile",
+            "custom",
+            Some(Box::new(move || {
+                use std::io::Write as _;
                 let mut file = fs::OpenOptions::new()
                     .append(true)
-                    .open(&watched_rollout)
+                    .open(&rollout_for_hook)
                     .unwrap();
-                use std::io::Write as _;
                 writeln!(
                     file,
                     "{}",
                     json!({"type": "event_msg", "payload": {"type": "task_started"}})
                 )
                 .unwrap();
-                return;
-            }
-            assert!(Instant::now() < deadline, "backup did not start in time");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    std::thread::sleep(Duration::from_millis(1));
-    let result = run_remote_control_session_finalization_for_thread_with_target(
-        Some(&home),
-        "mobile",
-        "custom",
-    );
-    writer.join().unwrap();
+            })),
+        );
 
     assert_eq!(result.status, ProviderSyncStatus::Skipped);
     assert_eq!(result.changed_session_files, 0);
