@@ -1463,6 +1463,36 @@ async fn launch_lifecycle_cleans_helper_when_launch_fails_after_helper_started()
 }
 
 #[tokio::test]
+async fn launch_reuses_helper_when_port_is_already_listening() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone());
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let helper_port = listener.local_addr().unwrap().port();
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap().clone();
+    assert!(!events.contains(&format!("start-helper:{helper_port}")));
+    assert!(!events.contains(&format!("shutdown-helper:{helper_port}")));
+    assert!(events.contains(&format!("launch:9229")));
+}
+
+#[tokio::test]
 async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");

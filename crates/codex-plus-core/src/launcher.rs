@@ -345,8 +345,18 @@ where
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            hooks.start_helper(helper_port).await?;
-            helper_started = true;
+            if crate::watcher::cdp_listening(helper_port) {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.reuse_existing_helper",
+                    serde_json::json!({
+                        "debug_port": debug_port,
+                        "helper_port": helper_port
+                    }),
+                );
+            } else {
+                hooks.start_helper(helper_port).await?;
+                helper_started = true;
+            }
         }
 
         let launch = hooks

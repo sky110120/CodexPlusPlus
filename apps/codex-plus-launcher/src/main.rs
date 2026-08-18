@@ -44,6 +44,22 @@ impl LauncherHooks {
     }
 }
 
+struct ExistingActivation {
+    hooks: LauncherHooks,
+    helper_port: u16,
+    helper_started: bool,
+}
+
+impl ExistingActivation {
+    async fn keep_alive_until_codex_exit(self, debug_port: u16) {
+        if !self.helper_started {
+            return;
+        }
+        wait_for_activated_codex_exit(debug_port).await;
+        self.hooks.shutdown_helper(self.helper_port).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -86,7 +102,7 @@ async fn launcher_main(
         return Ok(());
     }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
+        let activation = activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
             status: "running".to_string(),
             message: "Existing Codex instance activated".to_string(),
@@ -97,6 +113,9 @@ async fn launcher_main(
                 .app_dir
                 .map(|path| path.to_string_lossy().to_string()),
         })?;
+        activation
+            .keep_alive_until_codex_exit(options.debug_port)
+            .await;
         return Ok(());
     };
     tokio::spawn(async {
@@ -190,7 +209,7 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
+async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<ExistingActivation> {
     let hooks = LauncherHooks::default();
     let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
@@ -218,10 +237,12 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
+    let mut helper_started = false;
     if settings.enhancements_enabled
         && !codex_plus_core::watcher::cdp_listening(helper_port)
     {
         hooks.start_helper(helper_port).await?;
+        helper_started = true;
     }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     let mut activated = false;
@@ -263,7 +284,28 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
         }),
     );
-    launch_result.map(|_| ())
+    launch_result.map(|_| ExistingActivation {
+        hooks,
+        helper_port,
+        helper_started,
+    })
+}
+
+async fn wait_for_activated_codex_exit(debug_port: u16) {
+    let mut empty_streak = 0u32;
+    loop {
+        let has_codex_process = !codex_plus_core::watcher::find_codex_processes().is_empty();
+        let cdp_listening = codex_plus_core::watcher::cdp_listening(debug_port);
+        if !(has_codex_process || cdp_listening) {
+            empty_streak = empty_streak.saturating_add(1);
+            if empty_streak >= 3 {
+                break;
+            }
+        } else {
+            empty_streak = 0;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 fn should_finalize_pending_remote_control_recovery(
@@ -1094,6 +1136,15 @@ mod tests {
         assert!(
             body[recovery..launch].contains("hooks.run_remote_control_session_recovery().await?")
         );
+    }
+
+    #[test]
+    fn existing_launcher_keeps_missing_helper_alive_until_codex_exit() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("struct ExistingActivation"));
+        assert!(source.contains("keep_alive_until_codex_exit"));
+        assert!(source.contains("wait_for_activated_codex_exit"));
+        assert!(source.contains("shutdown_helper(self.helper_port)"));
     }
 
     #[test]

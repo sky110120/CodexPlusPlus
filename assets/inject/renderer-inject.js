@@ -9349,6 +9349,18 @@
     }
   }
 
+  function scheduleStartupDeferredScanCatchup() {
+    if (window.__codexSessionDeleteStartupCatchupStarted) return;
+    window.__codexSessionDeleteStartupCatchupStarted = true;
+    const runCatchup = () => {
+      if (!document.getElementById(codexPlusMenuId)) runScanStep(scanLightweight);
+      runScanStep(scanDeferred);
+    };
+    [100, 300, 700, 1500, 2500, 4000, 6000, 9000, 12000, 15000].forEach((delay) => {
+      window.setTimeout(runCatchup, delay);
+    });
+  }
+
   function scan() {
     runScanStep(scanLightweight);
     window.setTimeout(() => runScanStep(scanDeferred), 0);
@@ -9433,6 +9445,7 @@
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
   scan();
+  scheduleStartupDeferredScanCatchup();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {
