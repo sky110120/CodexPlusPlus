@@ -26,6 +26,8 @@ const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 
+const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 10;
+
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
 /// Callers that install a custom [`crate::routes::BridgeContext`] should configure this callback
@@ -989,7 +991,16 @@ impl LaunchHooks for DefaultLaunchHooks {
                 && crate::cdp::endpoint_available(debug_port);
             if !launcher_target_alive(has_codex_process, cdp_available) {
                 empty_streak = empty_streak.saturating_add(1);
-                if empty_streak >= 3 {
+                if empty_streak >= CODEX_EXIT_EMPTY_STREAK_LIMIT {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.codex_exit_confirmed",
+                        serde_json::json!({
+                            "debug_port": debug_port,
+                            "empty_streak": empty_streak,
+                            "has_codex_process": has_codex_process,
+                            "cdp_available": cdp_available
+                        }),
+                    );
                     break;
                 }
             } else {

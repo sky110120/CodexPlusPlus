@@ -298,7 +298,16 @@ async fn wait_for_activated_codex_exit(debug_port: u16) {
         let cdp_listening = codex_plus_core::watcher::cdp_listening(debug_port);
         if !(has_codex_process || cdp_listening) {
             empty_streak = empty_streak.saturating_add(1);
-            if empty_streak >= 3 {
+            if empty_streak >= 10 {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.activated_codex_exit_confirmed",
+                    json!({
+                        "debug_port": debug_port,
+                        "empty_streak": empty_streak,
+                        "has_codex_process": has_codex_process,
+                        "cdp_listening": cdp_listening
+                    }),
+                );
                 break;
             }
         } else {
