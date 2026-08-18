@@ -26,7 +26,7 @@ const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 
-const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 5;
+const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 1;
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
