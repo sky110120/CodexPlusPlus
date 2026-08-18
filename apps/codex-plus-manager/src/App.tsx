@@ -826,7 +826,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink },
   { id: "userScripts", label: t("脚本市场"), icon: FileCode2 },
-  { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
+  // 推荐内容菜单暂时隐藏，保留代码便于恢复
+  // { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
   { id: "maintenance", label: t("安装维护"), icon: Wrench },
   { id: "about", label: t("关于"), icon: Info },
   { id: "settings", label: t("设置"), icon: Settings },
@@ -844,7 +845,12 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
   {
     label: t("系统"),
-    routes: ["recommendations", "maintenance", "about", "settings"],
+    routes: [
+      // "recommendations",
+      "maintenance",
+      "about",
+      "settings",
+    ],
     placement: "bottom",
   },
 ];
@@ -1844,7 +1850,8 @@ export function App() {
       await refreshSettings(true);
       await refreshScriptMarket(true);
     }
-    if (next === "recommendations") await refreshAds(true);
+    // 推荐页面已隐藏，暂不触发推荐内容拉取
+    // if (next === "recommendations") await refreshAds(true);
     if (next === "about") {
       await refreshOverview(true);
       await refreshLogs(true);
