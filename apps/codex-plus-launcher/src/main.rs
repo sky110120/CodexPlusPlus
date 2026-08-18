@@ -218,7 +218,9 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
-    if settings.enhancements_enabled {
+    if settings.enhancements_enabled
+        && !codex_plus_core::watcher::cdp_listening(helper_port)
+    {
         hooks.start_helper(helper_port).await?;
     }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
