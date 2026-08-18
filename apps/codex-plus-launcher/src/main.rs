@@ -298,7 +298,7 @@ async fn wait_for_activated_codex_exit(debug_port: u16) {
         let cdp_listening = codex_plus_core::watcher::cdp_listening(debug_port);
         if !(has_codex_process || cdp_listening) {
             empty_streak = empty_streak.saturating_add(1);
-            if empty_streak >= 10 {
+            if empty_streak >= 5 {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                     "launcher.activated_codex_exit_confirmed",
                     json!({
@@ -406,6 +406,10 @@ impl LaunchHooks for LauncherHooks {
 
     fn select_helper_port(&self, requested: u16) -> u16 {
         self.core.select_helper_port(requested)
+    }
+
+    fn helper_available(&self, helper_port: u16) -> bool {
+        self.core.helper_available(helper_port)
     }
 
     async fn load_settings(&self) -> anyhow::Result<codex_plus_core::settings::BackendSettings> {

@@ -1469,9 +1469,8 @@ async fn launch_reuses_helper_when_port_is_already_listening() {
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone());
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let helper_port = listener.local_addr().unwrap().port();
+    let hooks = FakeHooks::new(events.clone()).with_helper_available();
+    let helper_port = 57321;
 
     let handle = launch_and_inject_with_hooks(
         LaunchOptions {
@@ -1807,6 +1806,7 @@ struct FakeHooks {
     provider_sync_unsupported: bool,
     plugin_marketplace_error: Option<String>,
     has_pending_remote_control_session_recoveries: bool,
+    helper_available: bool,
 }
 
 impl FakeHooks {
@@ -1824,6 +1824,7 @@ impl FakeHooks {
             provider_sync_unsupported: false,
             plugin_marketplace_error: None,
             has_pending_remote_control_session_recoveries: false,
+            helper_available: false,
         }
     }
 
@@ -1857,6 +1858,11 @@ impl FakeHooks {
         self
     }
 
+    fn with_helper_available(mut self) -> Self {
+        self.helper_available = true;
+        self
+    }
+
     fn with_pending_remote_control_session_recoveries(mut self) -> Self {
         self.has_pending_remote_control_session_recoveries = true;
         self
@@ -1887,6 +1893,10 @@ impl LaunchHooks for FakeHooks {
     fn select_helper_port(&self, requested: u16) -> u16 {
         self.event(format!("select-helper:{requested}"));
         requested
+    }
+
+    fn helper_available(&self, _helper_port: u16) -> bool {
+        self.helper_available
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {

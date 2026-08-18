@@ -26,7 +26,7 @@ const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 
-const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 10;
+const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 5;
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
@@ -145,6 +145,9 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<PathBuf>;
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
+    fn helper_available(&self, _helper_port: u16) -> bool {
+        false
+    }
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
     fn has_pending_remote_control_session_recoveries(&self) -> bool {
@@ -347,7 +350,7 @@ where
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            if crate::watcher::cdp_listening(helper_port) {
+            if hooks.helper_available(helper_port) {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "launcher.reuse_existing_helper",
                     serde_json::json!({
@@ -567,6 +570,10 @@ impl LaunchHooks for DefaultLaunchHooks {
 
     fn select_helper_port(&self, requested: u16) -> u16 {
         crate::ports::select_platform_loopback_port(requested)
+    }
+
+    fn helper_available(&self, helper_port: u16) -> bool {
+        crate::watcher::cdp_listening(helper_port)
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
