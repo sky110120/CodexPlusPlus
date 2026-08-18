@@ -1,6 +1,7 @@
 use codex_plus_core::models::{DeleteStatus, SessionRef};
 use codex_plus_data::{
-    BackupStore, SQLiteStorageAdapter, delete_local_from_paths,
+    BackupStore, SQLiteStorageAdapter, cleanup_thread_reference_state_for_home,
+    delete_local_from_paths,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -817,6 +818,161 @@ fn missing_db_and_unsupported_schema_return_failed_results() {
 
     assert_eq!(result.status, DeleteStatus::Failed);
     assert!(result.message.contains("Unsupported"));
+}
+
+#[test]
+fn cleanup_thread_reference_state_removes_catalog_index_and_global_state() {
+    let tmp = tempdir().unwrap();
+    let sqlite_dir = tmp.path().join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    let catalog_db = sqlite_dir.join("codex-dev.db");
+    let catalog = Connection::open(&catalog_db).unwrap();
+    catalog
+        .execute(
+            "CREATE TABLE local_thread_catalog (
+                host_id TEXT,
+                thread_id TEXT,
+                display_title TEXT,
+                source_created_at REAL,
+                source_updated_at REAL,
+                cwd TEXT,
+                source_kind TEXT,
+                source_detail TEXT,
+                model_provider TEXT,
+                git_branch TEXT,
+                observation_sequence INTEGER,
+                missing_candidate INTEGER,
+                thread_source TEXT,
+                source_recency_at REAL,
+                pending_observed_title INTEGER,
+                PRIMARY KEY(host_id, thread_id)
+            )",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "CREATE TABLE thread_timeline_ledger (
+                host_id TEXT,
+                thread_id TEXT,
+                sequence INTEGER,
+                record_id TEXT,
+                payload_json TEXT,
+                PRIMARY KEY(host_id, thread_id, sequence)
+            )",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO local_thread_catalog VALUES ('local','t1','Stale','1','2','/tmp','vscode',NULL,'custom',NULL,1,0,'user',3,0)",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO local_thread_catalog VALUES ('local','other','Keep','1','2','/tmp','vscode',NULL,'custom',NULL,1,0,'user',3,0)",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO thread_timeline_ledger VALUES ('local','t1',1,'r1','{}')",
+            [],
+        )
+        .unwrap();
+    drop(catalog);
+
+    let session_index = tmp.path().join("session_index.jsonl");
+    fs::write(
+        &session_index,
+        "{\"id\":\"t1\",\"thread_name\":\"Stale\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n{\"id\":\"other\",\"thread_name\":\"Keep\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+
+    let global_state = tmp.path().join(".codex-global-state.json");
+    fs::write(
+        &global_state,
+        serde_json::to_string_pretty(&json!({
+            "projectless-thread-ids": ["t1", "other"],
+            "thread-projectless-output-directories": {
+                "t1": "/tmp/t1",
+                "other": "/tmp/other"
+            },
+            "electron-persisted-atom-state": {
+                "heartbeat-thread-permissions-by-id": {
+                    "t1": {},
+                    "other": {}
+                },
+                "thread-reference-capability:t1": true,
+                "thread-reference-capability:t10": true,
+                "thread-descriptions-v1": {
+                    "t1": "stale",
+                    "other": "keep"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join(".codex-global-state.json.bak"),
+        fs::read_to_string(&global_state).unwrap(),
+    )
+    .unwrap();
+    let safe_dir = tmp.path().join("backups_state").join("app-state-sync");
+    fs::create_dir_all(&safe_dir).unwrap();
+    fs::write(
+        safe_dir.join("latest-safe-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "state": {
+                "projectless-thread-ids": ["t1", "other"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = cleanup_thread_reference_state_for_home(tmp.path(), "local:t1").unwrap();
+
+    assert!(result.sqlite_rows_removed >= 2);
+    assert_eq!(result.session_index_lines_removed, 1);
+    assert!(result.global_state_files_changed >= 2);
+    assert!(result.global_state_references_removed >= 5);
+
+    let catalog = Connection::open(&catalog_db).unwrap();
+    let remaining: i64 = catalog
+        .query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 't1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+    let remaining: i64 = catalog
+        .query_row(
+            "SELECT COUNT(*) FROM thread_timeline_ledger WHERE thread_id = 't1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    let index = fs::read_to_string(&session_index).unwrap();
+    assert!(!index.contains("\"t1\""));
+    assert!(index.contains("\"other\""));
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&global_state).unwrap()).unwrap();
+    assert_eq!(state["projectless-thread-ids"], json!(["other"]));
+    assert_eq!(
+        state["electron-persisted-atom-state"]["thread-descriptions-v1"],
+        json!({"other": "keep"})
+    );
+    assert_eq!(
+        state["electron-persisted-atom-state"]["thread-reference-capability:t10"],
+        true
+    );
 }
 
 #[test]

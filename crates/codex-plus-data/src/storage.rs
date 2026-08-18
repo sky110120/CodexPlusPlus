@@ -42,6 +42,83 @@ pub fn delete_local_from_paths(
     result
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CleanupThreadReferenceResult {
+    pub sqlite_rows_removed: usize,
+    pub session_index_lines_removed: usize,
+    pub global_state_files_changed: usize,
+    pub global_state_references_removed: usize,
+}
+
+pub fn cleanup_thread_reference_state(
+    session_id: &str,
+) -> anyhow::Result<CleanupThreadReferenceResult> {
+    cleanup_thread_reference_state_for_home(
+        &codex_plus_core::codex_sqlite::default_codex_home_dir(),
+        session_id,
+    )
+}
+
+pub fn cleanup_thread_reference_state_for_home(
+    home: &Path,
+    session_id: &str,
+) -> anyhow::Result<CleanupThreadReferenceResult> {
+    let thread_id = normalize_codex_thread_id(session_id);
+    let mut result = CleanupThreadReferenceResult::default();
+    for db_path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(home) {
+        if !db_path.is_file() {
+            continue;
+        }
+        let db = Connection::open(&db_path)?;
+        for (table, column) in [
+            ("local_thread_catalog", "thread_id"),
+            ("thread_timeline_ledger", "thread_id"),
+            ("automation_runs", "thread_id"),
+            ("inbox_items", "thread_id"),
+        ] {
+            if !has_table(&db, table)? || !has_columns(&db, table, &[column])? {
+                continue;
+            }
+            result.sqlite_rows_removed += db.execute(
+                &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                [&thread_id],
+            )?;
+        }
+    }
+
+    let session_index = home.join("session_index.jsonl");
+    if session_index.is_file() {
+        let original = fs::read_to_string(&session_index)?;
+        let kept = original
+            .lines()
+            .filter(|line| !session_index_line_matches(line, &thread_id))
+            .collect::<Vec<_>>();
+        let next = if kept.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", kept.join("\n"))
+        };
+        if next != original {
+            codex_plus_core::settings::atomic_write(&session_index, next.as_bytes())?;
+            result.session_index_lines_removed =
+                original.lines().count().saturating_sub(kept.len());
+        }
+    }
+
+    let global_state =
+        codex_plus_core::codex_app_state::remove_thread_references_from_state(home, &[thread_id])?;
+    result.global_state_files_changed = global_state.files_changed;
+    result.global_state_references_removed = global_state.references_removed;
+    Ok(result)
+}
+
+fn session_index_line_matches(line: &str, thread_id: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|id| id == thread_id)
+}
+
 #[derive(Debug, Clone)]
 pub struct SQLiteStorageAdapter {
     db_path: PathBuf,

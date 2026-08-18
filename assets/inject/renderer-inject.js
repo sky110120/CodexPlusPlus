@@ -7670,6 +7670,107 @@
     });
   }
 
+  function removeThreadReferenceFromValue(value, threadId) {
+    if (Array.isArray(value)) {
+      return value
+        .filter((item) => !(typeof item === "string" && (item === threadId || item === `local:${threadId}`)))
+        .map((item) => removeThreadReferenceFromValue(item, threadId));
+    }
+    if (value && typeof value === "object") {
+      const next = {};
+      for (const [key, item] of Object.entries(value)) {
+        if (key === threadId || key.endsWith(`:${threadId}`) || key.endsWith(`%3A${threadId}`)) continue;
+        next[key] = removeThreadReferenceFromValue(item, threadId);
+      }
+      return next;
+    }
+    return value;
+  }
+
+  function requestPersistedAtomSync() {
+    if (!window.electronBridge?.sendMessageFromView) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (state) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        window.removeEventListener("message", handler);
+        resolve(state);
+      };
+      const timer = window.setTimeout(() => finish(null), 1000);
+      const handler = (event) => {
+        const data = event.data;
+        if (data && typeof data === "object" && data.type === "persisted-atom-sync" && data.state) {
+          finish(data.state);
+        }
+      };
+      window.addEventListener("message", handler);
+      window.electronBridge.sendMessageFromView({ type: "persisted-atom-sync-request" }).catch(() => finish(null));
+    });
+  }
+
+  async function cleanupCodexDeletedThreadReferences(threadId) {
+    const variants = threadIdVariants(threadId);
+    const bareId = variants.find((id) => !id.startsWith("local:")) || String(threadId || "").trim();
+    if (!bareId) return;
+    if (window.__codexThreadScrollEntries && bareId) {
+      delete window.__codexThreadScrollEntries[bareId];
+    }
+    try {
+      const raw = localStorage.getItem(codexThreadScrollKey);
+      if (raw) {
+        const value = JSON.parse(raw);
+        if (value && value.entries) {
+          for (const id of variants) delete value.entries[id];
+          localStorage.setItem(codexThreadScrollKey, JSON.stringify(value));
+        }
+      }
+    } catch (_) {
+      // localStorage cleanup is best-effort.
+    }
+
+    const state = await requestPersistedAtomSync();
+    if (!state || typeof state !== "object") return;
+    for (const [key, value] of Object.entries(state)) {
+      if (!JSON.stringify(value).includes(bareId)) continue;
+      const next = removeThreadReferenceFromValue(value, bareId);
+      if (JSON.stringify(next) !== JSON.stringify(value)) {
+        try {
+          await window.electronBridge.sendMessageFromView({
+            type: "persisted-atom-update",
+            key,
+            value: next,
+            deleted: false,
+          });
+        } catch (_) {
+          // Host state updates are best-effort; the reload fallback below handles stale rows.
+        }
+      }
+    }
+  }
+
+  async function refreshCodexRecentAfterDelete(threadId) {
+    const variants = threadIdVariants(threadId);
+    const bareId = variants.find((id) => !id.startsWith("local:")) || String(threadId || "").trim();
+    await cleanupCodexDeletedThreadReferences(threadId);
+    try {
+      await window.electronBridge?.sendMessageFromView({
+        type: "refresh-recent-conversations-for-host",
+        hostId: "local",
+        mode: "catalog",
+      });
+    } catch (_) {
+      // Fall through to the stale-row check below.
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    const reappeared = sessionRows(true).some((row) => {
+      const ref = sessionRefFromRow(row);
+      return ref.session_id && sessionKey(ref.session_id) === bareId;
+    });
+    if (reappeared) window.location.reload();
+  }
+
   function openDeleteConfirmForRow(row, button, ref, event) {
     event.preventDefault();
     event.stopPropagation();
@@ -7682,6 +7783,7 @@
       if (result.status === "server_deleted" || result.status === "local_deleted") {
         removeDeletedRow(row, button, ref);
         showToast(result.message || "删除成功", result.undo_token);
+        void refreshCodexRecentAfterDelete(ref.session_id);
       } else {
         showToast(result.message || "删除失败", null);
       }
@@ -9249,7 +9351,7 @@
 
   function scan() {
     runScanStep(scanLightweight);
-    requestAnimationFrame(() => runScanStep(scanDeferred));
+    window.setTimeout(() => runScanStep(scanDeferred), 0);
   }
 
   function isExtensionUiNode(node) {

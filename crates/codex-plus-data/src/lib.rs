@@ -16,4 +16,8 @@ pub use provider_sync::{
     run_remote_control_session_finalization_for_thread_with_target,
     run_remote_control_session_finalization_for_thread_with_target_with_before_apply_hook,
 };
-pub use storage::{LocalSession, SQLiteStorageAdapter, delete_local_from_paths};
+pub use storage::{
+    CleanupThreadReferenceResult, LocalSession, SQLiteStorageAdapter,
+    cleanup_thread_reference_state, cleanup_thread_reference_state_for_home,
+    delete_local_from_paths,
+};

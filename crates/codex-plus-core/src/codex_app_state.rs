@@ -60,6 +60,85 @@ pub struct AppStateSyncResult {
     pub snapshot_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RemoveThreadReferencesResult {
+    pub files_changed: usize,
+    pub references_removed: usize,
+}
+
+pub fn remove_thread_references_from_state(
+    home: &Path,
+    thread_ids: &[String],
+) -> anyhow::Result<RemoveThreadReferencesResult> {
+    let mut result = RemoveThreadReferencesResult::default();
+    if thread_ids.is_empty() {
+        return Ok(result);
+    }
+    let state_file = state_path(home);
+    let state_backup_file = PathBuf::from(format!("{}.bak", state_file.to_string_lossy()));
+    for path in [state_file, state_backup_file, snapshot_path(home)] {
+        if !path.is_file() {
+            continue;
+        }
+        let original = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut value: Value = serde_json::from_str(&original)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let removed = remove_thread_references(&mut value, thread_ids);
+        if removed == 0 {
+            continue;
+        }
+        crate::settings::atomic_write(&path, serde_json::to_string_pretty(&value)?.as_bytes())?;
+        result.files_changed += 1;
+        result.references_removed += removed;
+    }
+    Ok(result)
+}
+
+fn remove_thread_references(value: &mut Value, thread_ids: &[String]) -> usize {
+    let is_target_id = |candidate: &str| thread_ids.iter().any(|id| id == candidate);
+    match value {
+        Value::Array(items) => {
+            let mut removed = 0;
+            let mut kept = Vec::with_capacity(items.len());
+            for mut item in items.drain(..) {
+                if item.as_str().is_some_and(is_target_id) {
+                    removed += 1;
+                    continue;
+                }
+                removed += remove_thread_references(&mut item, thread_ids);
+                kept.push(item);
+            }
+            *items = kept;
+            removed
+        }
+        Value::Object(object) => {
+            let mut removed = 0;
+            let mut kept = Map::new();
+            for (key, mut item) in std::mem::take(object) {
+                if thread_ids
+                    .iter()
+                    .any(|id| thread_reference_key_matches(&key, id))
+                {
+                    removed += 1;
+                    continue;
+                }
+                removed += remove_thread_references(&mut item, thread_ids);
+                kept.insert(key, item);
+            }
+            *object = kept;
+            removed
+        }
+        _ => 0,
+    }
+}
+
+fn thread_reference_key_matches(key: &str, thread_id: &str) -> bool {
+    key == thread_id
+        || key.ends_with(&format!(":{thread_id}"))
+        || key.ends_with(&format!("%3A{thread_id}"))
+}
+
 pub fn capture_app_state_snapshot(home: &Path) -> anyhow::Result<Option<PathBuf>> {
     let Some(state) = load_global_state(home)? else {
         return Ok(None);

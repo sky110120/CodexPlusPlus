@@ -2381,6 +2381,22 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
                 .collect::<Vec<_>>(),
         }),
     );
+    if matches!(
+        result.status,
+        codex_plus_core::models::DeleteStatus::LocalDeleted
+    ) {
+        if let Err(error) =
+            codex_plus_data::cleanup_thread_reference_state(&session.session_id)
+        {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.delete_local_session.reference_cleanup_failed",
+                json!({
+                    "session_id": session.session_id,
+                    "error": error.to_string()
+                }),
+            );
+        }
+    }
     let status = if matches!(
         result.status,
         codex_plus_core::models::DeleteStatus::LocalDeleted
