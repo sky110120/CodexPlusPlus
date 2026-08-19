@@ -80,6 +80,7 @@ describe("dream skin theme helpers", () => {
 
     assert.equal(theme.colors, undefined);
     assert.equal(theme.stylePreset, undefined);
+    assert.equal(theme.projectPrefix, "project · ");
     assert.deepEqual(theme.art, { focusX: 0.72, focusY: 0.45, safeArea: "left", taskMode: "ambient" });
     assert.deepEqual(theme.palette, { accent: "#123456", custom: "keep" });
     assert.deepEqual(theme.companion, {

@@ -87,7 +87,11 @@ pub async fn load_community_catalog(state_dir: &Path) -> anyhow::Result<DreamSki
                 format!("DreamSkin 社区加载失败，且没有可用缓存：{network_error}")
             })?;
             cached.cached = true;
+            let skip_notice = cached.warning.clone();
             cached.warning = format!("DreamSkin 社区暂不可用，当前显示本地缓存：{network_error}");
+            if !skip_notice.is_empty() {
+                cached.warning = format!("{} {}", cached.warning, skip_notice);
+            }
             enrich_catalog(state_dir, &mut cached);
             Ok(cached)
         }
@@ -115,7 +119,12 @@ pub async fn fetch_community_catalog() -> anyhow::Result<DreamSkinCommunityCatal
         offset = items.len();
     };
     items.truncate(CATALOG_LIMIT);
-    validate_catalog(&items)?;
+    let (items, skipped) = keep_valid_themes(items);
+    let warning = if skipped > 0 {
+        format!("有 {skipped} 个主题因元数据校验未通过被跳过。")
+    } else {
+        String::new()
+    };
     Ok(DreamSkinCommunityCatalog {
         total,
         items,
@@ -125,7 +134,7 @@ pub async fn fetch_community_catalog() -> anyhow::Result<DreamSkinCommunityCatal
             .as_secs()
             .to_string(),
         cached: false,
-        warning: String::new(),
+        warning,
         installed_theme_id: String::new(),
     })
 }
@@ -258,14 +267,18 @@ fn pending_link_path() -> std::path::PathBuf {
     crate::paths::default_app_state_dir().join(PENDING_LINK_FILE)
 }
 
-fn validate_catalog(items: &[DreamSkinCommunityTheme]) -> anyhow::Result<()> {
-    if items.len() > CATALOG_LIMIT {
-        bail!("DreamSkin 社区主题数量超过限制");
+fn keep_valid_themes(
+    items: Vec<DreamSkinCommunityTheme>,
+) -> (Vec<DreamSkinCommunityTheme>, usize) {
+    let mut kept = Vec::new();
+    let mut skipped = 0usize;
+    for theme in items {
+        match validate_community_theme(&theme) {
+            Ok(()) => kept.push(theme),
+            Err(_) => skipped += 1,
+        }
     }
-    for item in items {
-        validate_community_theme(item)?;
-    }
-    Ok(())
+    (kept, skipped)
 }
 
 fn validate_community_theme(theme: &DreamSkinCommunityTheme) -> anyhow::Result<()> {
@@ -367,8 +380,15 @@ fn read_cached_catalog(state_dir: &Path) -> anyhow::Result<DreamSkinCommunityCat
     {
         bail!("DreamSkin 社区缓存无效");
     }
-    let catalog: DreamSkinCommunityCatalog = serde_json::from_slice(&std::fs::read(path)?)?;
-    validate_catalog(&catalog.items)?;
+    let mut catalog: DreamSkinCommunityCatalog = serde_json::from_slice(&std::fs::read(path)?)?;
+    if catalog.items.len() > CATALOG_LIMIT {
+        bail!("DreamSkin 社区主题数量超过限制");
+    }
+    let (items, skipped) = keep_valid_themes(catalog.items);
+    catalog.items = items;
+    if skipped > 0 && catalog.warning.is_empty() {
+        catalog.warning = format!("有 {skipped} 个主题因元数据校验未通过被跳过。");
+    }
     Ok(catalog)
 }
 

@@ -102,14 +102,15 @@ jobs:
 
   latest-json:
     name: Upload static latest.json
-    if: ${{ github.event_name == 'release' }}
+    needs: macos-dmg
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
     runs-on: ubuntu-latest
     steps:
       - name: Generate latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -138,7 +139,7 @@ jobs:
       - name: Upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
           REPO: ${{ github.repository }}
         shell: bash
         run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"

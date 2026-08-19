@@ -258,6 +258,10 @@ const textOr = (value: unknown, fallback: string): string => {
   return typeof value === "string" && value.trim() ? value.trim() : fallback;
 };
 
+const textKeep = (value: unknown, fallback: string): string => {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+};
+
 export function resolveDreamSkinStylePreset(id: string, stylePreset: unknown): string {
   const preset = typeof stylePreset === "string" ? stylePreset.trim() : "";
   if (preset && preset !== "dream-original") return preset;
@@ -298,7 +302,7 @@ export function normalizeDreamSkinTheme(
     name: textOr(value?.name, fallback.name),
     brandSubtitle: textOr(value?.brandSubtitle, fallback.brandSubtitle),
     tagline: textOr(value?.tagline, fallback.tagline),
-    projectPrefix: textOr(value?.projectPrefix, fallback.projectPrefix),
+    projectPrefix: textKeep(value?.projectPrefix, fallback.projectPrefix),
     projectLabel: textOr(value?.projectLabel, fallback.projectLabel),
     statusText: textOr(value?.statusText, fallback.statusText),
     quote: textOr(value?.quote, fallback.quote),
