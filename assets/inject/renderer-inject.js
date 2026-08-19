@@ -3714,8 +3714,9 @@
         <div class="codex-plus-tabs" role="tablist" aria-label="Codex++">
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="home" data-active="true">主页</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="userScripts" data-active="false">用户脚本</button>
-          // 推荐内容页签暂时隐藏，保留代码便于恢复
-          // <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
+          <!-- 推荐内容页签暂时隐藏，保留代码便于恢复。
+          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
+          -->
         </div>
         <div class="codex-plus-modal-body">
           <div class="codex-plus-panel" data-codex-plus-panel="home">
@@ -4903,6 +4904,7 @@
 
   let cachedSessionRows = [];
   let cachedSessionRowsAt = 0;
+  let forceSessionRowsRefreshOnNextScan = false;
   let threadIdBadgeActive = false;
 
   function sessionRows(forceRefresh = false) {
@@ -9333,7 +9335,9 @@
     }
     refreshDreamSkin();
     refreshThreadIdBadges();
-    sessionRows().forEach(tryAttachButton);
+    const rows = sessionRows(forceSessionRowsRefreshOnNextScan);
+    forceSessionRowsRefreshOnNextScan = false;
+    rows.forEach(tryAttachButton);
     updateDeleteButtonOffsets();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
@@ -9437,7 +9441,11 @@
     window.__codexSessionDeleteLastMutations = mutations;
     scheduleZedRemoteMenuRefresh(mutations);
     schedulePluginAutoExpand();
-    if (!shouldScheduleScan(mutations)) return;
+    const projectVisibilityChanged = mutations?.some((mutation) => mutation.type === "attributes" && mutation.attributeName === "data-app-action-sidebar-project-collapsed");
+    if (projectVisibilityChanged) {
+      forceSessionRowsRefreshOnNextScan = true;
+    }
+    if (!projectVisibilityChanged && !shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);
@@ -9468,11 +9476,10 @@
   window.__codexSessionDeleteObserver.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
-    // Codex may promote a newly-created row from a temporary client ID to its
-    // persisted UUID without replacing the DOM node. Re-scan those rows so the
-    // action button and its delete reference are rebuilt from the canonical ID.
+    // Re-scan when Codex promotes a temporary thread ID or expands a project
+    // whose session rows were not present in the previous cached query.
     attributes: true,
-    attributeFilter: ["data-app-action-sidebar-thread-id", "href"],
+    attributeFilter: ["data-app-action-sidebar-thread-id", "data-app-action-sidebar-project-collapsed", "href"],
   });
 })();
 
