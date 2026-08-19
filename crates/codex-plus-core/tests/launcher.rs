@@ -7,14 +7,14 @@ use codex_plus_core::app_paths::{
     packaged_app_user_model_id, resolve_codex_app_dir_with_saved, user_data_candidates_from,
 };
 use codex_plus_core::launcher::{
-    CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
+    CodexLaunch, DefaultLaunchHooks, HelperStatus, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
     MacosDebugLaunchAction, browser_identity_changed, build_codex_arguments,
     build_codex_arguments_for_settings, build_codex_arguments_with_native_menu_inspector,
     build_codex_command, build_codex_command_with_native_menu_inspector,
     build_macos_cleanup_command, build_macos_open_command,
     build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
     build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
-    select_macos_debug_launch_action,
+    probe_helper_status, select_macos_debug_launch_action,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -820,8 +820,12 @@ async fn default_helper_serves_backend_status_over_http() {
     assert!(response.status().is_success());
     let payload: serde_json::Value = response.json().await.unwrap();
     assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["service"], "codex-plus-helper");
+    assert_eq!(payload["apiVersion"], "1");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(payload["transport"], "http-helper");
     assert!(payload["hideOfficialUsageAlert"].is_boolean());
+    assert_eq!(probe_helper_status(port).await, HelperStatus::Compatible);
 
     let repair_response = client
         .post(format!("http://127.0.0.1:{port}/backend/repair"))
@@ -1415,6 +1419,34 @@ async fn launch_reuses_helper_when_port_is_already_listening() {
 }
 
 #[tokio::test]
+async fn launch_rejects_incompatible_helper_without_starting_another_listener() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_helper_incompatible("wrong service");
+    let helper_port = 57321;
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("wrong service"));
+    let events = events.lock().unwrap().clone();
+    assert!(!events.contains(&format!("start-helper:{helper_port}")));
+    assert!(!events.iter().any(|event| event.starts_with("launch:")));
+}
+
+#[tokio::test]
 async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
@@ -1753,7 +1785,7 @@ struct FakeHooks {
     provider_sync_unsupported: bool,
     plugin_marketplace_error: Option<String>,
     has_pending_remote_control_session_recoveries: bool,
-    helper_available: bool,
+    helper_status: HelperStatus,
 }
 
 impl FakeHooks {
@@ -1771,7 +1803,7 @@ impl FakeHooks {
             provider_sync_unsupported: false,
             plugin_marketplace_error: None,
             has_pending_remote_control_session_recoveries: false,
-            helper_available: false,
+            helper_status: HelperStatus::Missing,
         }
     }
 
@@ -1806,7 +1838,12 @@ impl FakeHooks {
     }
 
     fn with_helper_available(mut self) -> Self {
-        self.helper_available = true;
+        self.helper_status = HelperStatus::Compatible;
+        self
+    }
+
+    fn with_helper_incompatible(mut self, message: &str) -> Self {
+        self.helper_status = HelperStatus::Incompatible(message.to_string());
         self
     }
 
@@ -1842,8 +1879,8 @@ impl LaunchHooks for FakeHooks {
         requested
     }
 
-    fn helper_available(&self, _helper_port: u16) -> bool {
-        self.helper_available
+    async fn helper_status(&self, _helper_port: u16) -> HelperStatus {
+        self.helper_status.clone()
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {

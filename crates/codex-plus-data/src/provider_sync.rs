@@ -825,13 +825,17 @@ fn load_provider_sync_thread_kinds(
             continue;
         }
         let db = Connection::open(path)?;
-        let edge_columns = table_columns(&db, "thread_spawn_edges")?;
-        if edge_columns.contains("child_thread_id") {
-            let mut stmt = db.prepare(
-                "SELECT child_thread_id FROM thread_spawn_edges WHERE COALESCE(child_thread_id, '') <> ''",
-            )?;
-            for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
-                kinds.subagent_thread_ids.insert(item?);
+        for (table, column) in [
+            ("thread_spawn_edges", "child_thread_id"),
+            ("agent_job_items", "assigned_thread_id"),
+        ] {
+            if table_columns(&db, table)?.contains(column) {
+                let sql =
+                    format!("SELECT {column} FROM {table} WHERE COALESCE({column}, '') <> ''");
+                let mut stmt = db.prepare(&sql)?;
+                for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                    kinds.subagent_thread_ids.insert(item?);
+                }
             }
         }
 
@@ -897,12 +901,15 @@ pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTarg
         [current_provider.clone()],
         ProviderSyncTargetSource::Config,
     );
-    if let Ok(ids) = rollout_provider_ids(&home) {
-        add_sources(&mut sources, ids, ProviderSyncTargetSource::Rollout);
-    }
-    for db_path in provider_sync_db_paths(&home) {
-        if let Ok(ids) = sqlite_provider_ids(&db_path) {
-            add_sources(&mut sources, ids, ProviderSyncTargetSource::Sqlite);
+    let sqlite_paths = provider_sync_db_paths(&home);
+    if let Ok(thread_kinds) = load_provider_sync_thread_kinds(&sqlite_paths) {
+        if let Ok(ids) = rollout_provider_ids(&home, &thread_kinds) {
+            add_sources(&mut sources, ids, ProviderSyncTargetSource::Rollout);
+        }
+        for db_path in &sqlite_paths {
+            if let Ok(ids) = sqlite_provider_ids(db_path, &thread_kinds) {
+                add_sources(&mut sources, ids, ProviderSyncTargetSource::Sqlite);
+            }
         }
     }
 
@@ -1855,7 +1862,10 @@ fn cleanup_apply_error(
     }
 }
 
-fn rollout_provider_ids(home: &Path) -> anyhow::Result<Vec<String>> {
+fn rollout_provider_ids(
+    home: &Path,
+    thread_kinds: &ProviderSyncThreadKinds,
+) -> anyhow::Result<Vec<String>> {
     let mut ids = HashSet::new();
     for path in rollout_files(home)? {
         let text = match fs::read_to_string(&path) {
@@ -1871,12 +1881,19 @@ fn rollout_provider_ids(home: &Path) -> anyhow::Result<Vec<String>> {
             if record.get("type").and_then(Value::as_str) != Some("session_meta") {
                 continue;
             }
-            let Some(provider) = record
-                .get("payload")
-                .and_then(Value::as_object)
-                .and_then(|payload| payload.get("model_provider"))
-                .and_then(Value::as_str)
-            else {
+            let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            let thread_id = payload.get("id").and_then(Value::as_str);
+            let explicit_user = thread_id
+                .is_some_and(|thread_id| thread_kinds.explicit_user_thread_ids.contains(thread_id));
+            let classified_subagent = thread_id
+                .is_some_and(|thread_id| thread_kinds.subagent_thread_ids.contains(thread_id));
+            let rollout_subagent = payload.get("source").is_some_and(source_value_is_subagent);
+            if !explicit_user && (classified_subagent || rollout_subagent) {
+                continue;
+            }
+            let Some(provider) = payload.get("model_provider").and_then(Value::as_str) else {
                 continue;
             };
             if is_valid_provider_id_for_discovery(provider) {
@@ -2153,7 +2170,10 @@ fn table_columns(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>
         .collect::<rusqlite::Result<HashSet<_>>>()?)
 }
 
-fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
+fn sqlite_provider_ids(
+    path: &Path,
+    thread_kinds: &ProviderSyncThreadKinds,
+) -> anyhow::Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -2164,13 +2184,45 @@ fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
         if !columns.contains("model_provider") {
             continue;
         }
+        let id_column = if table == "threads" && columns.contains("id") {
+            Some("id")
+        } else if columns.contains("thread_id") {
+            Some("thread_id")
+        } else {
+            None
+        };
+        let id_expression = id_column.unwrap_or("NULL");
+        let source_expression = if table == "threads" {
+            text_expr(&columns, "source", "''")
+        } else {
+            text_expr(&columns, "source_kind", "''")
+        };
+        let thread_source_expression = text_expr(&columns, "thread_source", "NULL");
         let mut stmt = db.prepare(&format!(
-            "SELECT DISTINCT COALESCE(model_provider, '') FROM {table} WHERE COALESCE(model_provider, '') <> ''"
+            "SELECT DISTINCT COALESCE(model_provider, ''), {id_expression}, {source_expression}, {thread_source_expression} FROM {table} WHERE COALESCE(model_provider, '') <> ''"
         ))?;
-        for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
-            let id = item?;
-            if is_valid_provider_id_for_discovery(&id) {
-                ids.insert(id);
+        for item in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1).unwrap_or(None),
+                row.get::<_, String>(2).unwrap_or_default(),
+                row.get::<_, Option<String>>(3).unwrap_or(None),
+            ))
+        })? {
+            let (provider_id, thread_id, source, thread_source) = item?;
+            let explicit_user = thread_id
+                .as_ref()
+                .is_some_and(|thread_id| thread_kinds.explicit_user_thread_ids.contains(thread_id));
+            let classified_subagent = thread_id
+                .as_ref()
+                .is_some_and(|thread_id| thread_kinds.subagent_thread_ids.contains(thread_id));
+            let row_marks_subagent = thread_source_marks_non_root(thread_source.as_deref())
+                || source_marks_non_root_agent(&source);
+            if !explicit_user && (classified_subagent || row_marks_subagent) {
+                continue;
+            }
+            if is_valid_provider_id_for_discovery(&provider_id) {
+                ids.insert(provider_id);
             }
         }
     }
@@ -2869,16 +2921,19 @@ fn collect_spawned_child_thread_ids(paths: &[PathBuf]) -> anyhow::Result<HashSet
             continue;
         }
         let db = Connection::open(path)?;
-        let columns = table_columns(&db, "thread_spawn_edges")?;
-        if !columns.contains("child_thread_id") {
-            continue;
-        }
-        let mut stmt = db.prepare(
-            "SELECT child_thread_id FROM thread_spawn_edges WHERE COALESCE(child_thread_id, '') <> ''",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for thread_id in rows {
-            thread_ids.insert(thread_id?);
+        for (table, column) in [
+            ("thread_spawn_edges", "child_thread_id"),
+            ("agent_job_items", "assigned_thread_id"),
+        ] {
+            if !table_columns(&db, table)?.contains(column) {
+                continue;
+            }
+            let sql = format!("SELECT {column} FROM {table} WHERE COALESCE({column}, '') <> ''");
+            let mut stmt = db.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for thread_id in rows {
+                thread_ids.insert(thread_id?);
+            }
         }
     }
     Ok(thread_ids)
@@ -2946,20 +3001,20 @@ fn is_catalog_non_root_agent(
         || spawned_child_ids.contains(&thread.id)
 }
 
-fn thread_source_is_user(thread_source: Option<&str>) -> bool {
+pub(crate) fn thread_source_is_user(thread_source: Option<&str>) -> bool {
     thread_source
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("user"))
 }
 
-fn thread_source_marks_non_root(thread_source: Option<&str>) -> bool {
+pub(crate) fn thread_source_marks_non_root(thread_source: Option<&str>) -> bool {
     thread_source.map(str::trim).is_some_and(|value| {
         value.eq_ignore_ascii_case("subagent")
             || value.eq_ignore_ascii_case("memory_consolidation")
     })
 }
 
-fn source_marks_non_root_agent(source: &str) -> bool {
+pub(crate) fn source_marks_non_root_agent(source: &str) -> bool {
     let source = source.trim();
     if source_text_marks_non_root_agent(source) {
         return true;

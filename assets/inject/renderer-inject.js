@@ -3747,7 +3747,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
             </div>` : ""}
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。</div></div>
+              <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。启停后需重启 Codex++ 生效。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
             </div>
             <div class="codex-plus-row" data-codex-service-tier-controls="true">
@@ -9440,7 +9440,6 @@
   function scheduleScan(mutations) {
     window.__codexSessionDeleteLastMutations = mutations;
     scheduleZedRemoteMenuRefresh(mutations);
-    schedulePluginAutoExpand();
     const projectVisibilityChanged = mutations?.some((mutation) => mutation.type === "attributes" && mutation.attributeName === "data-app-action-sidebar-project-collapsed");
     if (projectVisibilityChanged) {
       forceSessionRowsRefreshOnNextScan = true;

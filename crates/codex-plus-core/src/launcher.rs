@@ -25,6 +25,8 @@ const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
 const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 
 const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 5;
+pub const HELPER_SERVICE_ID: &str = "codex-plus-helper";
+pub const HELPER_API_VERSION: &str = "1";
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
@@ -104,6 +106,13 @@ impl Default for LaunchOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperStatus {
+    Missing,
+    Compatible,
+    Incompatible(String),
+}
+
 #[derive(Clone)]
 pub struct LaunchHandle {
     pub debug_port: u16,
@@ -150,8 +159,8 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<PathBuf>;
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
-    fn helper_available(&self, _helper_port: u16) -> bool {
-        false
+    async fn helper_status(&self, _helper_port: u16) -> HelperStatus {
+        HelperStatus::Missing
     }
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
@@ -335,11 +344,17 @@ where
         if protocol_proxy_enabled {
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
-        if (settings.enhancements_enabled || protocol_proxy_enabled)
-            && !hooks.helper_available(helper_port)
-        {
-            hooks.start_helper(helper_port).await?;
-            helper_started = true;
+        if settings.enhancements_enabled || protocol_proxy_enabled {
+            match hooks.helper_status(helper_port).await {
+                HelperStatus::Compatible => {}
+                HelperStatus::Missing => {
+                    hooks.start_helper(helper_port).await?;
+                    helper_started = true;
+                }
+                HelperStatus::Incompatible(reason) => {
+                    anyhow::bail!("helper 端口 {helper_port} 已被不兼容的服务占用：{reason}");
+                }
+            }
         }
 
         let launch = hooks
@@ -525,6 +540,58 @@ fn helper_bind_host() -> String {
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
+pub async fn probe_helper_status(helper_port: u16) -> HelperStatus {
+    if !crate::watcher::cdp_listening(helper_port) {
+        return HelperStatus::Missing;
+    }
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return HelperStatus::Incompatible(format!("无法创建状态检查客户端：{error}"));
+        }
+    };
+    let response = match client
+        .post(format!("http://127.0.0.1:{helper_port}/backend/status"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return HelperStatus::Incompatible(format!("状态接口不可用：{error}"));
+        }
+    };
+    if !response.status().is_success() {
+        return HelperStatus::Incompatible(format!("状态接口返回 HTTP {}", response.status()));
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return HelperStatus::Incompatible(format!("状态接口返回无效 JSON：{error}"));
+        }
+    };
+    for (field, expected) in [
+        ("service", HELPER_SERVICE_ID),
+        ("transport", "http-helper"),
+        ("apiVersion", HELPER_API_VERSION),
+        ("version", crate::version::VERSION),
+    ] {
+        let actual = payload.get(field).and_then(Value::as_str).unwrap_or("");
+        if actual != expected {
+            return HelperStatus::Incompatible(format!(
+                "状态字段 {field} 不匹配（期望 {expected}，实际 {}）",
+                if actual.is_empty() { "缺失" } else { actual }
+            ));
+        }
+    }
+    HelperStatus::Compatible
+}
+
 #[async_trait(?Send)]
 impl LaunchHooks for DefaultLaunchHooks {
     fn resolve_app_dir(
@@ -547,8 +614,8 @@ impl LaunchHooks for DefaultLaunchHooks {
         crate::ports::select_platform_loopback_port(requested)
     }
 
-    fn helper_available(&self, helper_port: u16) -> bool {
-        crate::watcher::cdp_listening(helper_port)
+    async fn helper_status(&self, helper_port: u16) -> HelperStatus {
+        probe_helper_status(helper_port).await
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
@@ -1126,6 +1193,8 @@ async fn handle_helper_connection(
             serde_json::to_vec(&serde_json::json!({
                 "status": "ok",
                 "message": "后端已连接",
+                "service": HELPER_SERVICE_ID,
+                "apiVersion": HELPER_API_VERSION,
                 "version": crate::version::VERSION,
                 "hideOfficialUsageAlert": crate::assets::hide_official_usage_alert_config(
                     &crate::settings::SettingsStore::default().load().unwrap_or_default()

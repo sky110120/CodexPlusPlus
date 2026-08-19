@@ -84,6 +84,11 @@ fn create_codex_thread_db(path: &Path, rollout_path: &Path) {
         [],
     )
     .unwrap();
+    db.execute(
+        "INSERT INTO agent_job_items (id, assigned_thread_id) VALUES ('job-child', 'child')",
+        [],
+    )
+    .unwrap();
 }
 
 fn thread_count(path: &Path, id: &str) -> i64 {
@@ -449,6 +454,188 @@ fn delete_local_from_paths_removes_duplicate_threads_from_all_databases() {
     assert_eq!(thread_count(&second_db, "t1"), 0);
     assert!(!first_rollout.exists());
     assert!(!second_rollout.exists());
+}
+
+#[test]
+fn delete_local_from_paths_blocks_parent_when_child_only_has_spawn_edge() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let parent_rollout = tmp.path().join("parent.jsonl");
+    let child_rollout = tmp.path().join("child.jsonl");
+    fs::write(&parent_rollout, "{\"type\":\"message\"}\n").unwrap();
+    fs::write(&child_rollout, "{\"type\":\"message\"}\n").unwrap();
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, rollout_path TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'Parent', ?1)",
+        [parent_rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('child', 'Child', ?1)",
+        [child_rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES ('parent', 'child')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = delete_local_from_paths(
+        [db_path.clone()],
+        BackupStore::new(tmp.path().join("backups")),
+        &session("parent", "Parent"),
+    );
+
+    assert_eq!(result.status, DeleteStatus::Failed);
+    assert!(result.message.contains("child"));
+    assert!(result.undo_token.is_none());
+    assert_eq!(thread_count(&db_path, "parent"), 1);
+    assert!(parent_rollout.exists());
+}
+
+#[test]
+fn delete_local_from_paths_accepts_child_marker_from_another_database() {
+    let tmp = tempdir().unwrap();
+    let thread_db_path = tmp.path().join("state_5.sqlite");
+    let marker_db_path = tmp.path().join("codex-dev.db");
+    let parent_rollout = tmp.path().join("parent.jsonl");
+    fs::write(&parent_rollout, "{\"type\":\"message\"}\n").unwrap();
+    let db = Connection::open(&thread_db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, rollout_path TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'Parent', ?1)",
+        [parent_rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    db.execute("INSERT INTO threads VALUES ('child', 'Child', '')", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES ('parent', 'child')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let marker_db = Connection::open(&marker_db_path).unwrap();
+    marker_db
+        .execute(
+            "CREATE TABLE agent_job_items (id TEXT PRIMARY KEY, assigned_thread_id TEXT)",
+            [],
+        )
+        .unwrap();
+    marker_db
+        .execute(
+            "INSERT INTO agent_job_items VALUES ('job-child', 'child')",
+            [],
+        )
+        .unwrap();
+    drop(marker_db);
+
+    let result = delete_local_from_paths(
+        [thread_db_path.clone(), marker_db_path],
+        BackupStore::new(tmp.path().join("backups")),
+        &session("parent", "Parent"),
+    );
+
+    assert_eq!(result.status, DeleteStatus::LocalDeleted);
+    assert_eq!(thread_count(&thread_db_path, "parent"), 0);
+    assert_eq!(thread_count(&thread_db_path, "child"), 1);
+    assert!(!parent_rollout.exists());
+}
+
+#[test]
+fn delete_local_from_paths_accepts_catalog_and_rollout_child_markers() {
+    let tmp = tempdir().unwrap();
+    let thread_db_path = tmp.path().join("state_5.sqlite");
+    let catalog_db_path = tmp.path().join("codex-dev.db");
+    let parent_rollout = tmp.path().join("parent.jsonl");
+    let child_rollout = tmp.path().join("child.jsonl");
+    fs::write(&parent_rollout, "{\"type\":\"message\"}\n").unwrap();
+    fs::write(
+        &child_rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"rollout-child\",\"source\":{\"subagent\":{\"other\":\"review\"}}}}\n",
+    )
+    .unwrap();
+    let db = Connection::open(&thread_db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, rollout_path TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'Parent', ?1)",
+        [parent_rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('catalog-child', 'Catalog child', '')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('rollout-child', 'Rollout child', ?1)",
+        [child_rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    for child_id in ["catalog-child", "rollout-child"] {
+        db.execute(
+            "INSERT INTO thread_spawn_edges VALUES ('parent', ?1)",
+            [child_id],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let catalog_db = Connection::open(&catalog_db_path).unwrap();
+    catalog_db
+        .execute(
+            "CREATE TABLE local_thread_catalog (thread_id TEXT, source_kind TEXT, thread_source TEXT)",
+            [],
+        )
+        .unwrap();
+    catalog_db
+        .execute(
+            "INSERT INTO local_thread_catalog VALUES ('catalog-child', 'subagent_review', 'subagent')",
+            [],
+        )
+        .unwrap();
+    drop(catalog_db);
+
+    let result = delete_local_from_paths(
+        [thread_db_path.clone(), catalog_db_path],
+        BackupStore::new(tmp.path().join("backups")),
+        &session("parent", "Parent"),
+    );
+
+    assert_eq!(result.status, DeleteStatus::LocalDeleted);
+    assert_eq!(thread_count(&thread_db_path, "parent"), 0);
+    assert_eq!(thread_count(&thread_db_path, "catalog-child"), 1);
+    assert_eq!(thread_count(&thread_db_path, "rollout-child"), 1);
+    assert!(child_rollout.exists());
 }
 
 #[test]

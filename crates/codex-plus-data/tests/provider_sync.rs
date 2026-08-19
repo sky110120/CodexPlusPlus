@@ -459,6 +459,69 @@ fn provider_sync_rewrites_all_session_meta_model_providers() {
 }
 
 #[test]
+fn provider_sync_ignores_spawned_subagent_threads() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    let parent_rollout = home.join("sessions/2026/rollout-parent.jsonl");
+    let child_rollout = home.join("sessions/2026/rollout-child.jsonl");
+    write_rollout(&parent_rollout, "openai", "parent", "C:/workspace");
+    write_rollout(&child_rollout, "openai", "child", "C:/workspace");
+    let state = home.join("state_5.sqlite");
+    let db = Connection::open(&state).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'openai', 0, 1, 'C:/workspace')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('child', 'openai', 0, 1, 'C:/workspace')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES ('parent', 'child')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.changed_session_files, 1);
+    let child_first: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&child_rollout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(child_first["payload"]["model_provider"], "openai");
+    let db = Connection::open(state).unwrap();
+    let child_provider: String = db
+        .query_row(
+            "SELECT model_provider FROM threads WHERE id = 'child'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(child_provider, "openai");
+}
+
+#[test]
 fn provider_sync_target_discovery_reads_all_session_meta_providers() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
@@ -481,6 +544,116 @@ fn provider_sync_target_discovery_reads_all_session_meta_providers() {
     assert!(ids.contains(&"openai"));
     assert!(ids.contains(&"ccx"));
     assert!(ids.contains(&"CodexPlusPlus"));
+}
+
+#[test]
+fn provider_sync_target_discovery_excludes_subagent_only_providers() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+    write_rollout(
+        &home.join("sessions/2026/rollout-user.jsonl"),
+        "shared-provider",
+        "user-thread",
+        "C:/workspace",
+    );
+    write_rollout(
+        &home.join("sessions/2026/rollout-child.jsonl"),
+        "child-only-provider",
+        "child-thread",
+        "C:/workspace",
+    );
+
+    let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, source TEXT, thread_source TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute("CREATE TABLE agent_job_items (assigned_thread_id TEXT)", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('user-thread', 'shared-provider', 'cli', 'user')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('child-thread', 'child-only-provider', 'cli', NULL)",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO agent_job_items VALUES ('child-thread')", [])
+        .unwrap();
+    drop(db);
+
+    let targets = load_provider_sync_targets(Some(&home));
+    let ids = targets
+        .targets
+        .iter()
+        .map(|target| target.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(ids.contains(&"custom"));
+    assert!(ids.contains(&"shared-provider"));
+    assert!(!ids.contains(&"child-only-provider"));
+}
+
+#[test]
+fn provider_sync_uses_agent_jobs_to_exclude_subagent_sessions() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    let parent_rollout = home.join("sessions/2026/rollout-parent.jsonl");
+    let child_rollout = home.join("sessions/2026/rollout-child.jsonl");
+    write_rollout(&parent_rollout, "openai", "parent", "C:/workspace");
+    write_rollout(&child_rollout, "openai", "child", "C:/workspace");
+    let state = home.join("state_5.sqlite");
+    let db = Connection::open(&state).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute("CREATE TABLE agent_job_items (assigned_thread_id TEXT)", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'openai', 0, 1, 'C:/workspace')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('child', 'openai', 0, 1, 'C:/workspace')",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO agent_job_items VALUES ('child')", [])
+        .unwrap();
+    drop(db);
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.changed_session_files, 1);
+    let child_first: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&child_rollout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(child_first["payload"]["model_provider"], "openai");
+    let db = Connection::open(state).unwrap();
+    let child_provider: String = db
+        .query_row(
+            "SELECT model_provider FROM threads WHERE id = 'child'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(child_provider, "openai");
 }
 
 #[test]
@@ -583,12 +756,7 @@ fn provider_sync_excludes_subagents_from_provider_updates_and_catalog() {
     let parent_rollout = home.join("sessions/2026/rollout-parent.jsonl");
     let existing_child_rollout = home.join("sessions/2026/rollout-child-existing.jsonl");
     let missing_child_rollout = home.join("sessions/2026/rollout-child-missing.jsonl");
-    write_rollout(
-        &parent_rollout,
-        "openai",
-        "parent-thread",
-        "C:/workspace",
-    );
+    write_rollout(&parent_rollout, "openai", "parent-thread", "C:/workspace");
     write_subagent_rollout(
         &existing_child_rollout,
         "openai",
@@ -672,14 +840,9 @@ fn provider_sync_excludes_subagents_from_provider_updates_and_catalog() {
     assert_eq!(result.sqlite_catalog_rows_inserted, 1);
     assert_eq!(result.sqlite_catalog_rows_removed, 1);
     for rollout in [&existing_child_rollout, &missing_child_rollout] {
-        let first: serde_json::Value = serde_json::from_str(
-            fs::read_to_string(rollout)
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(rollout).unwrap().lines().next().unwrap())
+                .unwrap();
         assert_eq!(first["payload"]["model_provider"], "openai");
     }
 
@@ -703,10 +866,7 @@ fn provider_sync_excludes_subagents_from_provider_updates_and_catalog() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(
-            child,
-            ("openai".to_string(), 0, "C:/old-child".to_string())
-        );
+        assert_eq!(child, ("openai".to_string(), 0, "C:/old-child".to_string()));
     }
 
     let catalog = Connection::open(&catalog_db).unwrap();
@@ -800,10 +960,7 @@ fn provider_sync_uses_spawn_edges_to_exclude_legacy_subagent_rollouts() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(
-        child,
-        ("openai".to_string(), 0, "C:/old-child".to_string())
-    );
+    assert_eq!(child, ("openai".to_string(), 0, "C:/old-child".to_string()));
 }
 
 #[test]
@@ -1057,7 +1214,13 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
                 ?1, 'apigather', 0, 1, 'C:/workspace', 'Same title',
                 ?2, ?3, 100000, ?4, ?5, 'main'
             )",
-            rusqlite::params![id, format!("C:/{id}.jsonl"), source, updated_at, thread_source],
+            rusqlite::params![
+                id,
+                format!("C:/{id}.jsonl"),
+                source,
+                updated_at,
+                thread_source
+            ],
         )
         .unwrap();
     }
@@ -1097,7 +1260,11 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
             r#"{"sub_agent":{"other":"review"}}"#,
             235000_i64,
         ),
-        ("internal-child", "internal_memory_consolidation", 237000_i64),
+        (
+            "internal-child",
+            "internal_memory_consolidation",
+            237000_i64,
+        ),
         ("edge-child", "cli", 240000_i64),
     ] {
         db.execute(
@@ -1136,7 +1303,9 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
     assert_eq!(result.sqlite_rows_updated, 5);
     let db = Connection::open(&catalog_db).unwrap();
     let mut stmt = db
-        .prepare("SELECT thread_id FROM local_thread_catalog WHERE host_id = 'local' ORDER BY thread_id")
+        .prepare(
+            "SELECT thread_id FROM local_thread_catalog WHERE host_id = 'local' ORDER BY thread_id",
+        )
         .unwrap();
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -1243,9 +1412,7 @@ fn provider_sync_prunes_existing_local_subagent_catalog_rows() {
 
     let db = Connection::open(&catalog_db).unwrap();
     let mut stmt = db
-        .prepare(
-            "SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id",
-        )
+        .prepare("SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id")
         .unwrap();
     let rows = stmt
         .query_map([], |row| {
@@ -2647,12 +2814,14 @@ fn session_index_preview_preserves_relation_only_roots_but_hides_spawned_childre
 
     let preview = preview_session_index_cleanup(Some(&home)).unwrap();
 
-    assert_eq!(preview.candidates.len(), 1);
-    assert_eq!(preview.candidates[0].id, ids[5]);
-    assert_eq!(
-        preview.candidates[0].reason,
-        SessionIndexCleanupReason::NonRootAgent
-    );
+    assert_eq!(preview.candidates.len(), 2);
+    let candidates = preview
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate.reason))
+        .collect::<Vec<_>>();
+    assert!(candidates.contains(&(ids[5], SessionIndexCleanupReason::NonRootAgent)));
+    assert!(candidates.contains(&(ids[7], SessionIndexCleanupReason::NonRootAgent)));
 }
 
 #[test]

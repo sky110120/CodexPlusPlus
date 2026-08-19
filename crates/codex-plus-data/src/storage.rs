@@ -15,6 +15,10 @@ pub fn delete_local_from_paths(
     backup_store: BackupStore,
     session: &SessionRef,
 ) -> DeleteResult {
+    let db_paths = db_paths.into_iter().collect::<Vec<_>>();
+    if let Err(error) = preflight_child_session_markers(&db_paths, &session.session_id) {
+        return failed(&session.session_id, error.to_string());
+    }
     let mut result = failed(
         &session.session_id,
         "Thread not found in local storage".to_string(),
@@ -40,6 +44,177 @@ pub fn delete_local_from_paths(
         result.backup_path = None;
     }
     result
+}
+
+fn preflight_child_session_markers(db_paths: &[PathBuf], session_id: &str) -> anyhow::Result<()> {
+    let thread_id = normalize_codex_thread_id(session_id);
+    let mut child_ids = HashSet::new();
+    for db_path in db_paths {
+        if !db_path.is_file() {
+            continue;
+        }
+        let db = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !has_table(&db, "thread_spawn_edges")?
+            || !has_columns(
+                &db,
+                "thread_spawn_edges",
+                &["parent_thread_id", "child_thread_id"],
+            )?
+        {
+            continue;
+        }
+        let mut stmt = db.prepare(
+            "SELECT DISTINCT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ?1 AND COALESCE(child_thread_id, '') <> ''",
+        )?;
+        for child_id in stmt.query_map([&thread_id], |row| row.get::<_, String>(0))? {
+            child_ids.insert(child_id?);
+        }
+    }
+    if child_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut durable_child_ids = HashSet::new();
+    let mut explicit_user_thread_ids = HashSet::new();
+    let mut rollout_paths = Vec::new();
+    for db_path in db_paths {
+        if !db_path.is_file() {
+            continue;
+        }
+        let db = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if has_table(&db, "agent_job_items")?
+            && has_columns(&db, "agent_job_items", &["assigned_thread_id"])?
+        {
+            let mut stmt = db.prepare(
+                "SELECT DISTINCT assigned_thread_id FROM agent_job_items WHERE COALESCE(assigned_thread_id, '') <> ''",
+            )?;
+            for assigned_thread_id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                let assigned_thread_id = assigned_thread_id?;
+                if child_ids.contains(&assigned_thread_id) {
+                    durable_child_ids.insert(assigned_thread_id);
+                }
+            }
+        }
+
+        let columns = table_columns(&db, "threads")?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if columns.contains("id") {
+            let source = optional_column_expression(&columns, "source", "''");
+            let thread_source = optional_column_expression(&columns, "thread_source", "NULL");
+            let rollout_path = optional_column_expression(&columns, "rollout_path", "''");
+            let sql = format!(
+                "SELECT id, {source}, {thread_source}, {rollout_path} FROM threads WHERE COALESCE(id, '') <> ''"
+            );
+            let mut stmt = db.prepare(&sql)?;
+            for row in stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, Option<String>>(2).unwrap_or(None),
+                    row.get::<_, String>(3).unwrap_or_default(),
+                ))
+            })? {
+                let (candidate_id, source, thread_source, rollout_path) = row?;
+                if !child_ids.contains(&candidate_id) {
+                    continue;
+                }
+                if crate::provider_sync::thread_source_is_user(thread_source.as_deref()) {
+                    explicit_user_thread_ids.insert(candidate_id.clone());
+                } else if crate::provider_sync::thread_source_marks_non_root(
+                    thread_source.as_deref(),
+                ) || crate::provider_sync::source_marks_non_root_agent(&source)
+                {
+                    durable_child_ids.insert(candidate_id.clone());
+                }
+                if !rollout_path.trim().is_empty() {
+                    rollout_paths.push((candidate_id, PathBuf::from(rollout_path)));
+                }
+            }
+        }
+
+        let catalog_columns = table_columns(&db, "local_thread_catalog")?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if catalog_columns.contains("thread_id") {
+            let source_kind = optional_column_expression(&catalog_columns, "source_kind", "''");
+            let thread_source =
+                optional_column_expression(&catalog_columns, "thread_source", "NULL");
+            let sql = format!(
+                "SELECT thread_id, {source_kind}, {thread_source} FROM local_thread_catalog WHERE COALESCE(thread_id, '') <> ''"
+            );
+            let mut stmt = db.prepare(&sql)?;
+            for row in stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, Option<String>>(2).unwrap_or(None),
+                ))
+            })? {
+                let (candidate_id, source_kind, thread_source) = row?;
+                if child_ids.contains(&candidate_id)
+                    && (crate::provider_sync::thread_source_marks_non_root(
+                        thread_source.as_deref(),
+                    ) || crate::provider_sync::source_marks_non_root_agent(&source_kind))
+                {
+                    durable_child_ids.insert(candidate_id);
+                }
+            }
+        }
+    }
+
+    for (child_id, rollout_path) in rollout_paths {
+        if rollout_session_meta_marks_non_root(&rollout_path, &child_id)? {
+            durable_child_ids.insert(child_id);
+        }
+    }
+
+    let mut edge_only_child_ids = child_ids
+        .difference(&durable_child_ids)
+        .filter(|child_id| !explicit_user_thread_ids.contains(*child_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    edge_only_child_ids.sort();
+    if edge_only_child_ids.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "删除已阻止：发现 {} 个仅由主会话关联边标记的子进程会话；本次未创建备份或修改数据。子进程 ID：{}",
+        edge_only_child_ids.len(),
+        edge_only_child_ids.join(", ")
+    )
+}
+
+fn rollout_session_meta_marks_non_root(path: &Path, thread_id: &str) -> anyhow::Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let file = File::open(path)?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        if payload
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != thread_id)
+        {
+            continue;
+        }
+        if payload.get("source").is_some_and(|source| {
+            crate::provider_sync::source_marks_non_root_agent(&source.to_string())
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

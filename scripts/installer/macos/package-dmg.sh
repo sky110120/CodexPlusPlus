@@ -14,7 +14,7 @@ ICON_ICNS="$DIST/$ICON_NAME"
 
 rm -rf "$DIST"
 mkdir -p "$STAGE"
-DMG_TMP_DIR="$(mktemp -d "$DIST/.dmg-tmp.XXXXXX")"
+DMG_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-plus-plus-dmg.XXXXXX")"
 trap 'rm -rf "$DMG_TMP_DIR"' EXIT
 DMG_TMP="$DMG_TMP_DIR/CodexPlusPlus-${VERSION}-macos-${ARCH}.dmg"
 

@@ -229,6 +229,19 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"blocking_process_ids": blocking_process_ids}),
         );
     }
+    let mut helper_started = false;
+    if settings.enhancements_enabled {
+        match hooks.helper_status(helper_port).await {
+            codex_plus_core::launcher::HelperStatus::Compatible => {}
+            codex_plus_core::launcher::HelperStatus::Missing => {
+                hooks.start_helper(helper_port).await?;
+                helper_started = true;
+            }
+            codex_plus_core::launcher::HelperStatus::Incompatible(reason) => {
+                anyhow::bail!("helper 端口 {helper_port} 已被不兼容的服务占用：{reason}");
+            }
+        }
+    }
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -237,13 +250,6 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
-    let mut helper_started = false;
-    if settings.enhancements_enabled
-        && !codex_plus_core::watcher::cdp_listening(helper_port)
-    {
-        hooks.start_helper(helper_port).await?;
-        helper_started = true;
-    }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
     let activated = process_ids
@@ -396,8 +402,8 @@ impl LaunchHooks for LauncherHooks {
         self.core.select_helper_port(requested)
     }
 
-    fn helper_available(&self, helper_port: u16) -> bool {
-        self.core.helper_available(helper_port)
+    async fn helper_status(&self, helper_port: u16) -> codex_plus_core::launcher::HelperStatus {
+        self.core.helper_status(helper_port).await
     }
 
     async fn load_settings(&self) -> anyhow::Result<codex_plus_core::settings::BackendSettings> {
