@@ -239,6 +239,26 @@ pub struct DeleteLocalSessionRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DeleteLocalSessionPayload {
+    pub delete_status: codex_plus_core::models::DeleteStatus,
+    pub session_id: String,
+    pub undo_token: Option<String>,
+    pub backup_path: Option<String>,
+}
+
+impl From<DeleteResult> for DeleteLocalSessionPayload {
+    fn from(result: DeleteResult) -> Self {
+        Self {
+            delete_status: result.status,
+            session_id: result.session_id,
+            undo_token: result.undo_token,
+            backup_path: result.backup_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayPayload {
     pub authenticated: bool,
     pub auth_source: String,
@@ -2316,15 +2336,16 @@ pub fn forget_zed_remote_project(id: String) -> CommandResult<ZedRemoteProjectsP
 }
 
 #[tauri::command]
-pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult<DeleteResult> {
+pub fn delete_local_session(
+    request: DeleteLocalSessionRequest,
+) -> CommandResult<DeleteLocalSessionPayload> {
     let session_id = request.session_id.trim();
     if session_id.is_empty() {
         return failed(
             "会话 ID 不能为空。",
-            DeleteResult {
-                status: codex_plus_core::models::DeleteStatus::Failed,
+            DeleteLocalSessionPayload {
+                delete_status: codex_plus_core::models::DeleteStatus::Failed,
                 session_id: String::new(),
-                message: "会话 ID 不能为空。".to_string(),
                 undo_token: None,
                 backup_path: None,
             },
@@ -2406,7 +2427,7 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
     CommandResult {
         status: status.to_string(),
         message: result.message.clone(),
-        payload: result,
+        payload: result.into(),
     }
 }
 
@@ -6003,9 +6024,13 @@ mod tests {
 
         assert_eq!(result.status, "ok");
         assert_eq!(
-            result.payload.status,
+            result.payload.delete_status,
             codex_plus_core::models::DeleteStatus::LocalDeleted
         );
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(serialized["status"], "ok");
+        assert_eq!(serialized["deleteStatus"], "local_deleted");
+        assert_eq!(serialized["sessionId"], "t1");
         let active = rusqlite::Connection::open(&active_db).unwrap();
         assert_eq!(
             active

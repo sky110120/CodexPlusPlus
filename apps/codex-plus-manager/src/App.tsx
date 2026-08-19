@@ -466,11 +466,10 @@ type ZedRemoteOpenResult = CommandResult<{
 }>;
 
 type DeleteLocalSessionResult = CommandResult<{
-  status: string;
-  session_id: string;
-  message: string;
-  undo_token: string | null;
-  backup_path: string | null;
+  deleteStatus: "server_deleted" | "local_deleted" | "partial" | "failed" | "undone" | string;
+  sessionId: string;
+  undoToken: string | null;
+  backupPath: string | null;
 }>;
 
 type ContextEntriesResult = CommandResult<{
