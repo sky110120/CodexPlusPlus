@@ -2770,16 +2770,13 @@ pub async fn preview_session_index_cleanup() -> CommandResult<Value> {
     .and_then(|result| result);
     match result {
         Ok(preview) => ok(
-            &format!(
-                "发现 {} 条仅存在于任务索引中的候选记录。",
-                preview.candidates.len()
-            ),
+            &format!("发现 {} 条普通任务索引清理候选。", preview.candidates.len()),
             json!({
                 "snapshotSha256": preview.snapshot_sha256,
                 "candidates": preview.candidates,
             }),
         ),
-        Err(error) => failed(&format!("预览失效任务索引失败：{error}"), json!({})),
+        Err(error) => failed(&format!("预览任务索引清理候选失败：{error}"), json!({})),
     }
 }
 
@@ -2796,7 +2793,7 @@ pub async fn apply_session_index_cleanup(
     match result {
         Ok(Ok(cleanup)) => ok(
             &format!(
-                "已清理 {} 条失效任务索引；原索引已完整备份。",
+                "已清理 {} 条普通任务索引；原索引已完整备份。",
                 cleanup.pruned_entries
             ),
             json!({
@@ -2811,11 +2808,11 @@ pub async fn apply_session_index_cleanup(
                 .map(|path| format!(" 备份目录：{}。", path.to_string_lossy()))
                 .unwrap_or_default();
             failed(
-                &format!("清理失效任务索引失败：{}{backup_hint}", error.message),
+                &format!("清理任务索引失败：{}{backup_hint}", error.message),
                 json!({ "backupDir": error.backup_dir }),
             )
         }
-        Err(error) => failed(&format!("清理失效任务索引失败：{error}"), json!({})),
+        Err(error) => failed(&format!("清理任务索引失败：{error}"), json!({})),
     }
 }
 

@@ -57,6 +57,14 @@ pub struct SessionIndexCleanupCandidate {
     pub id: String,
     pub thread_name: String,
     pub updated_at: String,
+    pub reason: SessionIndexCleanupReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIndexCleanupReason {
+    MissingLocalSource,
+    NonRootAgent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +165,19 @@ struct SessionIndexPlan {
     original_text: String,
     snapshot_sha256: String,
     candidates: Vec<SessionIndexCleanupCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionIndexEntry {
+    id: String,
+    thread_name: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Default)]
+struct SessionIndexThreadState {
+    live_thread_ids: HashSet<String>,
+    non_root_thread_ids: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1498,18 +1519,23 @@ fn rollout_files(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn collect_live_thread_ids(
+fn collect_session_index_thread_state(
     home: &Path,
     sqlite_paths: &[PathBuf],
-) -> anyhow::Result<HashSet<String>> {
-    let mut ids = HashSet::new();
+) -> anyhow::Result<SessionIndexThreadState> {
+    let thread_kinds = load_provider_sync_thread_kinds(sqlite_paths)?;
+    let explicit_user_thread_ids = thread_kinds.explicit_user_thread_ids;
+    let mut state = SessionIndexThreadState {
+        live_thread_ids: HashSet::new(),
+        non_root_thread_ids: thread_kinds.subagent_thread_ids,
+    };
     for path in rollout_files(home)? {
         if let Some(id) = path
             .file_name()
             .and_then(|name| name.to_str())
             .and_then(rollout_thread_id_from_filename)
         {
-            ids.insert(id);
+            state.live_thread_ids.insert(id);
         }
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -1524,21 +1550,31 @@ fn collect_live_thread_ids(
             if record.get("type").and_then(Value::as_str) != Some("session_meta") {
                 continue;
             }
-            if let Some(id) = record
-                .get("payload")
-                .and_then(Value::as_object)
-                .and_then(|payload| payload.get("id"))
+            let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            if let Some(id) = payload
+                .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
             {
-                ids.insert(id.to_string());
+                let id = id.to_string();
+                state.live_thread_ids.insert(id.clone());
+                if payload.get("source").is_some_and(source_value_is_subagent)
+                    && !explicit_user_thread_ids.contains(&id)
+                {
+                    state.non_root_thread_ids.insert(id);
+                }
             }
         }
     }
     for path in sqlite_paths {
-        ids.extend(sqlite_thread_ids(path)?);
+        state.live_thread_ids.extend(sqlite_thread_ids(path)?);
     }
-    Ok(ids)
+    state
+        .non_root_thread_ids
+        .retain(|thread_id| !explicit_user_thread_ids.contains(thread_id));
+    Ok(state)
 }
 
 fn rollout_thread_id_from_filename(name: &str) -> Option<String> {
@@ -1594,7 +1630,7 @@ fn sqlite_thread_ids(path: &Path) -> anyhow::Result<HashSet<String>> {
 
 fn plan_session_index_cleanup(
     path: &Path,
-    live_thread_ids: &HashSet<String>,
+    thread_state: &SessionIndexThreadState,
 ) -> anyhow::Result<Option<SessionIndexPlan>> {
     if !path.exists() {
         return Ok(None);
@@ -1604,10 +1640,23 @@ fn plan_session_index_cleanup(
     let mut candidates = Vec::new();
     for segment in original_text.split_inclusive('\n') {
         let (line, _) = split_line_ending(segment);
-        if let Some(candidate) = known_session_index_candidate(line)
-            && !live_thread_ids.contains(&candidate.id)
-        {
-            candidates.push(candidate);
+        let Some(entry) = known_session_index_entry(line) else {
+            continue;
+        };
+        let reason = if thread_state.non_root_thread_ids.contains(&entry.id) {
+            Some(SessionIndexCleanupReason::NonRootAgent)
+        } else if !thread_state.live_thread_ids.contains(&entry.id) {
+            Some(SessionIndexCleanupReason::MissingLocalSource)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            candidates.push(SessionIndexCleanupCandidate {
+                id: entry.id,
+                thread_name: entry.thread_name,
+                updated_at: entry.updated_at,
+                reason,
+            });
         }
     }
     Ok(Some(SessionIndexPlan {
@@ -1619,7 +1668,7 @@ fn plan_session_index_cleanup(
     }))
 }
 
-fn known_session_index_candidate(line: &str) -> Option<SessionIndexCleanupCandidate> {
+fn known_session_index_entry(line: &str) -> Option<SessionIndexEntry> {
     let record = serde_json::from_str::<Value>(line).ok()?;
     let object = record.as_object()?;
     if object.len() != 3
@@ -1635,7 +1684,7 @@ fn known_session_index_candidate(line: &str) -> Option<SessionIndexCleanupCandid
     if id.is_empty() || updated_at.trim().is_empty() {
         return None;
     }
-    Some(SessionIndexCleanupCandidate {
+    Some(SessionIndexEntry {
         id: id.to_string(),
         thread_name: thread_name.to_string(),
         updated_at: updated_at.to_string(),
@@ -1654,8 +1703,8 @@ fn filtered_session_index_text(
     let mut removed_entries = 0;
     for segment in plan.original_text.split_inclusive('\n') {
         let (line, line_ending) = split_line_ending(segment);
-        let remove = known_session_index_candidate(line)
-            .is_some_and(|candidate| selected_ids.contains(&candidate.id));
+        let remove =
+            known_session_index_entry(line).is_some_and(|entry| selected_ids.contains(&entry.id));
         if remove {
             removed_entries += 1;
         } else {
@@ -1674,8 +1723,8 @@ pub fn preview_session_index_cleanup(
         .unwrap_or_else(default_codex_home_dir);
     let sqlite_paths =
         codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(&home);
-    let live_thread_ids = collect_live_thread_ids(&home, &sqlite_paths)?;
-    let plan = plan_session_index_cleanup(&home.join("session_index.jsonl"), &live_thread_ids)?;
+    let thread_state = collect_session_index_thread_state(&home, &sqlite_paths)?;
+    let plan = plan_session_index_cleanup(&home.join("session_index.jsonl"), &thread_state)?;
     Ok(match plan {
         Some(plan) => SessionIndexCleanupPreview {
             snapshot_sha256: plan.snapshot_sha256,
@@ -1705,9 +1754,9 @@ pub fn apply_session_index_cleanup(
     let result = (|| {
         let sqlite_paths =
             codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(&home);
-        let live_thread_ids = collect_live_thread_ids(&home, &sqlite_paths)
+        let thread_state = collect_session_index_thread_state(&home, &sqlite_paths)
             .map_err(|error| cleanup_apply_error(error, None))?;
-        let plan = plan_session_index_cleanup(&home.join("session_index.jsonl"), &live_thread_ids)
+        let plan = plan_session_index_cleanup(&home.join("session_index.jsonl"), &thread_state)
             .map_err(|error| cleanup_apply_error(error, None))?
             .ok_or_else(|| cleanup_apply_error("session_index.jsonl 不存在，无法清理", None))?;
         if plan.snapshot_sha256 != expected_snapshot_sha256 {

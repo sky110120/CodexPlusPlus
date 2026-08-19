@@ -1,6 +1,6 @@
 use codex_plus_data::{
-    ProviderSyncStatus, ProviderSyncTargetSource, apply_session_index_cleanup,
-    load_provider_sync_targets, preview_session_index_cleanup,
+    ProviderSyncStatus, ProviderSyncTargetSource, SessionIndexCleanupReason,
+    apply_session_index_cleanup, load_provider_sync_targets, preview_session_index_cleanup,
     remote_control_session_recovery_candidate_exists, run_provider_sync,
     run_provider_sync_with_target,
     run_remote_control_session_catalog_recovery_for_thread_with_target,
@@ -2513,6 +2513,10 @@ fn session_index_cleanup_preserves_all_local_sources_and_unknown_records() {
 
     assert_eq!(preview.candidates.len(), 1);
     assert_eq!(preview.candidates[0].id, stale_id);
+    assert_eq!(
+        preview.candidates[0].reason,
+        SessionIndexCleanupReason::MissingLocalSource
+    );
     let result = apply_session_index_cleanup(
         Some(&home),
         &preview.snapshot_sha256,
@@ -2570,7 +2574,7 @@ fn session_index_cleanup_aborts_when_codex_changes_index_after_preview() {
 }
 
 #[test]
-fn session_index_preview_preserves_relation_only_sqlite_thread_references() {
+fn session_index_preview_preserves_relation_only_roots_but_hides_spawned_children() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     let sqlite_dir = home.join("sqlite");
@@ -2643,7 +2647,134 @@ fn session_index_preview_preserves_relation_only_sqlite_thread_references() {
 
     let preview = preview_session_index_cleanup(Some(&home)).unwrap();
 
-    assert!(preview.candidates.is_empty());
+    assert_eq!(preview.candidates.len(), 1);
+    assert_eq!(preview.candidates[0].id, ids[5]);
+    assert_eq!(
+        preview.candidates[0].reason,
+        SessionIndexCleanupReason::NonRootAgent
+    );
+}
+
+#[test]
+fn session_index_cleanup_hides_subagent_without_deleting_source_records() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    let parent_id = "019f6100-0000-7000-8000-000000000001";
+    let child_id = "019f6100-0000-7000-8000-000000000002";
+    let explicit_user_id = "019f6100-0000-7000-8000-000000000003";
+    let child_rollout = home.join(format!("sessions/rollout-{child_id}.jsonl"));
+    write_subagent_rollout(
+        &child_rollout,
+        "openai",
+        child_id,
+        parent_id,
+        "C:/workspace",
+    );
+
+    let state_db = home.join("state_5.sqlite");
+    let db = Connection::open(&state_db).unwrap();
+    db.execute(
+        "CREATE TABLE threads (
+            id TEXT PRIMARY KEY, source TEXT, thread_source TEXT
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, 'vscode', 'user')",
+        [parent_id],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, '{\"subagent\":{\"other\":\"review\"}}', 'subagent')",
+        [child_id],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, '{\"subagent\":{\"other\":\"legacy\"}}', 'user')",
+        [explicit_user_id],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+        [parent_id, child_id],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+        [parent_id, explicit_user_id],
+    )
+    .unwrap();
+    drop(db);
+
+    let original_index = format!(
+        "{}\n{}\n{}\n",
+        session_index_line(parent_id, "Parent"),
+        session_index_line(child_id, "Internal child"),
+        session_index_line(explicit_user_id, "Explicit user"),
+    );
+    fs::write(home.join("session_index.jsonl"), &original_index).unwrap();
+
+    let preview = preview_session_index_cleanup(Some(&home)).unwrap();
+
+    assert_eq!(preview.candidates.len(), 1);
+    assert_eq!(preview.candidates[0].id, child_id);
+    assert_eq!(
+        preview.candidates[0].reason,
+        SessionIndexCleanupReason::NonRootAgent
+    );
+    let result = apply_session_index_cleanup(
+        Some(&home),
+        &preview.snapshot_sha256,
+        &[child_id.to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(result.pruned_entries, 1);
+    let next_index = fs::read_to_string(home.join("session_index.jsonl")).unwrap();
+    assert!(next_index.contains(parent_id));
+    assert!(!next_index.contains(child_id));
+    assert!(next_index.contains(explicit_user_id));
+    assert!(child_rollout.exists());
+    assert!(
+        fs::read_to_string(&child_rollout)
+            .unwrap()
+            .contains(child_id)
+    );
+
+    let db = Connection::open(&state_db).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            [child_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            [explicit_user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM thread_spawn_edges WHERE parent_thread_id = ?1 AND child_thread_id = ?2",
+            [parent_id, child_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
 }
 
 #[test]

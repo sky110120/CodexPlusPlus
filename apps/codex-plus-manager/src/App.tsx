@@ -629,6 +629,7 @@ type SessionIndexCleanupCandidate = {
   id: string;
   threadName: string;
   updatedAt: string;
+  reason: "missing_local_source" | "non_root_agent";
 };
 
 type SessionIndexCleanupPreviewPayload = {
@@ -754,7 +755,7 @@ function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>)
   const pruned = result.prunedSessionIndexEntries ?? 0;
   const target = result.targetProvider || t("当前 provider");
   const skipped = result.skippedLockedRolloutFiles?.length ?? 0;
-  const prunedText = pruned ? tf("，清理 {0} 条失效任务索引", [pruned]) : "";
+  const prunedText = pruned ? tf("，清理 {0} 条普通任务索引", [pruned]) : "";
   const skippedText = skipped ? tf("，跳过 {0} 个占用文件", [skipped]) : "";
   const catalogText = insertedCatalogRows ? tf("，补齐 {0} 条侧边栏索引", [insertedCatalogRows]) : "";
   const catalogCleanupText = removedCatalogRows
@@ -2302,7 +2303,7 @@ export function App() {
           if (!preview) {
             cleanupFailure = {
               status: "failed",
-              message: t("幽灵任务索引处理失败，请查看错误提示后重试。"),
+              message: t("任务索引处理失败，请查看错误提示后重试。"),
             };
           } else if (isSuccessStatus(preview.status) && preview.candidates.length > 0) {
             const selectedIds = await selectSessionIndexCleanupCandidates(preview.candidates);
@@ -2321,7 +2322,7 @@ export function App() {
               } else {
                 cleanupFailure = cleanup ?? {
                   status: "failed",
-                  message: t("幽灵任务索引处理失败，请查看错误提示后重试。"),
+                  message: t("任务索引处理失败，请查看错误提示后重试。"),
                 };
               }
             }
@@ -2352,7 +2353,7 @@ export function App() {
         }
         await refreshProviderSyncTargets(true);
         const noticeTitle =
-          completion.noticeKind === "cleanup" ? t("清理幽灵任务索引") : t("历史会话修复");
+          completion.noticeKind === "cleanup" ? t("清理任务索引") : t("历史会话修复");
         showNotice(
           noticeTitle,
           completion.result.message,
@@ -8102,7 +8103,13 @@ function SessionIndexCleanupDialog({
   onConfirm: (selectedIds: string[]) => void;
   onCancel: () => void;
 }) {
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(
+    () => new Set(
+      request.candidates
+        .filter((candidate) => candidate.reason === "non_root_agent")
+        .map((candidate) => candidate.id),
+    ),
+  );
   const allSelected = request.candidates.length > 0 && selectedIds.size === request.candidates.length;
   const toggleCandidate = (id: string, selected: boolean) => {
     setSelectedIds((current) => {
@@ -8118,9 +8125,9 @@ function SessionIndexCleanupDialog({
       <div className="modal-card session-index-cleanup-modal">
         <div className="modal-head">
           <div>
-            <h2>{t("清理幽灵任务索引")}</h2>
+            <h2>{t("清理任务索引")}</h2>
             <p className="modal-message">
-              {tf("发现 {0} 条仅存在于 session_index.jsonl、未在本地数据库或 rollout 中找到来源的候选记录。它们也可能是云端或尚未落盘的任务，请逐项核对。任务标题仅用于预览，实际按 thread ID 与数据来源判断。清理前请先完全退出 Codex App / ChatGPT。", [request.candidates.length])}
+              {tf("发现 {0} 条不应保留在普通任务索引中的候选记录，包括已确认的内部子任务，以及仅存在于 session_index.jsonl 的疑似失效记录。清理只会移除普通任务索引；子任务的数据库记录、rollout 和父子关系会保留。清理前请先完全退出 Codex App / ChatGPT。", [request.candidates.length])}
             </p>
           </div>
           <button className="toast-close" onClick={onCancel} type="button">×</button>
@@ -8146,6 +8153,11 @@ function SessionIndexCleanupDialog({
               <span>
                 <strong>{candidate.threadName || t("未命名任务")}</strong>
                 <code>{candidate.id}</code>
+                <small>
+                  {candidate.reason === "non_root_agent"
+                    ? t("内部子任务：仅从普通任务列表隐藏，原始记录与父子关系保留。")
+                    : t("未找到本地数据库或 rollout 来源，请确认后清理。")}
+                </small>
                 <small>{candidate.updatedAt}</small>
               </span>
             </label>

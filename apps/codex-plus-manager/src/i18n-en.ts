@@ -717,8 +717,12 @@ export const EN_PLAIN: Record<string, string> = {
   "添加聚合供应商": "Add aggregate provider",
   "清空选择": "Clear selection",
   "清除保存路径": "Clear saved path",
-  "清理幽灵任务索引": "Clean up ghost task index",
-  "幽灵任务索引处理失败，请查看错误提示后重试。": "Ghost task index processing failed. Check the error message and retry.",
+  "清理任务索引": "Clean up task index",
+  "任务索引处理失败，请查看错误提示后重试。": "Task index processing failed. Check the error message and retry.",
+  "内部子任务：仅从普通任务列表隐藏，原始记录与父子关系保留。":
+    "Internal subtask: hidden only from the regular task list; source records and parent-child links are preserved.",
+  "未找到本地数据库或 rollout 来源，请确认后清理。":
+    "No local database or rollout source was found. Review before cleanup.",
   "点击刷新会话读取本地数据库": "Click Refresh Sessions to read the local database",
   "点击刷新市场加载远程脚本。": "Click Refresh Marketplace to load remote scripts.",
   "版本信息、项目链接、GitHub Release 更新、日志与诊断": "Version info, project links, GitHub Release updates, logs and diagnostics",
@@ -913,7 +917,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "，补齐 {0} 条侧边栏索引": ", added {0} missing sidebar index entry/entries",
   "，清理 {0} 条误列的子任务侧边栏索引":
     ", removed {0} incorrectly listed subtask sidebar index entry/entries",
-  "，清理 {0} 条失效任务索引": ", pruned {0} stale task index entry/entries",
+  "，清理 {0} 条普通任务索引": ", removed {0} regular task index entry/entries",
   "\n...以及另外 {0} 个会话": "\n...and {0} more session(s)",
   "{0}（{1}）": "{0} ({1})",
   "{0} · {1} 个成员": "{0} · {1} member(s)",
@@ -970,8 +974,8 @@ export const EN_TEMPLATE: Record<string, string> = {
   "第 {0} 页，每页最多 {1} 条，按更新时间倒序显示": "Page {0}, up to {1} sessions per page, newest first",
   "打开选择器失败：{0}": "Failed to open the picker: {0}",
   "正在同步到 {0}…": "Syncing to {0}…",
-  "发现 {0} 条仅存在于 session_index.jsonl、未在本地数据库或 rollout 中找到来源的候选记录。它们也可能是云端或尚未落盘的任务，请逐项核对。任务标题仅用于预览，实际按 thread ID 与数据来源判断。清理前请先完全退出 Codex App / ChatGPT。":
-    "Found {0} candidate record(s) that exist only in session_index.jsonl and have no source in the local databases or rollout files. They may still represent cloud-only or not-yet-persisted tasks, so review each item. Titles are shown only for preview; cleanup is decided by thread ID and data sources. Fully exit Codex App / ChatGPT before cleanup.",
+  "发现 {0} 条不应保留在普通任务索引中的候选记录，包括已确认的内部子任务，以及仅存在于 session_index.jsonl 的疑似失效记录。清理只会移除普通任务索引；子任务的数据库记录、rollout 和父子关系会保留。清理前请先完全退出 Codex App / ChatGPT。":
+    "Found {0} candidate record(s) that should not remain in the regular task index, including confirmed internal subtasks and suspected stale records found only in session_index.jsonl. Cleanup removes only the regular task index entry; subtask database records, rollout files, and parent-child links are preserved. Fully exit Codex App / ChatGPT before cleanup.",
   "确认清理 {0} 条": "Confirm cleanup of {0}",
   "清单更新时间：{0}": "Manifest updated at: {0}",
   "留空使用默认：{0}": "Leave empty to use the default: {0}",
