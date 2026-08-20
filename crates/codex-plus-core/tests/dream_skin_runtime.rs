@@ -1,6 +1,7 @@
 use codex_plus_core::dream_skin_runtime::{
     DreamSkinRuntimeStatus, DreamSkinState, apply_dream_skin_live, macos_arch_name,
-    parse_renderer_verification, windows_app_path_matches_registered_root,
+    parse_renderer_verification, renderer_verification_script,
+    windows_app_path_matches_registered_root,
 };
 use std::path::Path;
 
@@ -117,6 +118,19 @@ fn verification_accepts_target_project_live_contract() {
 
     assert_eq!(result.state, DreamSkinState::Pass);
     assert!(result.pass);
+}
+
+#[test]
+fn verification_script_supports_managed_versions_and_modern_composers() {
+    let script = renderer_verification_script();
+
+    assert!(script.contains("window.__CODEX_PLUS_VERSION__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__"));
+    assert!(script.contains(".composer-surface-chrome"));
+    assert!(script.contains("[role=\"textbox\"][contenteditable=\"true\"]"));
+    assert!(script.contains("textarea:not([disabled])"));
 }
 
 #[test]

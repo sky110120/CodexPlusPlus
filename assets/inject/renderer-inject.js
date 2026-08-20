@@ -3,6 +3,47 @@
   // so this bundle cannot create UI in embedded browser documents.
   const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
+  const codexPlusRendererRuntimeVersion = "7";
+  const existingCodexPlusRendererRuntime = window.__CODEX_PLUS_RENDERER_RUNTIME__;
+  if (!codexPlusIsNodeTestHarness
+      && existingCodexPlusRendererRuntime?.version === codexPlusRendererRuntimeVersion
+      && typeof existingCodexPlusRendererRuntime.refresh === "function") {
+    existingCodexPlusRendererRuntime.refresh();
+    return;
+  }
+  if (!codexPlusIsNodeTestHarness) {
+    try {
+      existingCodexPlusRendererRuntime?.destroy?.();
+    } catch {
+    }
+    clearInterval(window.__codexPlusBackendHeartbeat);
+    clearTimeout(window.__codexSessionDeleteScanTimer);
+    clearTimeout(window.__codexZedRemoteMenuRefreshTimer);
+    clearTimeout(window.__codexUpstreamBranchInjectTimer);
+    window.__codexSessionDeleteObserver?.disconnect?.();
+    window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
+    document.querySelectorAll(".codex-plus-modal-overlay").forEach((node) => node.remove());
+  }
+  const codexPlusRendererRuntimeGeneration = codexPlusIsNodeTestHarness
+    ? 0
+    : (Number(window.__CODEX_PLUS_RENDERER_RUNTIME_GENERATION__) || 0) + 1;
+  if (!codexPlusIsNodeTestHarness) {
+    window.__CODEX_PLUS_RENDERER_RUNTIME_GENERATION__ = codexPlusRendererRuntimeGeneration;
+  }
+  const codexPlusRendererTimers = new Set();
+  function isCurrentCodexPlusRendererRuntime() {
+    return codexPlusIsNodeTestHarness
+      || window.__CODEX_PLUS_RENDERER_RUNTIME_GENERATION__ === codexPlusRendererRuntimeGeneration;
+  }
+  function scheduleCodexPlusRendererTimeout(callback, delay) {
+    const timer = window.setTimeout(() => {
+      codexPlusRendererTimers.delete(timer);
+      if (!isCurrentCodexPlusRendererRuntime()) return;
+      callback();
+    }, delay);
+    codexPlusRendererTimers.add(timer);
+    return timer;
+  }
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
   function installCodexPlusFastStartup() {
@@ -399,7 +440,7 @@
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
   const upstreamBranchSelectionKey = "codexUpstreamBranchSelection";
   const upstreamProjectContextKey = "codexUpstreamProjectContext";
-  const zedRemoteOpenInMenuVersion = "1";
+  const zedRemoteOpenInMenuVersion = `2-${codexPlusRendererRuntimeVersion}`;
   const zedRemoteOpenInMenuActivationWindowMs = 600;
   const styleId = "codex-delete-style";
   const codexDeleteStyleVersion = "16";
@@ -465,10 +506,10 @@
   const codexThreadServiceTierKey = "codexThreadServiceTierOverrides";
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
-  const codexServiceTierRequestOverrideVersion = "8";
-  const codexAppServerModelRequestPatchVersion = "5";
+  const codexServiceTierRequestOverrideVersion = `8-${codexPlusRendererRuntimeVersion}`;
+  const codexAppServerModelRequestPatchVersion = `5-${codexPlusRendererRuntimeVersion}`;
   const codexRemoteSessionRecoveryVersion = "4";
-  const codexPluginMarketplaceUnlockVersion = "15";
+  const codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`;
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -1195,6 +1236,30 @@
     return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
+  function disabledCodexPlusSettings() {
+    return {
+      pluginMarketplaceUnlock: false,
+      modelWhitelistUnlock: false,
+      sessionDelete: false,
+      markdownExport: false,
+      pasteFix: false,
+      threadIdBadge: false,
+      conversationView: false,
+      conversationViewMaxWidth: conversationViewDefaultWidth,
+      threadScrollRestore: false,
+      zedRemoteOpen: false,
+      upstreamWorktreeCreate: false,
+      nativeMenuPlacement: false,
+      serviceTierControls: false,
+      petRealMouseLook: false,
+      stepwise: false,
+      dreamSkinEnabled: false,
+      dreamSkinPaused: false,
+      dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {},
+      dreamSkinImagePath: "",
+    };
+  }
+
   const codexPlusBackendSettingMap = {
     pluginMarketplaceUnlock: "codexAppPluginMarketplaceUnlock",
     modelWhitelistUnlock: "codexAppModelWhitelistUnlock",
@@ -1216,6 +1281,9 @@
     dreamSkinImagePath: "codexAppDreamSkinImagePath",
   };
   const codexPlusBackendMappedSettings = new Set(Object.keys(codexPlusBackendSettingMap));
+  const codexPlusBackendLocalSettingMap = new Map(
+    Object.entries(codexPlusBackendSettingMap).map(([localKey, backendKey]) => [backendKey, localKey]),
+  );
 
   function backendCodexPlusSettings() {
     const settings = {};
@@ -1230,29 +1298,7 @@
 
   function codexPlusSettings() {
     const relayPatchDisabled = codexPlusBackendSettings.launchMode === "relay";
-    if (codexPlusBackendSettings.enhancementsEnabled === false) {
-      return {
-        pluginMarketplaceUnlock: false,
-        modelWhitelistUnlock: false,
-        sessionDelete: false,
-        markdownExport: false,
-        pasteFix: false,
-        threadIdBadge: false,
-        conversationView: false,
-        conversationViewMaxWidth: conversationViewDefaultWidth,
-        threadScrollRestore: false,
-        zedRemoteOpen: false,
-        upstreamWorktreeCreate: false,
-        nativeMenuPlacement: false,
-        serviceTierControls: false,
-        petRealMouseLook: false,
-        stepwise: false,
-        dreamSkinEnabled: false,
-        dreamSkinPaused: false,
-        dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {},
-        dreamSkinImagePath: "",
-      };
-    }
+    if (!isCurrentCodexPlusRendererRuntime() || codexPlusBackendSettings.enhancementsEnabled === false) return disabledCodexPlusSettings();
     try {
       const settings = { ...defaultCodexPlusSettings(), ...JSON.parse(localStorage.getItem(codexPlusSettingsKey) || "{}"), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
@@ -1573,6 +1619,11 @@
   }
 
   function ensureDreamSkinCompanion(theme) {
+    const settings = codexPlusSettings();
+    if (codexPlusBackendSettingsLoaded && (!settings.dreamSkinEnabled || settings.dreamSkinPaused)) {
+      removeDreamSkinCompanion();
+      return;
+    }
     const config = dreamSkinCompanionConfig(theme);
     const composer = visibleDreamSkinComposer();
     if (!config || !composer) {
@@ -1600,7 +1651,19 @@
       document.body.appendChild(companion);
     }
     if (companion.src !== config.dataUrl) {
-      companion.onload = () => ensureDreamSkinCompanion(theme);
+      const expectedDataUrl = config.dataUrl;
+      companion.onload = () => {
+        const latestSettings = codexPlusSettings();
+        if (!latestSettings.dreamSkinEnabled || latestSettings.dreamSkinPaused) {
+          removeDreamSkinCompanion();
+          return;
+        }
+        if (document.getElementById(dreamSkinCompanionId) !== companion) return;
+        if (companion.getAttribute("src") !== expectedDataUrl) return;
+        const latestTheme = window.__CODEX_PLUS_DREAM_SKIN_THEME__ || latestSettings.dreamSkinThemeConfig;
+        if (dreamSkinCompanionConfig(latestTheme)?.dataUrl !== expectedDataUrl) return;
+        ensureDreamSkinCompanion(latestTheme);
+      };
       companion.src = config.dataUrl;
     }
 
@@ -1675,7 +1738,20 @@
       "--dream-skin-tagline",
       "--dream-skin-project-prefix",
       "--dream-skin-project-label",
+      "--ds-theme-color-background",
+      "--ds-theme-color-panel",
+      "--ds-theme-color-panel-alt",
+      "--ds-theme-color-accent",
+      "--ds-theme-color-accent-alt",
+      "--ds-theme-color-secondary",
+      "--ds-theme-color-highlight",
+      "--ds-theme-color-text",
+      "--ds-theme-color-muted",
+      "--ds-theme-color-line",
+      "--ds-theme-image-focus-x",
+      "--ds-theme-image-focus-y",
     ].forEach((name) => root?.style.removeProperty(name));
+    document.querySelectorAll("[data-ds-part]").forEach((node) => node.removeAttribute("data-ds-part"));
     document.querySelectorAll(".dream-home").forEach((node) => node.classList.remove("dream-home"));
     document.querySelectorAll('[role="main"][data-dream-home-layout]').forEach((node) => {
       node.removeAttribute("data-dream-home-layout");
@@ -1723,6 +1799,8 @@
 
   function cleanupDreamSkin() {
     window.__CODEX_DREAM_SKIN_DISABLED__ = true;
+    window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__?.disconnect?.();
+    delete window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__;
     const state = window.__CODEX_DREAM_SKIN_STATE__;
     if (typeof state?.cleanup === "function" && state.cleanup !== cleanupDreamSkin) {
       try {
@@ -2009,13 +2087,83 @@
   window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ = codexPlusDreamSkinRevision;
   window.__CODEX_PLUS_APPLY_DREAM_SKIN__ = applyDreamSkinLiveUpdate;
 
+  function applyCodexPlusSettingRuntimeEffect(key, value) {
+    if (key === "threadScrollRestore" && !value) {
+      cleanupThreadScrollRestoreRuntime();
+    }
+    if (key === "serviceTierControls") {
+      if (value) {
+        void loadCodexServiceTierState();
+      } else {
+        codexServiceTierLoadSeq += 1;
+        removeCodexServiceTierBadges();
+        refreshCodexServiceTierControls();
+      }
+    }
+    if (key === "threadIdBadge" && !value) {
+      removeThreadIdBadges();
+      threadIdBadgeActive = false;
+    }
+    if ((key === "sessionDelete" || key === "markdownExport") && !value) {
+      cleanupSessionActionRuntime();
+    }
+    if (key === "sessionDelete" && !value) window.__codexDeleteConfirmCancel?.();
+    if (key === "conversationView" && !value) cleanupConversationView();
+    if (key === "zedRemoteOpen" && !value) {
+      removeZedRemoteButtons();
+      removeZedRemoteOpenInMenuItems();
+    }
+    if (key === "upstreamWorktreeCreate" && !value) cleanupUpstreamWorktreeRuntime();
+    if (key === "pluginMarketplaceUnlock" && !value) clearPluginPatchArtifacts();
+    if (key === "modelWhitelistUnlock" && !value) clearCodexModelWhitelistRuntime();
+    if (key === "stepwise") syncStepwisePanel(value);
+    if (key === "pasteFix") syncCodexPlusPasteFix(value);
+  }
+
+  function disableCodexPlusRuntimeFeatures() {
+    [
+      "threadScrollRestore",
+      "serviceTierControls",
+      "threadIdBadge",
+      "sessionDelete",
+      "markdownExport",
+      "conversationView",
+      "zedRemoteOpen",
+      "upstreamWorktreeCreate",
+      "pluginMarketplaceUnlock",
+      "modelWhitelistUnlock",
+      "stepwise",
+      "pasteFix",
+    ].forEach((key) => applyCodexPlusSettingRuntimeEffect(key, false));
+    cleanupDreamSkin();
+  }
+
+  function syncCodexPlusRuntimeFeatures(previousSettings = null) {
+    if (codexPlusBackendSettings.enhancementsEnabled === false) {
+      disableCodexPlusRuntimeFeatures();
+      return;
+    }
+    const syncAll = !previousSettings || previousSettings.enhancementsEnabled === false;
+    Object.entries(codexPlusBackendSettingMap).forEach(([localKey, backendKey]) => {
+      const value = codexPlusBackendSettings[backendKey];
+      if (typeof value !== "boolean") return;
+      if (syncAll || previousSettings[backendKey] !== value) {
+        applyCodexPlusSettingRuntimeEffect(localKey, value);
+      }
+    });
+  }
+
   function setCodexPlusSetting(key, value) {
     const backendKey = codexPlusBackendSettingMap[key];
     if (backendKey) {
-      if (key === "stepwise") syncStepwisePanel(value);
-      void setBackendSetting(backendKey, value).then(() => {
+      if (codexPlusBackendSettings.enhancementsEnabled === false) return;
+      const update = setBackendSetting(backendKey, value);
+      applyCodexPlusSettingRuntimeEffect(key, value);
+      void update.then(() => {
         if (key === "stepwise") {
-          Promise.resolve(window.__codexStepwisePanel?.loadSettings?.()).then(() => syncStepwisePanel(value));
+          Promise.resolve(window.__codexStepwisePanel?.loadSettings?.()).then(() => {
+            if (codexPlusSettings().stepwise === value) syncStepwisePanel(value);
+          });
         }
       }).catch(() => {
         void loadBackendSettings();
@@ -2030,26 +2178,7 @@
     }
     const next = { ...stored, [key]: value };
     localStorage.setItem(codexPlusSettingsKey, JSON.stringify(next));
-    if (key === "threadScrollRestore" && !value) {
-      clearTimeout(window.__codexThreadScrollSaveTimer);
-      window.__codexThreadScrollSaveTimer = null;
-      window.__codexThreadScrollRestoreRevision = (window.__codexThreadScrollRestoreRevision || 0) + 1;
-      window.__codexThreadScrollSyncRevision = (window.__codexThreadScrollSyncRevision || 0) + 1;
-      (window.__codexThreadScrollRestoreTimers || []).forEach((timer) => clearTimeout(timer));
-      window.__codexThreadScrollRestoreTimers = [];
-      (window.__codexThreadScrollSyncTimers || []).forEach((timer) => clearTimeout(timer));
-      window.__codexThreadScrollSyncTimers = [];
-      window.__codexThreadScrollRuntime = null;
-    }
-    if (key === "serviceTierControls") {
-      if (value) {
-        void loadCodexServiceTierState();
-      } else {
-        removeCodexServiceTierBadges();
-        refreshCodexServiceTierControls();
-      }
-    }
-    if (key === "stepwise") syncStepwisePanel(value);
+    applyCodexPlusSettingRuntimeEffect(key, value);
     renderCodexPlusMenu();
     scan();
   }
@@ -2059,6 +2188,17 @@
       window.__codexStepwisePanel?.syncSettings?.({ enabled: !!enabled });
     } catch (error) {
       sendCodexPlusDiagnostic("stepwise_sync_failed", {
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+      });
+    }
+  }
+
+  function syncCodexPlusPasteFix(enabled = codexPlusSettings().pasteFix) {
+    try {
+      window.__CODEX_PLUS_PASTE_FIX_RUNTIME__?.sync?.(!!enabled);
+    } catch (error) {
+      sendCodexPlusDiagnostic("paste_fix_sync_failed", {
         errorName: error?.name || "",
         errorMessage: error?.message || String(error),
       });
@@ -2096,12 +2236,13 @@
 
   function renderCodexPlusMenu() {
     const settings = codexPlusSettings();
+    const enhancementsEnabled = codexPlusBackendSettings.enhancementsEnabled !== false;
     document.querySelectorAll(".codex-plus-toggle[data-codex-plus-setting]").forEach((button) => {
       const key = button.getAttribute("data-codex-plus-setting");
       const waitsForBackend = codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded;
       button.dataset.enabled = String(!!settings[key]);
       button.dataset.pending = String(waitsForBackend);
-      button.disabled = waitsForBackend || button.dataset.relayUnneeded === "true";
+      button.disabled = !enhancementsEnabled || waitsForBackend || button.dataset.relayUnneeded === "true";
     });
     refreshConversationViewControls();
     refreshCodexServiceTierControls();
@@ -2109,6 +2250,10 @@
 
   let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, launchMode: "patch", codexAppVersion: "" };
   let codexPlusBackendSettingsSeq = 0;
+  let codexPlusBackendSettingsLoadSeq = 0;
+  let codexPlusBackendSettingsWriteQueue = Promise.resolve();
+  const codexPlusBackendSettingSeqByKey = new Map();
+  const codexPlusBackendConfirmedSettings = new Map();
   const codexPluginLegacyEntryUnlockBeforeVersion = "26.601.2237";
   const codexPluginBridgeRequestUnlockFromVersion = "26.616.0";
   const codexPluginBroadCatalogKindsFromVersion = "26.803.0";
@@ -2187,6 +2332,7 @@
     fastModelName: "",
     fastSupported: false,
   };
+  let codexServiceTierLoadSeq = 0;
   const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
   const codexServiceTierFallbackFastValue = "priority";
   const codexServiceTierModulePromises = new Map();
@@ -2863,7 +3009,9 @@
   }
 
   async function loadCodexServiceTierState() {
+    const loadSeq = ++codexServiceTierLoadSeq;
     if (!codexPlusSettings().serviceTierControls) {
+      if (loadSeq !== codexServiceTierLoadSeq) return;
       codexServiceTierState = { ...codexServiceTierState, status: "idle", message: "未启用" };
       refreshCodexServiceTierControls();
       return;
@@ -2872,6 +3020,9 @@
     refreshCodexServiceTierControls();
     try {
       const { serviceTier, configServiceTier, serviceTierSource } = await resolveInheritedServiceTier();
+      if (!isCurrentCodexPlusRendererRuntime()
+          || loadSeq !== codexServiceTierLoadSeq
+          || !codexPlusSettings().serviceTierControls) return;
       codexServiceTierState = {
         ...codexServiceTierState,
         status: "ok",
@@ -2881,6 +3032,9 @@
         message: serviceTierGlobalStatusMessage(serviceTier ?? configServiceTier),
       };
     } catch (error) {
+      if (!isCurrentCodexPlusRendererRuntime()
+          || loadSeq !== codexServiceTierLoadSeq
+          || !codexPlusSettings().serviceTierControls) return;
       codexServiceTierState = {
         ...codexServiceTierState,
         status: "failed",
@@ -2891,7 +3045,9 @@
         errorMessage: error?.message || String(error),
       });
     } finally {
-      refreshCodexServiceTierControls();
+      if (isCurrentCodexPlusRendererRuntime() && loadSeq === codexServiceTierLoadSeq) {
+        refreshCodexServiceTierControls();
+      }
     }
   }
 
@@ -3409,52 +3565,100 @@
   }
 
   async function loadBackendSettings() {
-    const seq = codexPlusBackendSettingsSeq;
+    if (!isCurrentCodexPlusRendererRuntime()) return false;
+    const settingsSeq = codexPlusBackendSettingsSeq;
+    const loadSeq = ++codexPlusBackendSettingsLoadSeq;
     try {
+      await codexPlusBackendSettingsWriteQueue;
+      if (!isCurrentCodexPlusRendererRuntime()) return false;
       const settings = await postJson("/settings/get", {});
       if (!settings || typeof settings !== "object" || (!("launchMode" in settings) && !("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
         throw new Error("invalid backend settings response");
       }
-      if (seq !== codexPlusBackendSettingsSeq) {
+      if (!isCurrentCodexPlusRendererRuntime()
+          || loadSeq !== codexPlusBackendSettingsLoadSeq
+          || settingsSeq !== codexPlusBackendSettingsSeq) {
         return false;
       }
+      const previousSettings = codexPlusBackendSettings;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+      Object.entries(settings).forEach(([key, value]) => codexPlusBackendConfirmedSettings.set(key, value));
       codexPlusBackendSettingsLoaded = true;
+      syncCodexPlusRuntimeFeatures(previousSettings);
       if (codexRemoteSessionProviderNormalizationEnabled()) {
         void loadCodexModelCatalog();
       }
       refreshCodexPlusBackendToggles();
       return true;
     } catch (_) {
-      refreshCodexPlusBackendToggles();
+      if (isCurrentCodexPlusRendererRuntime()) refreshCodexPlusBackendToggles();
       return false;
     }
   }
 
   function loadBackendSettingsForStartup(attempt = 0) {
     loadBackendSettings().then((loaded) => {
+      if (!isCurrentCodexPlusRendererRuntime()) return;
       if (loaded) {
-        scan();
+        activateCodexPlusRendererRuntime();
         return;
       }
       if (attempt < 60) {
-        setTimeout(() => loadBackendSettingsForStartup(attempt + 1), 250);
+        scheduleCodexPlusRendererTimeout(() => loadBackendSettingsForStartup(attempt + 1), 250);
       }
     });
   }
 
   async function setBackendSetting(key, value) {
-    const seq = ++codexPlusBackendSettingsSeq;
+    if (!isCurrentCodexPlusRendererRuntime()) throw new Error("renderer runtime retired");
+    codexPlusBackendSettingsSeq += 1;
+    const keySeq = (codexPlusBackendSettingSeqByKey.get(key) || 0) + 1;
+    codexPlusBackendSettingSeqByKey.set(key, keySeq);
+    const previousValue = codexPlusBackendSettings[key];
     codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
     codexPlusBackendSettingsLoaded = true;
+    if (key === "enhancementsEnabled" && value === false) {
+      disableCodexPlusRuntimeFeatures();
+    }
+    if (key === "enhancementsEnabled" && value === true) {
+      syncCodexPlusRuntimeFeatures();
+    }
     refreshCodexPlusBackendToggles();
     try {
-      const settings = await postJson("/settings/set", { [key]: value });
-      if (seq === codexPlusBackendSettingsSeq) {
-        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+      const request = codexPlusBackendSettingsWriteQueue.then(
+        () => postJson("/settings/set", { [key]: value }),
+        () => postJson("/settings/set", { [key]: value }),
+      );
+      codexPlusBackendSettingsWriteQueue = request.then(() => undefined, () => undefined);
+      const settings = await request;
+      if (!isCurrentCodexPlusRendererRuntime()) return settings;
+      if (!settings || typeof settings !== "object" || settings.status === "failed") {
+        throw new Error(settings?.message || "设置保存失败");
       }
+      if (settings[key] !== value) {
+        throw new Error("设置未写入，请重试");
+      }
+      codexPlusBackendConfirmedSettings.set(key, settings[key]);
+      if (keySeq === codexPlusBackendSettingSeqByKey.get(key)) {
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: settings[key] };
+      }
+      return settings;
+    } catch (error) {
+      if (!isCurrentCodexPlusRendererRuntime()) throw error;
+      if (keySeq === codexPlusBackendSettingSeqByKey.get(key)) {
+        const rollbackValue = codexPlusBackendConfirmedSettings.has(key)
+          ? codexPlusBackendConfirmedSettings.get(key)
+          : previousValue;
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: rollbackValue };
+        const localKey = codexPlusBackendLocalSettingMap.get(key);
+        if (localKey) applyCodexPlusSettingRuntimeEffect(localKey, rollbackValue);
+        if (key === "enhancementsEnabled") syncCodexPlusRuntimeFeatures();
+      }
+      showToast(`保存设置失败：${error?.message || String(error)}`, null);
+      void loadBackendSettings();
+      throw error;
     } finally {
-      refreshCodexPlusBackendToggles();
+      if (isCurrentCodexPlusRendererRuntime()) refreshCodexPlusBackendToggles();
     }
   }
 
@@ -3469,6 +3673,10 @@
   }
 
   let codexPlusUserScripts = { enabled: true, builtin_dir: "", user_dir: "", scripts: [] };
+  let codexPlusUserScriptsRequestSeq = 0;
+  let codexPlusUserScriptsRequestQueue = Promise.resolve();
+  const codexPlusUserScriptsGlobalPendingKey = "__global__";
+  const codexPlusUserScriptsPending = new Set();
   let codexPlusBackendStatus = { status: "checking", message: "正在检查后端…" };
   let codexPlusBackendCheckSeq = 0;
 
@@ -3562,8 +3770,13 @@
   }
 
   function renderUserScripts() {
+    const globalPending = codexPlusUserScriptsPending.has(codexPlusUserScriptsGlobalPendingKey);
     const enabledToggle = document.querySelector("[data-codex-user-scripts-enabled]");
-    if (enabledToggle) enabledToggle.dataset.enabled = String(!!codexPlusUserScripts.enabled);
+    if (enabledToggle) {
+      enabledToggle.dataset.enabled = String(!!codexPlusUserScripts.enabled);
+      enabledToggle.dataset.pending = String(globalPending);
+      enabledToggle.disabled = globalPending;
+    }
     const dirs = document.querySelector("[data-codex-user-script-dirs]");
     if (dirs) dirs.textContent = `内置：${codexPlusUserScripts.builtin_dir || "未找到"}  用户：${codexPlusUserScripts.user_dir || "未找到"}`;
     const list = document.querySelector("[data-codex-user-script-list]");
@@ -3579,16 +3792,37 @@
           <div class="codex-plus-user-script-meta">${script.source === "builtin" ? "内置" : "用户"} · ${userScriptStatusLabel(script.status)}</div>
           ${script.error ? `<div class="codex-plus-user-script-error">${escapeHtml(script.error)}</div>` : ""}
         </div>
-        <button type="button" class="codex-plus-toggle" data-codex-user-script-key="${escapeHtml(script.key)}" data-enabled="${String(!!script.enabled)}"><span></span></button>
+        <button type="button" class="codex-plus-toggle" data-codex-user-script-key="${escapeHtml(script.key)}" data-enabled="${String(!!script.enabled)}" data-pending="${String(globalPending || codexPlusUserScriptsPending.has(script.key))}" ${globalPending || codexPlusUserScriptsPending.has(script.key) ? "disabled" : ""}><span></span></button>
       </div>
     `).join("");
   }
 
+  function updateUserScripts(path, payload, pendingKey) {
+    if (codexPlusUserScriptsPending.has(pendingKey)) return;
+    codexPlusUserScriptsPending.add(pendingKey);
+    renderUserScripts();
+    void loadUserScripts(path, payload)
+      .catch(() => null)
+      .finally(() => {
+        if (!isCurrentCodexPlusRendererRuntime()) return;
+        codexPlusUserScriptsPending.delete(pendingKey);
+        renderUserScripts();
+      });
+  }
+
   async function loadUserScripts(path = "/user-scripts/list", payload = {}) {
+    if (!isCurrentCodexPlusRendererRuntime()) return null;
+    const requestSeq = ++codexPlusUserScriptsRequestSeq;
     const requestPayload = path === "/user-scripts/list"
       ? { ...payload, runtime_status: window.__codexPlusUserScripts?.scripts || {} }
       : payload;
-    const result = await postJson(path, requestPayload);
+    const request = codexPlusUserScriptsRequestQueue.then(
+      () => postJson(path, requestPayload),
+      () => postJson(path, requestPayload),
+    );
+    codexPlusUserScriptsRequestQueue = request.then(() => undefined, () => undefined);
+    const result = await request;
+    if (!isCurrentCodexPlusRendererRuntime() || requestSeq !== codexPlusUserScriptsRequestSeq) return result;
     if (result?.scripts) {
       codexPlusUserScripts = result;
       renderUserScripts();
@@ -3763,7 +3997,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
             </div>` : ""}
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。启停后需重启 Codex++ 生效。</div></div>
+              <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。已加载时可即时切换；启动时未加载则需重启 Codex++ 生效。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
             </div>
             <div class="codex-plus-row" data-codex-service-tier-controls="true">
@@ -3793,7 +4027,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="markdownExport"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。</div></div>
+              <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pasteFix"><span></span></button>
             </div>
             <div class="codex-plus-row">
@@ -3933,7 +4167,12 @@
       }
       const userScriptsEnabled = target?.closest("[data-codex-user-scripts-enabled]");
       if (userScriptsEnabled) {
-        loadUserScripts("/user-scripts/set-enabled", { enabled: userScriptsEnabled.dataset.enabled !== "true" });
+        if (userScriptsEnabled.dataset.pending === "true") return;
+        updateUserScripts(
+          "/user-scripts/set-enabled",
+          { enabled: userScriptsEnabled.dataset.enabled !== "true" },
+          codexPlusUserScriptsGlobalPendingKey,
+        );
         return;
       }
       if (target?.closest("[data-codex-service-tier-inherit]")) {
@@ -3966,7 +4205,13 @@
       }
       const userScriptToggle = target?.closest("[data-codex-user-script-key]");
       if (userScriptToggle) {
-        loadUserScripts("/user-scripts/set-script-enabled", { key: userScriptToggle.getAttribute("data-codex-user-script-key"), enabled: userScriptToggle.dataset.enabled !== "true" });
+        const key = userScriptToggle.getAttribute("data-codex-user-script-key") || "";
+        if (!key || userScriptToggle.dataset.pending === "true" || codexPlusUserScriptsPending.has(codexPlusUserScriptsGlobalPendingKey)) return;
+        updateUserScripts(
+          "/user-scripts/set-script-enabled",
+          { key, enabled: userScriptToggle.dataset.enabled !== "true" },
+          key,
+        );
         return;
       }
       if (target?.closest("[data-codex-user-scripts-reload]")) {
@@ -3985,13 +4230,13 @@
       if (toggle) {
         if (toggle.disabled || toggle.dataset.pending === "true") return;
         const key = toggle.getAttribute("data-codex-plus-setting");
-        setCodexPlusSetting(key, !codexPlusSettings()[key]);
+        setCodexPlusSetting(key, toggle.dataset.enabled !== "true");
         return;
       }
       const backendToggle = target?.closest("[data-codex-backend-setting]");
       if (backendToggle) {
         const key = backendToggle.getAttribute("data-codex-backend-setting");
-        setBackendSetting(key, !codexPlusBackendSettings[key]);
+        void setBackendSetting(key, backendToggle.dataset.enabled !== "true").catch(() => {});
         return;
       }
     }, true);
@@ -4079,13 +4324,16 @@
       indicator.dataset.status = codexPlusBackendStatus.status || "checking";
       trigger.prepend(indicator);
     }
-    if (trigger.dataset.codexPlusTriggerInstalled === "5") return;
+    if (trigger.__codexPlusTriggerHandler) {
+      trigger.removeEventListener("click", trigger.__codexPlusTriggerHandler, true);
+    }
     trigger.dataset.codexPlusTriggerInstalled = "5";
-    trigger.addEventListener("click", (event) => {
+    trigger.__codexPlusTriggerHandler = (event) => {
       event.preventDefault();
       event.stopPropagation();
       openCodexPlusModal();
-    }, true);
+    };
+    trigger.addEventListener("click", trigger.__codexPlusTriggerHandler, true);
   }
 
   function numericCssValue(value) {
@@ -4432,8 +4680,7 @@
 
   function installPluginBuildFlavorFilterPatch() {
     if (window.__codexPluginBuildFlavorFilterPatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!pluginMarketplaceUnlockActive()) return;
     const originalFilter = Array.prototype.__codexPluginBuildFlavorOriginalFilter || Array.prototype.filter;
     if (!Array.prototype.__codexPluginBuildFlavorOriginalFilter) {
       Object.defineProperty(Array.prototype, "__codexPluginBuildFlavorOriginalFilter", {
@@ -4447,6 +4694,7 @@
       return;
     }
     const patchedFilter = function codexPluginBuildFlavorFilterPatch(callback, thisArg) {
+      if (!pluginMarketplaceUnlockActive()) return originalFilter.call(this, callback, thisArg);
       if (isCodexPluginBuildFlavorFilter(callback, this)) {
         sendCodexPlusDiagnostic("plugin_build_flavor_filter_bypassed", { pluginCount: this.length });
         return Array.from(this);
@@ -4575,6 +4823,7 @@
     const originalSendRequest = client.__codexPluginMarketplaceOriginalSendRequest || client.sendRequest.bind(client);
     client.__codexPluginMarketplaceOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPluginMarketplacePatchedSendRequest(method, params, options) {
+      if (!pluginMarketplaceUnlockActive()) return originalSendRequest(method, params, options);
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       const restoredRequestParams = restorePluginMarketplaceRequestParams(params, requestMethod);
       const requestProfile = pluginMarketplaceRequestProfile(restoredRequestParams);
@@ -4593,8 +4842,10 @@
       }
       try {
         const result = await originalSendRequest(method, requestParams, options);
+        if (!pluginMarketplaceUnlockActive()) return result;
         return patchPluginMarketplaceResult(requestMethod, result, { mergeLocal: !requestProfile.remoteOnly });
       } catch (error) {
+        if (!pluginMarketplaceUnlockActive()) throw error;
         if (requestMethod === "list-plugins" && pluginMarketplaceRemoteAuthError(error)) {
           markPluginMarketplaceRemoteCatalogUnavailable(error);
           return requestProfile.remoteOnly
@@ -4620,6 +4871,7 @@
   }
 
   function patchPluginMarketplaceRequestMessage(message) {
+    if (!pluginMarketplaceUnlockActive()) return message;
     if (!message || typeof message !== "object") return message;
     if (message.type === "fetch" && typeof message.url === "string") {
       const requestMethod = appServerModelRequestMethod(message.url, message.body);
@@ -4695,6 +4947,7 @@
   }
 
   function patchPluginMarketplaceResponseData(data) {
+    if (!pluginMarketplaceUnlockActive()) return false;
     if (data?.type === "fetch-response") {
       const requestId = data.requestId != null ? String(data.requestId) : "";
       const requestIds = window.__codexPluginMarketplaceFetchRequestIds;
@@ -4777,6 +5030,15 @@
       setCodexAppVersion: (version) => {
         codexPlusBackendSettings.codexAppVersion = String(version || "");
       },
+      setActive: (enabled) => {
+        codexPlusBackendSettingsLoaded = true;
+        codexPlusBackendSettings = {
+          ...codexPlusBackendSettings,
+          launchMode: "patch",
+          enhancementsEnabled: true,
+          codexAppPluginMarketplaceUnlock: enabled !== false,
+        };
+      },
       remoteCatalogUnavailable: () => window.__codexPluginMarketplaceRemoteCatalogUnavailable === true,
       reset: () => {
         delete window.__codexPluginMarketplaceLastCwds;
@@ -4802,8 +5064,7 @@
 
   function installPluginMarketplaceBridgePatch() {
     if (window.__codexPluginMarketplaceBridgePatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!pluginMarketplaceUnlockActive()) return;
     installPluginMarketplaceWindowEventPatchOnly();
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") {
@@ -4832,8 +5093,7 @@
 
   function installPluginMarketplaceWindowEventPatchOnly() {
     if (window.__codexPluginMarketplaceWindowEventPatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!pluginMarketplaceUnlockActive()) return;
     const originalDispatchEvent = window.__codexPluginMarketplaceOriginalDispatchEvent || window.dispatchEvent;
     if (!window.__codexPluginMarketplaceOriginalDispatchEvent) {
       window.__codexPluginMarketplaceOriginalDispatchEvent = originalDispatchEvent;
@@ -4875,8 +5135,7 @@
 
   function installPluginMarketplaceRequestPatch() {
     if (window.__codexPluginMarketplaceUnlockInstalled === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!pluginMarketplaceUnlockActive()) return;
     const patch = async () => {
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
@@ -4915,7 +5174,18 @@
     return !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.launchMode === "relay";
   }
 
+  function pluginMarketplaceUnlockActive() {
+    return !pluginPatchDisabledInRelayMode() && !!codexPlusSettings().pluginMarketplaceUnlock;
+  }
+
   function clearPluginPatchArtifacts() {
+    const wasActive = window.__codexPluginPatchArtifactsActive === true;
+    window.__codexPluginPatchArtifactsActive = false;
+    window.__codexPluginMarketplaceRequestIds = new Set();
+    window.__codexPluginMarketplaceFetchRequestIds = new Set();
+    window.__codexPluginMarketplaceRequestProfiles = new Map();
+    window.__codexPluginMarketplaceFetchRequestProfiles = new Map();
+    if (wasActive) clearPluginMarketplaceQueryCache();
   }
 
   let cachedSessionRows = [];
@@ -5126,10 +5396,8 @@
 
   function refreshThreadIdBadges() {
     if (!codexPlusSettings().threadIdBadge) {
-      if (threadIdBadgeActive) {
-        removeThreadIdBadges();
-        threadIdBadgeActive = false;
-      }
+      removeThreadIdBadges();
+      threadIdBadgeActive = false;
       return;
     }
     threadIdBadgeActive = true;
@@ -5292,6 +5560,26 @@
   function clearThreadScrollSyncTimers() {
     (window.__codexThreadScrollSyncTimers || []).forEach((timer) => clearTimeout(timer));
     window.__codexThreadScrollSyncTimers = [];
+  }
+
+  function cleanupThreadScrollRestoreRuntime() {
+    clearTimeout(window.__codexThreadScrollSaveTimer);
+    window.__codexThreadScrollSaveTimer = null;
+    window.__codexThreadScrollRestoreRevision = (window.__codexThreadScrollRestoreRevision || 0) + 1;
+    window.__codexThreadScrollSyncRevision = (window.__codexThreadScrollSyncRevision || 0) + 1;
+    clearThreadScrollRestoreTimers();
+    clearThreadScrollSyncTimers();
+    const runtime = window.__codexThreadScrollRuntime;
+    if (runtime?.scrollListener) {
+      const usesWindow = runtime.scrollListenerUsesWindow
+        || !runtime.activeScroller
+        || runtime.activeScroller === document.scrollingElement
+        || runtime.activeScroller === document.documentElement
+        || runtime.activeScroller === document.body;
+      const target = usesWindow ? window : runtime.activeScroller;
+      target?.removeEventListener?.("scroll", runtime.scrollListener, true);
+    }
+    window.__codexThreadScrollRuntime = null;
   }
 
   function clearThreadScrollRestoreLock() {
@@ -5995,6 +6283,12 @@
   let codexModelWhitelistRefreshTimer = 0;
   let codexModelWhitelistRefreshUntil = 0;
   const codexPlusModelListRequestIds = new Set();
+  const codexPlusStatsigModelOriginalValues = window.__codexPlusStatsigModelOriginalValues || new Map();
+  window.__codexPlusStatsigModelOriginalValues = codexPlusStatsigModelOriginalValues;
+  const codexPlusModelPatchSnapshots = window.__codexPlusModelPatchSnapshots || new WeakMap();
+  const codexPlusModelPatchTargets = window.__codexPlusModelPatchTargets || new Set();
+  window.__codexPlusModelPatchSnapshots = codexPlusModelPatchSnapshots;
+  window.__codexPlusModelPatchTargets = codexPlusModelPatchTargets;
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -6064,6 +6358,72 @@
 
   function codexPlusModelUnlockEnabled() {
     return !!codexPlusSettings().modelWhitelistUnlock;
+  }
+
+  function codexPlusModelPatchSnapshot(target) {
+    if (!target || (typeof target !== "object" && typeof target !== "function")) return null;
+    let snapshot = codexPlusModelPatchSnapshots.get(target);
+    if (snapshot) return snapshot;
+    const targetRef = typeof WeakRef === "function" ? new WeakRef(target) : target;
+    snapshot = {
+      targetRef,
+      arrayItems: Array.isArray(target) ? [...target] : null,
+      setValues: target instanceof Set ? [...target] : null,
+      properties: new Map(),
+    };
+    codexPlusModelPatchSnapshots.set(target, snapshot);
+    codexPlusModelPatchTargets.add(targetRef);
+    return snapshot;
+  }
+
+  function rememberCodexPlusModelProperty(target, key) {
+    const snapshot = codexPlusModelPatchSnapshot(target);
+    if (!snapshot || snapshot.properties.has(key)) return;
+    snapshot.properties.set(key, Object.getOwnPropertyDescriptor(target, key) || null);
+  }
+
+  function restoreCodexPlusModelPatches() {
+    codexPlusModelPatchTargets.forEach((targetRef) => {
+      const target = typeof targetRef?.deref === "function" ? targetRef.deref() : targetRef;
+      if (!target) return;
+      const snapshot = codexPlusModelPatchSnapshots.get(target);
+      if (!snapshot) return;
+      try {
+        if (snapshot.arrayItems) {
+          target.splice(0, target.length, ...snapshot.arrayItems);
+        } else if (snapshot.setValues) {
+          target.clear();
+          snapshot.setValues.forEach((value) => target.add(value));
+        }
+        snapshot.properties.forEach((descriptor, key) => {
+          if (descriptor) {
+            Object.defineProperty(target, key, descriptor);
+          } else {
+            delete target[key];
+          }
+        });
+      } catch (error) {
+        window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
+        window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+      }
+      codexPlusModelPatchSnapshots.delete(target);
+    });
+    codexPlusModelPatchTargets.clear();
+  }
+
+  function clearCodexModelWhitelistRuntime() {
+    clearTimeout(codexModelWhitelistRefreshTimer);
+    codexModelWhitelistRefreshTimer = 0;
+    codexModelWhitelistRefreshUntil = 0;
+    codexPlusModelListRequestIds.clear();
+    codexPlusStatsigModelOriginalValues.forEach((originalValue, config) => {
+      try {
+        config.value = originalValue;
+      } catch {
+      }
+    });
+    codexPlusStatsigModelOriginalValues.clear();
+    restoreCodexPlusModelPatches();
   }
 
   function codexPlusModelNames() {
@@ -6142,6 +6502,7 @@
     let changed = false;
     for (const key of ["displayName", "description", "defaultReasoningEffort"]) {
       if (typeof metadata[key] === "string" && metadata[key] && descriptor[key] !== metadata[key]) {
+        rememberCodexPlusModelProperty(descriptor, key);
         descriptor[key] = metadata[key];
         changed = true;
       }
@@ -6149,6 +6510,7 @@
     if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
       const nextEfforts = modelReasoningEfforts(modelName);
       if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
+        rememberCodexPlusModelProperty(descriptor, "supportedReasoningEfforts");
         descriptor.supportedReasoningEfforts = nextEfforts;
         changed = true;
       }
@@ -6186,14 +6548,11 @@
     if (!stringArrayLooksPatchable(models)) return false;
     const customModels = codexPlusModelNames();
     if (!customModels.length) return false;
-    let changed = false;
-    customModels.forEach((modelName) => {
-      if (!models.includes(modelName)) {
-        models.push(modelName);
-        changed = true;
-      }
-    });
-    return changed;
+    const missingModels = customModels.filter((modelName) => !models.includes(modelName));
+    if (!missingModels.length) return false;
+    codexPlusModelPatchSnapshot(models);
+    models.push(...missingModels);
+    return true;
   }
 
   function patchModelArray(models, allowEmpty = false) {
@@ -6205,6 +6564,7 @@
     models.forEach((item) => {
       if (customModels.includes(item.model)) {
         if (item.hidden !== false) {
+          rememberCodexPlusModelProperty(item, "hidden");
           item.hidden = false;
           changed = true;
         }
@@ -6213,6 +6573,7 @@
     });
     customModels.forEach((modelName) => {
       if (!existing.has(modelName)) {
+        codexPlusModelPatchSnapshot(models);
         models.push(codexPlusModelDescriptor(modelName));
         changed = true;
       }
@@ -6236,6 +6597,7 @@
     if (value.availableModels instanceof Set) {
       names.forEach((name) => {
         if (!value.availableModels.has(name)) {
+          codexPlusModelPatchSnapshot(value.availableModels);
           value.availableModels.add(name);
           changed = true;
         }
@@ -6244,41 +6606,42 @@
     if (value.available_models instanceof Set) {
       names.forEach((name) => {
         if (!value.available_models.has(name)) {
+          codexPlusModelPatchSnapshot(value.available_models);
           value.available_models.add(name);
           changed = true;
         }
       });
     }
     if (Array.isArray(value.availableModels)) {
-      names.forEach((name) => {
-        if (!value.availableModels.includes(name)) {
-          value.availableModels.push(name);
-          changed = true;
-        }
-      });
+      if (patchModelNameArray(value.availableModels)) changed = true;
     }
     if (Array.isArray(value.available_models)) {
-      names.forEach((name) => {
-        if (!value.available_models.includes(name)) {
-          value.available_models.push(name);
-          changed = true;
-        }
-      });
+      if (patchModelNameArray(value.available_models)) changed = true;
     }
     if (Array.isArray(value.hiddenModels)) {
       const before = value.hiddenModels.length;
-      value.hiddenModels = value.hiddenModels.filter((name) => !names.includes(name));
-      if (value.hiddenModels.length !== before) changed = true;
+      const nextHiddenModels = value.hiddenModels.filter((name) => !names.includes(name));
+      if (nextHiddenModels.length !== before) {
+        rememberCodexPlusModelProperty(value, "hiddenModels");
+        value.hiddenModels = nextHiddenModels;
+        changed = true;
+      }
     }
     if (Array.isArray(value.hidden_models)) {
       const before = value.hidden_models.length;
-      value.hidden_models = value.hidden_models.filter((name) => !names.includes(name));
-      if (value.hidden_models.length !== before) changed = true;
+      const nextHiddenModels = value.hidden_models.filter((name) => !names.includes(name));
+      if (nextHiddenModels.length !== before) {
+        rememberCodexPlusModelProperty(value, "hidden_models");
+        value.hidden_models = nextHiddenModels;
+        changed = true;
+      }
     }
     if (value.defaultModel == null && names.length > 0) {
+      rememberCodexPlusModelProperty(value, "defaultModel");
       value.defaultModel = codexPlusModelDescriptor(names[0]);
       changed = true;
     } else if (typeof value.defaultModel === "string" && names.includes(value.defaultModel) && value.model == null) {
+      rememberCodexPlusModelProperty(value, "model");
       value.model = value.defaultModel;
       changed = true;
     }
@@ -6313,6 +6676,7 @@
   async function patchModelJsonResponse(payload) {
     if (!codexPlusModelUnlockEnabled()) return payload;
     if (!codexPlusModelNames().length) await loadCodexModelCatalog();
+    if (!codexPlusModelUnlockEnabled()) return payload;
     if (!modelJsonResponseLooksPatchable(payload)) return payload;
     try {
       patchModelContainer(payload);
@@ -6324,22 +6688,43 @@
   }
 
   function installModelJsonResponsePatch() {
-    if (window.__codexPlusModelJsonResponsePatchInstalled === "1") return;
-    window.__codexPlusModelJsonResponsePatchInstalled = "1";
+    window.__codexPlusPatchModelJsonResponse = patchModelJsonResponse;
+    const patchVersion = `3-${codexPlusRendererRuntimeVersion}`;
+    if (window.__codexPlusModelJsonResponsePatchInstalled === patchVersion) return;
+    window.__codexPlusModelJsonResponsePatchInstalled = patchVersion;
     window.__codexPlusModelJsonResponseOriginals = window.__codexPlusModelJsonResponseOriginals || {};
     const originals = window.__codexPlusModelJsonResponseOriginals;
     originals.responseJson = originals.responseJson || Response.prototype.json;
     if (typeof originals.responseJson !== "function") return;
     Response.prototype.json = async function codexPlusPatchedResponseJson(...args) {
       const payload = await originals.responseJson.apply(this, args);
-      return await patchModelJsonResponse(payload);
+      const patch = window.__codexPlusPatchModelJsonResponse;
+      return typeof patch === "function" ? await patch(payload) : payload;
     };
   }
 
   function patchStatsigModelDynamicConfig(config) {
-    const names = codexPlusModelNames();
     const value = config?.value;
-    if (!names.length || !value || typeof value !== "object") return config;
+    if (!value || typeof value !== "object") return config;
+    if (!codexPlusModelUnlockEnabled()) {
+      const originalValue = codexPlusStatsigModelOriginalValues.get(config);
+      if (!originalValue) return config;
+      codexPlusStatsigModelOriginalValues.delete(config);
+      try {
+        config.value = originalValue;
+      } catch {
+        return { ...config, value: originalValue };
+      }
+      return config;
+    }
+    const names = codexPlusModelNames();
+    if (!names.length) return config;
+    if (!codexPlusStatsigModelOriginalValues.has(config)) {
+      codexPlusStatsigModelOriginalValues.set(config, {
+        ...value,
+        available_models: Array.isArray(value.available_models) ? [...value.available_models] : value.available_models,
+      });
+    }
     const availableModels = Array.isArray(value.available_models) ? [...value.available_models] : [];
     let changed = false;
     names.forEach((name) => {
@@ -6371,15 +6756,20 @@
   }
 
   function patchStatsigModelWhitelist() {
+    window.__codexPlusPatchStatsigModelDynamicConfig = patchStatsigModelDynamicConfig;
+    const patchVersion = `2-${codexPlusRendererRuntimeVersion}`;
     statsigClients().forEach((client) => {
       if (typeof client.getDynamicConfig !== "function") return;
-      if (!client.__codexPlusModelWhitelistPatched) {
-        const originalGetDynamicConfig = client.getDynamicConfig.bind(client);
+      if (client.__codexPlusModelWhitelistPatched !== patchVersion) {
+        const originalGetDynamicConfig = client.__codexPlusModelWhitelistOriginalGetDynamicConfig
+          || client.getDynamicConfig.bind(client);
+        client.__codexPlusModelWhitelistOriginalGetDynamicConfig = originalGetDynamicConfig;
         client.getDynamicConfig = (name, options) => {
           const result = originalGetDynamicConfig(name, options);
-          return String(name) === "107580212" ? patchStatsigModelDynamicConfig(result) : result;
+          const patch = window.__codexPlusPatchStatsigModelDynamicConfig;
+          return String(name) === "107580212" && typeof patch === "function" ? patch(result) : result;
         };
-        client.__codexPlusModelWhitelistPatched = true;
+        client.__codexPlusModelWhitelistPatched = patchVersion;
       }
       try {
         patchStatsigModelDynamicConfig(client.getDynamicConfig("107580212", { disableExposureLog: true }));
@@ -6389,10 +6779,18 @@
   }
 
   function patchAppServerModelMessages() {
-    if (window.__codexPlusModelMessagePatchInstalled) return;
-    window.__codexPlusModelMessagePatchInstalled = true;
-    window.addEventListener("codex-message-from-view", (event) => {
+    const patchVersion = `2-${codexPlusRendererRuntimeVersion}`;
+    if (window.__codexPlusModelMessagePatchInstalled === patchVersion) return;
+    if (window.__codexPlusModelRequestMessageHandler) {
+      window.removeEventListener("codex-message-from-view", window.__codexPlusModelRequestMessageHandler, true);
+    }
+    if (window.__codexPlusModelResponseMessageHandler) {
+      window.removeEventListener("message", window.__codexPlusModelResponseMessageHandler, true);
+    }
+    window.__codexPlusModelMessagePatchInstalled = patchVersion;
+    window.__codexPlusModelRequestMessageHandler = (event) => {
       try {
+        if (!codexPlusModelUnlockEnabled()) return;
         const detail = event?.detail;
         const request = detail?.request;
         if (detail?.type === "mcp-request" && request?.method === "model/list") {
@@ -6410,16 +6808,18 @@
         window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
         window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
       }
-    }, true);
+    };
+    window.addEventListener("codex-message-from-view", window.__codexPlusModelRequestMessageHandler, true);
 
-    window.addEventListener("message", (event) => {
+    window.__codexPlusModelResponseMessageHandler = (event) => {
       try {
         patchMcpModelResponseData(event?.data);
       } catch (error) {
         window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
         window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
       }
-    }, true);
+    };
+    window.addEventListener("message", window.__codexPlusModelResponseMessageHandler, true);
   }
 
   function patchMcpModelResponseData(data) {
@@ -6447,7 +6847,7 @@
   }
 
   function patchAppServerModelResult(method, result) {
-    if (method !== "list-models-for-host") return result;
+    if (!codexPlusModelUnlockEnabled() || method !== "list-models-for-host") return result;
     try {
       if (Array.isArray(result)) patchModelArray(result, true);
       if (Array.isArray(result?.data)) patchModelArray(result.data, true);
@@ -6479,6 +6879,7 @@
       const result = await originalSendRequest(method, nextParams, options);
       if (!codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
+      if (!codexPlusModelUnlockEnabled()) return result;
       return patchAppServerModelResult(requestMethod, result);
     };
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
@@ -7242,6 +7643,17 @@
     });
   }
 
+  function cleanupUpstreamWorktreeRuntime() {
+    removeUpstreamBranchOptions();
+    writeUpstreamBranchSelection(null);
+    clearUpstreamBranchTriggerLabel();
+    document.querySelectorAll(`[${branchWorktreePathAttribute}]`).forEach((item) => {
+      item.removeAttribute(branchWorktreePathAttribute);
+      item.removeAttribute("title");
+    });
+    document.querySelectorAll(`.${upstreamWorktreeDialogClass}`).forEach((dialog) => dialog.remove());
+  }
+
   function syncUpstreamBranchTriggerLabel() {
     const selection = readUpstreamBranchSelection();
     if (!selection?.label) {
@@ -7261,6 +7673,7 @@
   }
 
   function handleNativeBranchSelection(event) {
+    if (!codexPlusSettings().upstreamWorktreeCreate) return;
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
     const menuItem = target?.closest?.('[role="menuitem"], [data-radix-collection-item]');
     if (!menuItem || menuItem.closest?.(`[${upstreamBranchOptionAttribute}]`)) return;
@@ -7295,6 +7708,10 @@
         continue;
       }
       const defaults = await loadUpstreamBranchDefaults(context);
+      if (!codexPlusSettings().upstreamWorktreeCreate) {
+        removeUpstreamBranchOptions(menu);
+        continue;
+      }
       const defaultsResult = defaults?.result;
       const refs = defaults?.result?.upstreamRefs || [];
       annotateBranchMenuWorktreeUsage(menu, defaultsResult);
@@ -7332,18 +7749,24 @@
   function installUpstreamBranchDropdownAdapter() {
     const adapterVersion = "actual-upstream-refs-v17";
     window.__codexUpstreamBranchDropdownAdapterVersion = adapterVersion;
-    if (window.__codexUpstreamBranchDropdownAdapterInstalled === adapterVersion) return;
     window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
+    if (window.__codexUpstreamBranchDropdownClickHandler) {
+      document.removeEventListener("click", window.__codexUpstreamBranchDropdownClickHandler, true);
+    }
+    clearTimeout(window.__codexUpstreamBranchInjectTimer);
     window.__codexUpstreamBranchDropdownAdapterInstalled = adapterVersion;
-    let upstreamBranchInjectTimer = null;
     const schedule = () => {
-      clearTimeout(upstreamBranchInjectTimer);
-      upstreamBranchInjectTimer = setTimeout(() => {
+      clearTimeout(window.__codexUpstreamBranchInjectTimer);
+      window.__codexUpstreamBranchInjectTimer = setTimeout(() => {
         injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
       }, 80);
     };
-    document.addEventListener("click", (event) => {
+    window.__codexUpstreamBranchDropdownClickHandler = (event) => {
       rememberStartNewChatProjectContext(event);
+      if (!codexPlusSettings().upstreamWorktreeCreate) {
+        removeUpstreamBranchOptions();
+        return;
+      }
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
       const control = target?.closest?.('button, [role="button"]');
       if (control && branchMenuTriggerIsBranchControl(control)) schedule();
@@ -7366,7 +7789,8 @@
       syncUpstreamBranchTriggerLabel();
       syncUpstreamBranchMenuSelection(option.closest?.('[role="menu"], [data-radix-menu-content], [cmdk-list]'));
       showToast(`将从 ${upstreamBranchOptionLabel(option) || "upstream/main"} 创建新 worktree`, null);
-    }, true);
+    };
+    document.addEventListener("click", window.__codexUpstreamBranchDropdownClickHandler, true);
     const branchMenuSelector = '[role="menu"], [data-radix-menu-content], [cmdk-list]';
     const addedNodeContainsBranchMenu = (node) => {
       if (!(node instanceof Element)) return false;
@@ -7498,11 +7922,14 @@
 
   function installUpstreamWorktreeNativeAdapter() {
     const adapterVersion = "2";
-    if (window.__codexUpstreamWorktreeNativeAdapterInstalled === adapterVersion) return;
+    if (window.__codexUpstreamWorktreeNativeAdapterHandler) {
+      document.removeEventListener("click", window.__codexUpstreamWorktreeNativeAdapterHandler, true);
+    }
     window.__codexUpstreamWorktreeNativeAdapterInstalled = adapterVersion;
-    document.addEventListener("click", (event) => {
+    window.__codexUpstreamWorktreeNativeAdapterHandler = (event) => {
       handleUpstreamWorktreeNativeCreate(event);
-    }, true);
+    };
+    document.addEventListener("click", window.__codexUpstreamWorktreeNativeAdapterHandler, true);
   }
 
   function setUpstreamWorktreeMessage(dialog, message, status = "idle") {
@@ -7513,6 +7940,7 @@
   }
 
   async function loadUpstreamWorktreeDefaults(dialog) {
+    if (!codexPlusSettings().upstreamWorktreeCreate || !dialog?.isConnected) return;
     const repoPath = upstreamWorktreeField(dialog, "repoPath")?.value?.trim() || "";
     if (!repoPath) {
       setUpstreamWorktreeMessage(dialog, "填写仓库路径后会自动读取 remote 和当前分支。", "idle");
@@ -7521,6 +7949,7 @@
     setUpstreamWorktreeMessage(dialog, "正在读取仓库默认值…", "loading");
     try {
       const result = await postJson("/upstream-worktree/defaults", { repoPath });
+      if (!codexPlusSettings().upstreamWorktreeCreate || !dialog.isConnected) return;
       if (result?.status !== "ok") {
         setUpstreamWorktreeMessage(dialog, result?.message || "读取仓库默认值失败", "failed");
         return;
@@ -7536,6 +7965,10 @@
   }
 
   async function submitUpstreamWorktree(dialog) {
+    if (!codexPlusSettings().upstreamWorktreeCreate || !dialog?.isConnected) {
+      dialog?.remove();
+      return;
+    }
     const payload = upstreamWorktreePayload(dialog);
     if (!payload.repoPath || !payload.branchName || !payload.worktreePath || !payload.remote || !payload.baseBranch) {
       setUpstreamWorktreeMessage(dialog, "仓库路径、分支名、worktree 路径、remote 和 base branch 都必须填写。", "failed");
@@ -7556,6 +7989,7 @@
   }
 
   function openUpstreamWorktreeDialog() {
+    if (!codexPlusSettings().upstreamWorktreeCreate) return;
     document.querySelectorAll(`.${upstreamWorktreeDialogClass}`).forEach((node) => node.remove());
     const overlay = document.createElement("div");
     overlay.className = `codex-delete-confirm-overlay ${upstreamWorktreeDialogClass}`;
@@ -7605,6 +8039,7 @@
   }
 
   function confirmDelete(title) {
+    window.__codexDeleteConfirmCancel?.();
     document.querySelectorAll(".codex-delete-confirm-overlay").forEach((node) => node.remove());
     return new Promise((resolve) => {
       const overlay = document.createElement("div");
@@ -7624,8 +8059,11 @@
         event?.stopPropagation();
         event?.target?.blur?.();
         overlay.remove();
+        if (window.__codexDeleteConfirmCancel === cancel) delete window.__codexDeleteConfirmCancel;
         resolve(value);
       };
+      const cancel = () => finish(false);
+      window.__codexDeleteConfirmCancel = cancel;
       overlay.addEventListener("click", (event) => {
         if (event.target === overlay || event.target.closest("[data-codex-delete-cancel]")) {
           finish(false, event);
@@ -7797,7 +8235,7 @@
     event.stopImmediatePropagation?.();
     releaseDeleteFocus(row, button);
     confirmDelete(ref.title).then(async (confirmed) => {
-      if (!confirmed) return;
+      if (!confirmed || !codexPlusSettings().sessionDelete) return;
       releaseDeleteFocus(row, button);
       const result = await postJson("/delete", ref);
       if (result.status === "server_deleted" || result.status === "local_deleted") {
@@ -7811,9 +8249,12 @@
   }
 
   async function exportMarkdown(ref) {
+    if (!codexPlusSettings().markdownExport) return;
     const result = await postJson("/export-markdown", ref);
+    if (!codexPlusSettings().markdownExport) return;
     if (result.status === "exported" && result.filename && typeof result.markdown === "string") {
       const saveResult = await saveMarkdown(result.filename, result.markdown);
+      if (!codexPlusSettings().markdownExport) return;
       if (saveResult?.status === "cancelled") {
         showToast(saveResult.message || "导出已取消", null);
       } else {
@@ -7827,6 +8268,7 @@
   function installDeleteButtonEventDelegation() {
     document.removeEventListener("click", window.__codexSessionDeleteDocumentDeleteHandler, true);
     const handler = (event) => {
+      if (!codexPlusSettings().sessionDelete) return;
       const button = event.target?.closest?.(`.${buttonClass}`);
       const row = button?.closest?.("[data-app-action-sidebar-thread-id]");
       if (!button || !row) return;
@@ -7925,6 +8367,17 @@
       if (menu.__codexSessionMoreRow === row) menu.remove();
     });
     row.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
+  }
+
+  function cleanupSessionActionRuntime() {
+    closeSessionMoreMenus();
+    document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => menu.remove());
+    document.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
+    document.querySelectorAll("[data-codex-archive-row-action]").forEach((button) => button.remove());
+    document.querySelectorAll("[data-codex-delete-row], [data-codex-archive-delete-row]").forEach((row) => {
+      delete row.dataset.codexDeleteRow;
+      delete row.dataset.codexArchiveDeleteRow;
+    });
   }
 
   function stopActionButtonEvent(row, button, event) {
@@ -8756,6 +9209,7 @@
     installThreadScrollUserIntentCapture();
     installThreadScrollRouteHooks();
     scheduleThreadScrollSync(true);
+    syncCodexPlusPasteFix();
     refreshCodexServiceTierControls();
   }
 
@@ -9179,9 +9633,11 @@
   }
 
   async function openZedRemote(request) {
+    if (!codexPlusSettings().zedRemoteOpen) return;
     let nextRequest = request;
     if (!nextRequest?.ssh?.host && nextRequest?.hostId) {
       const ssh = await resolveZedRemoteHost(nextRequest.hostId);
+      if (!codexPlusSettings().zedRemoteOpen) return;
       nextRequest = ssh ? { ...nextRequest, ssh } : nextRequest;
     }
     if (!nextRequest?.ssh?.host) {
@@ -9193,14 +9649,17 @@
       strategy: nextRequest.strategy || zedRemoteOpenStrategy(),
       remember: codexPlusBackendSettings.zedRemoteProjectRegistryEnabled !== false,
     };
+    if (!codexPlusSettings().zedRemoteOpen) return;
     try {
       const result = await postJson("/zed-remote/open", nextRequest);
+      if (!codexPlusSettings().zedRemoteOpen) return;
       if (result?.status === "ok") {
         showZedRemoteToast("Opened in Zed Remote");
         return;
       }
       showZedRemoteToast(result?.message || "Cannot open this file in Zed Remote");
     } catch (error) {
+      if (!codexPlusSettings().zedRemoteOpen) return;
       showZedRemoteToast(error?.message || "Cannot open this file in Zed Remote");
     }
   }
@@ -9249,22 +9708,29 @@
     event.stopImmediatePropagation?.();
     if (zedRemoteOpenInMenuActivationIsDuplicate(event?.currentTarget)) return;
     const request = zedRemoteBestOpenRequest(scope) || await resolveZedRemoteFallbackRequest();
+    if (!codexPlusSettings().zedRemoteOpen) return;
     if (!request) {
       showZedRemoteToast("Cannot find a remote workspace or file for Zed");
       return;
     }
-    openZedRemote(request);
+    void openZedRemote(request);
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
   }
 
   function bindZedRemoteOpenInMenuItem(item, source) {
     item.setAttribute("data-codex-zed-open-in-menu", source);
     if (item.dataset.codexZedOpenInMenuBound === zedRemoteOpenInMenuVersion) return;
+    if (item.__codexZedRemoteOpenInMenuHandler) {
+      item.removeEventListener("pointerup", item.__codexZedRemoteOpenInMenuHandler, true);
+      item.removeEventListener("click", item.__codexZedRemoteOpenInMenuHandler, true);
+      item.removeEventListener("keydown", item.__codexZedRemoteOpenInMenuHandler, true);
+    }
     item.dataset.codexZedOpenInMenuBound = zedRemoteOpenInMenuVersion;
     item.dataset.codexZedOpenInMenuVersion = zedRemoteOpenInMenuVersion;
-    item.addEventListener("pointerup", activateZedRemoteOpenInMenuItem, true);
-    item.addEventListener("click", activateZedRemoteOpenInMenuItem, true);
-    item.addEventListener("keydown", activateZedRemoteOpenInMenuItem, true);
+    item.__codexZedRemoteOpenInMenuHandler = activateZedRemoteOpenInMenuItem;
+    item.addEventListener("pointerup", item.__codexZedRemoteOpenInMenuHandler, true);
+    item.addEventListener("click", item.__codexZedRemoteOpenInMenuHandler, true);
+    item.addEventListener("keydown", item.__codexZedRemoteOpenInMenuHandler, true);
   }
 
   function removeZedRemoteOpenInMenuItems(scope = document) {
@@ -9424,6 +9890,7 @@
   }
 
   async function activateSessionAutoRenameMenuItem(event) {
+    if (!codexPlusSettings().markdownExport) return;
     if (event?.type === "keydown" && !["Enter", " "].includes(event.key)) return;
     const item = event?.currentTarget;
     event?.preventDefault?.();
@@ -9441,6 +9908,7 @@
       showToast("会话加载超时，请稍后重试", null);
       return;
     }
+    if (!codexPlusSettings().markdownExport) return;
 
     const trigger = row.querySelector('button[aria-label="聊天操作"], button[aria-label="Chat actions"]');
     if (!(trigger instanceof HTMLElement)) {
@@ -9468,11 +9936,16 @@
       showToast("无法打开 Codex 原生重命名入口", null);
       return;
     }
+    if (!codexPlusSettings().markdownExport) return;
     renameItem.click();
 
     const dialog = await waitForSessionElement(visibleSessionRenameDialog, 3000);
     if (!(dialog instanceof HTMLElement)) {
       showToast("无法打开 Codex 原生重命名窗口", null);
+      return;
+    }
+    if (!codexPlusSettings().markdownExport) {
+      closeSessionRenameDialog(dialog);
       return;
     }
     const titleInput = dialog.querySelector('input[aria-label="聊天标题"], input[aria-label="Chat title"]');
@@ -9497,6 +9970,10 @@
       showToast("Codex 未能生成新名称，请稍后重试", null);
       return;
     }
+    if (!codexPlusSettings().markdownExport) {
+      closeSessionRenameDialog(visibleSessionRenameDialog());
+      return;
+    }
 
     suggestionButton.click();
     const renamedInput = await waitForSessionElement(() => {
@@ -9511,11 +9988,16 @@
       showToast("Codex 未能应用新名称，请稍后重试", null);
       return;
     }
+    if (!codexPlusSettings().markdownExport) {
+      closeSessionRenameDialog(activeDialog);
+      return;
+    }
     saveButton.click();
     showToast("已自动重命名当前会话", null);
   }
 
   async function activateSessionCopyMenuItem(event) {
+    if (!codexPlusSettings().markdownExport) return;
     if (event?.type === "keydown" && !["Enter", " "].includes(event.key)) return;
     const item = event?.currentTarget;
     event?.preventDefault?.();
@@ -9531,7 +10013,9 @@
       showToast("会话加载超时，请稍后重试", null);
       return;
     }
+    if (!codexPlusSettings().markdownExport) return;
     await new Promise((resolve) => setTimeout(resolve, 350));
+    if (!codexPlusSettings().markdownExport) return;
     const forkButtons = [...document.querySelectorAll('button[aria-label="从这里创建聊天分支"], button[aria-label="Fork from here"]')]
       .filter(visibleElement)
       .filter((button) => !isExtensionUiNode(button));
@@ -9635,37 +10119,52 @@
   }
 
   function scanDeferred() {
-    if (pluginPatchDisabledInRelayMode()) {
-      clearPluginPatchArtifacts();
-    } else {
-      const pluginUnlockStrategy = codexPluginUnlockStrategy();
-      const settings = codexPlusSettings();
-      logCodexPluginUnlockStrategy(pluginUnlockStrategy);
-      if ((pluginUnlockStrategy === "modern" || pluginUnlockStrategy === "unknown") && settings.pluginMarketplaceUnlock) {
-        const marketplaceRequestPatchStrategy = codexPluginMarketplaceRequestPatchStrategy();
-        installPluginBuildFlavorFilterPatch();
-        if (marketplaceRequestPatchStrategy === "bridge") {
-          installPluginMarketplaceBridgePatch();
-        } else if (marketplaceRequestPatchStrategy === "client") {
-          installPluginMarketplaceRequestPatch();
+    runScanStep(() => {
+      if (pluginPatchDisabledInRelayMode()) {
+        clearPluginPatchArtifacts();
+      } else {
+        const pluginUnlockStrategy = codexPluginUnlockStrategy();
+        const settings = codexPlusSettings();
+        logCodexPluginUnlockStrategy(pluginUnlockStrategy);
+        if ((pluginUnlockStrategy === "modern" || pluginUnlockStrategy === "unknown") && settings.pluginMarketplaceUnlock) {
+          window.__codexPluginPatchArtifactsActive = true;
+          const marketplaceRequestPatchStrategy = codexPluginMarketplaceRequestPatchStrategy();
+          installPluginBuildFlavorFilterPatch();
+          if (marketplaceRequestPatchStrategy === "bridge") {
+            installPluginMarketplaceBridgePatch();
+          } else if (marketplaceRequestPatchStrategy === "client") {
+            installPluginMarketplaceRequestPatch();
+          } else {
+            installPluginMarketplaceWindowEventPatchOnly();
+            installPluginMarketplaceBridgePatch();
+            installPluginMarketplaceRequestPatch();
+          }
         } else {
-          installPluginMarketplaceWindowEventPatchOnly();
-          installPluginMarketplaceBridgePatch();
-          installPluginMarketplaceRequestPatch();
+          clearPluginPatchArtifacts();
         }
       }
-    }
-    refreshDreamSkin();
-    refreshThreadIdBadges();
-    const rows = sessionRows(forceSessionRowsRefreshOnNextScan);
-    forceSessionRowsRefreshOnNextScan = false;
-    rows.forEach(tryAttachButton);
-    updateDeleteButtonOffsets();
-    archivedPageRows().forEach(attachArchivedPageDeleteButton);
-    refreshConversationView();
-    installCodexServiceTierBadge();
-    scheduleThreadScrollSync();
-    refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
+    });
+    runScanStep(refreshDreamSkin);
+    runScanStep(refreshThreadIdBadges);
+    runScanStep(() => {
+      const rows = sessionRows(forceSessionRowsRefreshOnNextScan);
+      forceSessionRowsRefreshOnNextScan = false;
+      rows.forEach(tryAttachButton);
+    });
+    runScanStep(updateDeleteButtonOffsets);
+    runScanStep(() => archivedPageRows().forEach(attachArchivedPageDeleteButton));
+    runScanStep(refreshConversationView);
+    runScanStep(installCodexServiceTierBadge);
+    runScanStep(scheduleThreadScrollSync);
+    runScanStep(() => refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations));
+    runScanStep(() => {
+      const settings = codexPlusSettings();
+      if (!settings.zedRemoteOpen) {
+        removeZedRemoteButtons();
+        removeZedRemoteOpenInMenuItems();
+      }
+      if (!settings.upstreamWorktreeCreate) cleanupUpstreamWorktreeRuntime();
+    });
   }
 
   function runScanStep(step) {
@@ -9674,24 +10173,38 @@
     } catch (error) {
       window.__codexSessionDeleteScanFailures = window.__codexSessionDeleteScanFailures || [];
       window.__codexSessionDeleteScanFailures.push(String(error?.stack || error));
+      if (window.__codexSessionDeleteScanFailures.length > 50) {
+        window.__codexSessionDeleteScanFailures.splice(0, window.__codexSessionDeleteScanFailures.length - 50);
+      }
     }
   }
 
+  function activateCodexPlusRendererRuntime() {
+    if (!isCurrentCodexPlusRendererRuntime()) return;
+    installUpstreamBranchDropdownAdapter();
+    installUpstreamWorktreeNativeAdapter();
+    scan();
+    scheduleStartupDeferredScanCatchup();
+  }
+
   function scheduleStartupDeferredScanCatchup() {
+    if (!isCurrentCodexPlusRendererRuntime()) return;
     if (window.__codexSessionDeleteStartupCatchupStarted) return;
     window.__codexSessionDeleteStartupCatchupStarted = true;
     const runCatchup = () => {
+      if (!isCurrentCodexPlusRendererRuntime()) return;
       if (!document.getElementById(codexPlusMenuId)) runScanStep(scanLightweight);
       runScanStep(scanDeferred);
     };
     [100, 300, 700, 1500, 2500, 4000, 6000, 9000, 12000, 15000].forEach((delay) => {
-      window.setTimeout(runCatchup, delay);
+      scheduleCodexPlusRendererTimeout(runCatchup, delay);
     });
   }
 
   function scan() {
+    if (!isCurrentCodexPlusRendererRuntime()) return;
     runScanStep(scanLightweight);
-    window.setTimeout(() => runScanStep(scanDeferred), 0);
+    scheduleCodexPlusRendererTimeout(() => runScanStep(scanDeferred), 0);
   }
 
   function isExtensionUiNode(node) {
@@ -9756,10 +10269,12 @@
     window.__codexSessionDeleteScanPending = false;
     clearTimeout(window.__codexSessionDeleteScanTimer);
     window.__codexSessionDeleteScanTimer = null;
+    if (!isCurrentCodexPlusRendererRuntime() || !codexPlusBackendSettingsLoaded) return;
     scan();
   }
 
   function scheduleScan(mutations) {
+    if (!isCurrentCodexPlusRendererRuntime() || !codexPlusBackendSettingsLoaded) return;
     window.__codexSessionDeleteLastMutations = mutations;
     scheduleZedRemoteMenuRefresh(mutations);
     const projectVisibilityChanged = mutations?.some((mutation) => mutation.type === "attributes" && mutation.attributeName === "data-app-action-sidebar-project-collapsed");
@@ -9769,14 +10284,77 @@
     if (!projectVisibilityChanged && !shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
-    window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);
+    window.__codexSessionDeleteScanTimer = scheduleCodexPlusRendererTimeout(runScheduledScan, 200);
   }
 
+  function destroyCodexPlusRendererRuntime() {
+    codexPlusRendererTimers.forEach((timer) => clearTimeout(timer));
+    codexPlusRendererTimers.clear();
+    clearInterval(window.__codexPlusBackendHeartbeat);
+    window.__codexPlusBackendHeartbeat = null;
+    clearTimeout(window.__codexSessionDeleteScanTimer);
+    clearTimeout(window.__codexZedRemoteMenuRefreshTimer);
+    clearTimeout(window.__codexUpstreamBranchInjectTimer);
+    clearTimeout(codexModelWhitelistRefreshTimer);
+    clearTimeout(appServerModelRequestPatchRetryTimer);
+    window.__codexSessionDeleteScanTimer = null;
+    window.__codexSessionDeleteScanPending = false;
+    window.__codexZedRemoteMenuRefreshTimer = null;
+    window.__codexZedRemoteMenuRefreshPending = false;
+    window.__codexUpstreamBranchInjectTimer = null;
+    window.__codexSessionDeleteObserver?.disconnect?.();
+    window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
+    window.removeEventListener("resize", window.__codexPlusResizeHandler);
+    document.removeEventListener("pointerdown", window.__codexSessionActionTriggerHandler, true);
+    document.removeEventListener("click", window.__codexSessionActionTriggerClickHandler, true);
+    document.removeEventListener("click", window.__codexSessionDeleteDocumentDeleteHandler, true);
+    document.removeEventListener("click", window.__codexUpstreamBranchDropdownClickHandler, true);
+    document.removeEventListener("click", window.__codexUpstreamWorktreeNativeAdapterHandler, true);
+    window.removeEventListener("codex-message-from-view", window.__codexPlusModelRequestMessageHandler, true);
+    window.removeEventListener("message", window.__codexPlusModelResponseMessageHandler, true);
+    document.removeEventListener("wheel", window.__codexThreadScrollWheelIntentHandler, true);
+    document.removeEventListener("touchmove", window.__codexThreadScrollTouchIntentHandler, true);
+    document.removeEventListener("keydown", window.__codexThreadScrollKeyIntentHandler, true);
+    document.removeEventListener("pointerdown", window.__codexThreadScrollPointerIntentHandler, true);
+    document.removeEventListener("pointerdown", window.__codexThreadScrollNavigationHandler, true);
+    document.removeEventListener("click", window.__codexThreadScrollClickNavigationHandler, true);
+    document.removeEventListener("keydown", window.__codexThreadScrollKeyboardHandler, true);
+    window.removeEventListener("popstate", window.__codexThreadScrollPopStateHandler, true);
+    window.removeEventListener("hashchange", window.__codexThreadScrollHashChangeHandler, true);
+    document.removeEventListener("visibilitychange", window.__codexThreadScrollVisibilityHandler, true);
+    document.querySelectorAll("[data-codex-plus-trigger-installed]").forEach((trigger) => {
+      if (trigger.__codexPlusTriggerHandler) {
+        trigger.removeEventListener("click", trigger.__codexPlusTriggerHandler, true);
+      }
+    });
+    disableCodexPlusRuntimeFeatures();
+    cleanupSessionActionRuntime();
+    document.querySelectorAll(".codex-plus-modal-overlay").forEach((node) => node.remove());
+    window.__codexPlusPatchModelJsonResponse = null;
+    window.__codexPlusPatchStatsigModelDynamicConfig = null;
+    window.__codexSessionDeleteStartupCatchupStarted = false;
+  }
+
+  if (!codexPlusIsNodeTestHarness) {
+    window.__CODEX_PLUS_RENDERER_RUNTIME__ = {
+      version: codexPlusRendererRuntimeVersion,
+      refresh() {
+        if (!isCurrentCodexPlusRendererRuntime()) return;
+        installCodexPlusFastStartup();
+        installCodexPlusForceChineseLocale();
+        installCodexPlusImageOverlay();
+        void loadBackendSettings().then((loaded) => {
+          if (loaded) {
+            activateCodexPlusRendererRuntime();
+          } else {
+            loadBackendSettingsForStartup(1);
+          }
+        });
+      },
+      destroy: destroyCodexPlusRendererRuntime,
+    };
+  }
   void loadBackendSettingsForStartup();
-  installUpstreamBranchDropdownAdapter();
-  installUpstreamWorktreeNativeAdapter();
-  scan();
-  scheduleStartupDeferredScanCatchup();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {
@@ -9812,41 +10390,58 @@
 
 // === 粘贴修复 (CodexPlusPlus 页面增强) ===
 // 控制开关：window.__CODEX_PLUS_PASTE_FIX__ = { enabled: <bool> }
-// 由 CodexPlusPlus 在启动时根据 settings.codexAppPasteFix 注入。
-// 关闭时不进入 if 体，行为与原 Codex 完全一致；开启时在 document 捕获阶段
-// 拦截 paste，若 text/plain 非空则阻止默认行为并调用 execCommand('insertText')
-// 插入纯文本，避免 Codex 把 Word 复制的内容识别为附件。
-// SENTINEL 保证多次执行（页面刷新、脚本重注入）只装一次 handler。
-if (window.__CODEX_PLUS_PASTE_FIX__ && window.__CODEX_PLUS_PASTE_FIX__.enabled === true) {
-  (() => {
-    const SENTINEL = '__codexPasteFixInstalled__';
-    if (window[SENTINEL]) return;
-    window[SENTINEL] = true;
+// 运行时可即时安装或卸载捕获阶段的 paste handler。
+(() => {
+  const RUNTIME_KEY = '__CODEX_PLUS_PASTE_FIX_RUNTIME__';
+  const RUNTIME_VERSION = '2';
+  const initialEnabled = window.__CODEX_PLUS_PASTE_FIX__?.enabled === true;
+  const existingRuntime = window[RUNTIME_KEY];
+  if (existingRuntime?.version === RUNTIME_VERSION && typeof existingRuntime.sync === 'function') {
+    existingRuntime.sync(initialEnabled);
+    return;
+  }
+  existingRuntime?.destroy?.();
 
-    const TAG = '[PasteFix]';
-
-    const handler = (e) => {
-      const cd = e.clipboardData;
-      if (!cd) return;
-
-      const text = cd.getData('text/plain');
-      if (typeof text !== 'string' || text.length === 0) return;
-
-      e.preventDefault();
-      e.stopImmediatePropagation();
-
-      let ok = false;
-      try {
-        ok = document.execCommand('insertText', false, text);
-      } catch (err) {
-        console.warn(TAG, 'execCommand threw:', err && err.message);
-      }
-      if (!ok) {
-        console.warn(TAG, 'execCommand failed; please paste again');
-      }
-    };
-
-    document.addEventListener('paste', handler, { capture: true });
-    console.log(TAG, 'paste handler installed (capture phase)');
-  })();
-}
+  const runtime = {
+    version: RUNTIME_VERSION,
+    enabled: false,
+    installed: false,
+    handler: null,
+    sync: null,
+    destroy: null,
+  };
+  const tag = '[PasteFix]';
+  runtime.handler = (event) => {
+    if (!runtime.enabled) return;
+    const clipboardData = event.clipboardData;
+    if (!clipboardData) return;
+    const text = clipboardData.getData('text/plain');
+    if (typeof text !== 'string' || text.length === 0) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    let inserted = false;
+    try {
+      inserted = document.execCommand('insertText', false, text);
+    } catch (error) {
+      console.warn(tag, 'execCommand threw:', error?.message);
+    }
+    if (!inserted) console.warn(tag, 'execCommand failed; please paste again');
+  };
+  runtime.sync = (enabled) => {
+    runtime.enabled = enabled === true;
+    if (runtime.enabled && !runtime.installed) {
+      document.addEventListener('paste', runtime.handler, { capture: true });
+      runtime.installed = true;
+    } else if (!runtime.enabled && runtime.installed) {
+      document.removeEventListener('paste', runtime.handler, true);
+      runtime.installed = false;
+    }
+  };
+  runtime.destroy = () => {
+    runtime.enabled = false;
+    if (runtime.installed) document.removeEventListener('paste', runtime.handler, true);
+    runtime.installed = false;
+  };
+  window[RUNTIME_KEY] = runtime;
+  runtime.sync(initialEnabled);
+})();

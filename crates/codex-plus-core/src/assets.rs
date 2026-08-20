@@ -239,6 +239,7 @@ fn dream_skin_skin_api_bootstrap_script(theme: &str) -> String {
     "composer-toolbar": ".composer-surface-chrome [role='toolbar']", dialog: "[role='dialog']",
   }};
   const mark = () => {{
+    if (window.__CODEX_DREAM_SKIN_DISABLED__) return;
     for (const [part, selector] of Object.entries(map)) for (const node of document.querySelectorAll(selector)) node.setAttribute("data-ds-part", part);
   }};
   mark();

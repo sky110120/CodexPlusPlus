@@ -2561,9 +2561,13 @@ async fn pet_overlay_supports_v2_cursor(websocket_url: &str) -> anyhow::Result<b
     Ok(runtime_evaluate_result_is_true(&result))
 }
 
-async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
+fn pet_real_mouse_enabled() -> bool {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let enabled = settings.enhancements_enabled && settings.codex_app_pet_real_mouse_look;
+    settings.enhancements_enabled && settings.codex_app_pet_real_mouse_look
+}
+
+async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
+    let enabled = pet_real_mouse_enabled();
     let targets = crate::cdp::list_targets(debug_port).await?;
     for target in targets
         .iter()
@@ -2572,17 +2576,19 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
         let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
             continue;
         };
-        let script = if !enabled {
-            crate::assets::pet_real_mouse_stop_script()
-        } else if pet_overlay_supports_v2_cursor(websocket_url)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to probe pet overlay capability in target {} ({})",
-                    target.id, target.url
-                )
-            })?
-        {
+        let supports_v2 = if enabled {
+            pet_overlay_supports_v2_cursor(websocket_url)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to probe pet overlay capability in target {} ({})",
+                        target.id, target.url
+                    )
+                })?
+        } else {
+            false
+        };
+        let script = if enabled && supports_v2 && pet_real_mouse_enabled() {
             crate::assets::pet_real_mouse_script()
         } else {
             crate::assets::pet_real_mouse_stop_script()
@@ -2602,8 +2608,7 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
 #[cfg(windows)]
 async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
     loop {
-        let settings = SettingsStore::default().load().unwrap_or_default();
-        if !settings.enhancements_enabled || !settings.codex_app_pet_real_mouse_look {
+        if !pet_real_mouse_enabled() {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
@@ -2613,6 +2618,9 @@ async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
             .unwrap_or_default();
         if targets.is_empty() {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            continue;
+        }
+        if !pet_real_mouse_enabled() {
             continue;
         }
         let mut drivers = tokio::task::JoinSet::new();
@@ -2641,6 +2649,9 @@ async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::C
     let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
         return;
     };
+    if !pet_real_mouse_enabled() {
+        return;
+    }
     if let Err(error) =
         crate::bridge::evaluate_script(websocket_url, crate::assets::pet_real_mouse_script()).await
     {

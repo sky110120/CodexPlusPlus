@@ -23,6 +23,7 @@
   let codexAppActionsPromise = null;
   let settingsPromise = null;
   let startupPromise = null;
+  let settingsRequestSeq = 0;
 
   const previous = window[API_KEY];
   if (previous && typeof previous.destroy === "function") previous.destroy();
@@ -46,6 +47,7 @@
     lastScanStatus: "",
     bridgeCache: new Map(),
     bridgePendingHash: "",
+    bridgeRequestSeq: 0,
     bridgeStatus: "idle",
     bridgeError: "",
     prompts: [],
@@ -54,6 +56,8 @@
     theme: "dark",
     themeMode: "auto",
     scans: 0,
+    runtimeTimers: new Set(),
+    submitTimers: new Set(),
     destroyed: false,
     diagnostics: readDiagnostics(),
   };
@@ -986,7 +990,7 @@
     const drag = state.drag;
     state.fab.removeEventListener("pointermove", onFabPointerMove);
     state.fab.releasePointerCapture?.(event.pointerId);
-    window.setTimeout(() => {
+    scheduleRuntimeTimeout(() => {
       if (state.drag === drag) state.drag = null;
     }, 0);
   }
@@ -1077,6 +1081,7 @@
   async function selectPrompt(button) {
     const item = state.prompts[Number(button.dataset.index)];
     if (!item?.prompt) return;
+    if (!isCurrentInstance() || !stepwiseEnabled()) return;
     if (state.settings) {
       fillSelectedPrompt(item.prompt, state.settings);
       return;
@@ -1084,11 +1089,12 @@
 
     pushDiagnostic("settings:missing-before-click", {});
     const settings = await ensureSettings();
-    if (!isCurrentInstance()) return;
+    if (!isCurrentInstance() || !stepwiseEnabled()) return;
     fillSelectedPrompt(item.prompt, settings);
   }
 
   function fillSelectedPrompt(prompt, settings) {
+    if (!isCurrentInstance() || !stepwiseEnabled()) return;
     pushDiagnostic("settings:click-mode", {
       directSend: settings?.directSend === true,
     });
@@ -1161,8 +1167,9 @@
   }
 
   async function loadSettings() {
+    const requestSeq = ++settingsRequestSeq;
     const payload = await bridgeCall("/stepwise/settings", {});
-    if (!isCurrentInstance()) return null;
+    if (!isCurrentInstance() || requestSeq !== settingsRequestSeq) return state.settings;
     if (payload?.settings) {
       state.settings = payload.settings;
       state.settingsStatus = statusLine(payload.settings);
@@ -1764,6 +1771,7 @@
     if (!stepwiseEnabled()) return;
     if (!key || state.bridgePendingHash === key || state.bridgeCache.has(key)) return;
 
+    const requestSeq = ++state.bridgeRequestSeq;
     state.bridgePendingHash = key;
     state.bridgeStatus = "pending";
     state.bridgeError = "";
@@ -1781,7 +1789,7 @@
       }
     )
       .then((payload) => {
-        if (!isCurrentInstance()) return;
+        if (!isCurrentInstance() || !stepwiseEnabled() || requestSeq !== state.bridgeRequestSeq) return;
         const prompts = payload?.disabled || payload?.error ? [] : payloadPrompts(payload);
         pushDiagnostic("bridge:generate-result", {
           status: payload?.status || "",
@@ -1800,14 +1808,14 @@
         state.bridgeError = normalizeText(payload?.error || "");
       })
       .catch((error) => {
-        if (!isCurrentInstance()) return;
+        if (!isCurrentInstance() || !stepwiseEnabled() || requestSeq !== state.bridgeRequestSeq) return;
         pushDiagnostic("bridge:generate-failed", { error: error.message });
         state.bridgeCache.set(key, { disabled: true, error: error.message, prompts: [] });
         state.bridgeStatus = "failed";
         state.bridgeError = error.message;
       })
       .finally(() => {
-        if (!isCurrentInstance()) return;
+        if (!isCurrentInstance() || requestSeq !== state.bridgeRequestSeq) return;
         if (state.bridgePendingHash === key) state.bridgePendingHash = "";
         scheduleScan(0);
       });
@@ -1939,7 +1947,30 @@
     return false;
   }
 
+  function scheduleSubmitRetry(callback, delay) {
+    if (!isCurrentInstance() || !stepwiseEnabled()) return false;
+    const timer = window.setTimeout(() => {
+      state.submitTimers.delete(timer);
+      if (!isCurrentInstance() || !stepwiseEnabled()) return;
+      callback();
+    }, delay);
+    state.submitTimers.add(timer);
+    return true;
+  }
+
+  function scheduleRuntimeTimeout(callback, delay) {
+    if (!isCurrentInstance() || !stepwiseEnabled()) return false;
+    const timer = window.setTimeout(() => {
+      state.runtimeTimers.delete(timer);
+      if (!isCurrentInstance() || !stepwiseEnabled()) return;
+      callback();
+    }, delay);
+    state.runtimeTimers.add(timer);
+    return true;
+  }
+
   function submitComposerWhenReady(target, expectedText = "", attempt = 0) {
+    if (!isCurrentInstance() || !stepwiseEnabled()) return false;
     if (!(target instanceof HTMLElement)) return false;
     if (!document.contains(target)) {
       pushDiagnostic("submit:target-detached", { attempt });
@@ -1965,12 +1996,12 @@
         pushDiagnostic("submit:blocked-local-stop-timeout", { attempt, targetRect: rectSummary(target) });
         return false;
       }
-      window.setTimeout(() => submitComposerWhenReady(target, expectedText, attempt + 1), SUBMIT_RETRY_DELAY_MS);
+      scheduleSubmitRetry(() => submitComposerWhenReady(target, expectedText, attempt + 1), SUBMIT_RETRY_DELAY_MS);
       return false;
     }
     if (submitComposer(target, attempt >= SUBMIT_RETRY_LIMIT)) return true;
     if (attempt >= SUBMIT_RETRY_LIMIT) return false;
-    window.setTimeout(() => submitComposerWhenReady(target, expectedText, attempt + 1), SUBMIT_RETRY_DELAY_MS);
+    scheduleSubmitRetry(() => submitComposerWhenReady(target, expectedText, attempt + 1), SUBMIT_RETRY_DELAY_MS);
     return false;
   }
 
@@ -2024,7 +2055,7 @@
       setEditableText(target, prompt);
       target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
       pushDiagnostic("fill:editable", { valueLength: normalizeText(target.textContent).length });
-      if (submit) window.setTimeout(() => submitComposerWhenReady(target, prompt), EDITABLE_SUBMIT_DELAY_MS);
+      if (submit) scheduleSubmitRetry(() => submitComposerWhenReady(target, prompt), EDITABLE_SUBMIT_DELAY_MS);
       return true;
     }
 
@@ -2144,8 +2175,16 @@
   }
 
   function stopRuntime() {
+    state.bridgeRequestSeq += 1;
+    state.bridgePendingHash = "";
+    state.bridgeStatus = "idle";
+    state.bridgeError = "";
     if (state.timer) window.clearTimeout(state.timer);
     state.timer = 0;
+    state.runtimeTimers.forEach((timer) => window.clearTimeout(timer));
+    state.runtimeTimers.clear();
+    state.submitTimers.forEach((timer) => window.clearTimeout(timer));
+    state.submitTimers.clear();
     window.removeEventListener("resize", onResize);
     state.observer?.disconnect();
     state.observer = null;
@@ -2188,14 +2227,12 @@
       state.settings = { ...(state.settings || {}), ...patch };
     }
     if (patch?.enabled === false) {
-      stopRuntime();
+      settingsRequestSeq += 1;
       settingsPromise = null;
       startupPromise = null;
-      const settings = await loadSettings();
-      if (!isCurrentInstance()) return null;
-      if (settings?.enabled) activateRuntime();
-      else pushDiagnostic("settings:disabled-sync", {});
-      return settings;
+      stopRuntime();
+      pushDiagnostic("settings:disabled-sync", {});
+      return state.settings;
     }
     if (patch?.enabled === true) {
       pushDiagnostic("settings:enabled-sync", {});

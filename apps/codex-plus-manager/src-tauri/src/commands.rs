@@ -1329,8 +1329,12 @@ pub fn load_settings() -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
-pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload> {
+pub fn save_settings(
+    settings: BackendSettings,
+    base_settings: Option<BackendSettings>,
+) -> CommandResult<SettingsPayload> {
     let settings = normalize_settings_before_save(settings);
+    let base_settings = base_settings.map(normalize_settings_before_save);
     let Ok(_guard) = relay_switch_mutex().lock() else {
         return failed(
             "供应商切换锁已损坏，请重启管理器后再试。",
@@ -1363,7 +1367,11 @@ pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload
             },
         );
     }
-    match store.save(&settings) {
+    let save_result = base_settings
+        .as_ref()
+        .map(|base| store.save_merged(base, &settings))
+        .unwrap_or_else(|| store.save(&settings));
+    match save_result {
         Ok(()) => settings_payload("设置已保存。", "设置保存后重新读取失败"),
         Err(error) => {
             let _ = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(

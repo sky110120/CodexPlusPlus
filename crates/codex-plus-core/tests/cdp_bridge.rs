@@ -791,6 +791,23 @@ fn stepwise_runtime_stops_work_when_disabled() {
     assert!(script.contains("function stepwiseEnabled()"));
     assert!(script.contains("if (!stepwiseEnabled()) {"));
     assert!(script.contains("stopRuntime();"));
+    assert!(script.contains("submitTimers: new Set()"));
+    assert!(script.contains("function scheduleSubmitRetry(callback, delay)"));
+    assert!(script.contains("function scheduleRuntimeTimeout(callback, delay)"));
+    assert!(script.contains("runtimeTimers: new Set()"));
+    assert!(script.contains("bridgeRequestSeq: 0"));
+    assert!(script.contains("requestSeq !== state.bridgeRequestSeq"));
+    assert!(script.contains("if (!isCurrentInstance() || !stepwiseEnabled()) return;"));
+    assert!(script.contains("state.bridgeRequestSeq += 1"));
+    assert!(script.contains("state.bridgePendingHash = \"\""));
+    assert!(script.contains("state.submitTimers.forEach((timer) => window.clearTimeout(timer))"));
+    assert!(script.contains("state.submitTimers.clear()"));
+    assert!(script.contains("let settingsRequestSeq = 0"));
+    assert!(script.contains("const requestSeq = ++settingsRequestSeq"));
+    assert!(script.contains("requestSeq !== settingsRequestSeq"));
+    assert!(script.contains(
+        "if (patch?.enabled === false) {\n      settingsRequestSeq += 1;\n      settingsPromise = null;\n      startupPromise = null;\n      stopRuntime();"
+    ));
     assert!(script.contains(
         "function requestBridgeStepwise(key, userText, assistantText) {\n    if (!stepwiseEnabled()) return;"
     ));
@@ -874,7 +891,7 @@ fn injection_script_defers_backend_mapped_toggles_until_settings_load() {
     );
     assert!(script.contains("button.dataset.pending = String(waitsForBackend)"));
     assert!(script.contains(
-        "button.disabled = waitsForBackend || button.dataset.relayUnneeded === \"true\""
+        "button.disabled = !enhancementsEnabled || waitsForBackend || button.dataset.relayUnneeded === \"true\""
     ));
     assert!(script.contains("toggle.disabled || toggle.dataset.pending === \"true\""));
 }
@@ -884,10 +901,54 @@ fn injection_script_ignores_stale_backend_settings_responses() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("let codexPlusBackendSettingsSeq = 0"));
-    assert!(script.contains("const seq = codexPlusBackendSettingsSeq"));
-    assert!(script.contains("if (seq !== codexPlusBackendSettingsSeq)"));
-    assert!(script.contains("const seq = ++codexPlusBackendSettingsSeq"));
-    assert!(script.contains("if (seq === codexPlusBackendSettingsSeq)"));
+    assert!(script.contains("let codexPlusBackendSettingsLoadSeq = 0"));
+    assert!(script.contains("let codexPlusBackendSettingsWriteQueue = Promise.resolve()"));
+    assert!(script.contains("const codexPlusBackendSettingSeqByKey = new Map()"));
+    assert!(script.contains("const codexPlusBackendConfirmedSettings = new Map()"));
+    assert!(script.contains("const settingsSeq = codexPlusBackendSettingsSeq"));
+    assert!(script.contains("const loadSeq = ++codexPlusBackendSettingsLoadSeq"));
+    assert!(script.contains("if (!isCurrentCodexPlusRendererRuntime()"));
+    assert!(script.contains("|| loadSeq !== codexPlusBackendSettingsLoadSeq"));
+    assert!(script.contains("|| settingsSeq !== codexPlusBackendSettingsSeq"));
+    assert!(script.contains("await codexPlusBackendSettingsWriteQueue"));
+    assert!(script.contains("codexPlusBackendSettingsWriteQueue = request.then"));
+    assert!(script.contains("keySeq === codexPlusBackendSettingSeqByKey.get(key)"));
+    assert!(script.contains("codexPlusBackendConfirmedSettings.get(key)"));
+    assert!(script.contains("applyCodexPlusSettingRuntimeEffect(localKey, rollbackValue)"));
+}
+
+#[test]
+fn injection_script_serializes_user_script_requests_and_ignores_stale_responses() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("let codexPlusUserScriptsRequestSeq = 0"));
+    assert!(script.contains("let codexPlusUserScriptsRequestQueue = Promise.resolve()"));
+    assert!(script.contains("const codexPlusUserScriptsPending = new Set()"));
+    assert!(script.contains("function updateUserScripts(path, payload, pendingKey)"));
+    assert!(script.contains("const requestSeq = ++codexPlusUserScriptsRequestSeq"));
+    assert!(script.contains("requestSeq !== codexPlusUserScriptsRequestSeq"));
+    assert!(script.contains("if (!isCurrentCodexPlusRendererRuntime()) return null;"));
+}
+
+#[test]
+fn injection_script_resynchronizes_runtime_when_enhancements_reopen() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains(
+        "if (key === \"enhancementsEnabled\" && value === true) {\n      syncCodexPlusRuntimeFeatures();\n    }"
+    ));
+    assert!(script.contains("function refreshCodexPlusBackendToggles()"));
+    assert!(script.contains("renderCodexPlusMenu();\n    scan();"));
+}
+
+#[test]
+fn injection_script_ignores_stale_service_tier_reads_after_toggle_changes() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("let codexServiceTierLoadSeq = 0"));
+    assert!(script.contains("const loadSeq = ++codexServiceTierLoadSeq"));
+    assert!(script.contains("loadSeq !== codexServiceTierLoadSeq"));
+    assert!(script.contains("codexServiceTierLoadSeq += 1"));
 }
 
 #[test]
@@ -896,7 +957,11 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
 
     assert!(script.contains("function pluginPatchDisabledInRelayMode()"));
     assert!(script.contains("!codexPlusBackendSettingsLoaded"));
-    assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
+    assert!(script.contains("function pluginMarketplaceUnlockActive()"));
+    assert!(script.contains(
+        "return !pluginPatchDisabledInRelayMode() && !!codexPlusSettings().pluginMarketplaceUnlock"
+    ));
+    assert!(script.contains("if (!pluginMarketplaceUnlockActive()) return"));
     assert!(script.contains("clearPluginPatchArtifacts()"));
 }
 
@@ -952,7 +1017,7 @@ fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock()
 
     assert!(script.contains("pluginMarketplaceUnlock: true"));
     assert!(script.contains("pluginMarketplaceUnlock: \"codexAppPluginMarketplaceUnlock\""));
-    assert!(script.contains("if (!codexPlusSettings().pluginMarketplaceUnlock) return"));
+    assert!(script.contains("!!codexPlusSettings().pluginMarketplaceUnlock"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
 }
@@ -992,7 +1057,7 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"));
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -1004,7 +1069,7 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
     assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
     assert!(script.contains("source.includes(\"!Eu(e.marketplaceName)||e.marketplaceName===n\")"));
@@ -1017,7 +1082,7 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
@@ -1194,6 +1259,7 @@ window.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = [{{
   plugins: [{{ id: "alpha@fixture-local", name: "alpha", marketplaceName: "fixture-local" }}],
 }}];
 const api = window.__codexPlusPluginMarketplaceTest;
+api.setActive(true);
 api.reset();
 const initial = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
 api.setCodexAppVersion("26.803.41515");
@@ -1288,15 +1354,20 @@ fn injection_script_loads_backend_settings_before_initial_scan() {
         .rfind("void loadBackendSettingsForStartup();")
         .expect("script should load backend settings on startup");
     let footer = &script[startup_call..];
-    let initial_scan = footer
-        .find("scan();")
-        .expect("script should perform an initial scan");
     let footer_marker = footer
         .find("window.removeEventListener(\"resize\"")
-        .expect("script should continue bootstrapping after the initial scan");
+        .expect("script should continue bootstrapping after scheduling the settings load");
 
-    assert!(initial_scan < footer_marker);
+    assert!(!footer[..footer_marker].contains("scan();"));
+    assert!(script.contains("if (loaded) {\n        activateCodexPlusRendererRuntime();"));
+    assert!(script.contains("function activateCodexPlusRendererRuntime()"));
     assert!(script.contains("if (attempt < 60)"));
+    assert!(script.contains(
+        "function scheduleScan(mutations) {\n    if (!isCurrentCodexPlusRendererRuntime() || !codexPlusBackendSettingsLoaded) return;"
+    ));
+    assert!(script.contains(
+        "window.__codexSessionDeleteScanTimer = null;\n    if (!isCurrentCodexPlusRendererRuntime() || !codexPlusBackendSettingsLoaded) return;"
+    ));
 }
 
 #[test]
@@ -1323,10 +1394,10 @@ fn injection_script_exposes_sidebar_thread_id_badge_control() {
     assert!(script.contains("codex-thread-id-badge"));
     assert!(script.contains("data-codex-thread-id-badge-wrap=\"true\""));
     assert!(script.contains("let threadIdBadgeActive = false"));
-    assert!(script.contains("if (threadIdBadgeActive)"));
+    assert!(script.contains("removeThreadIdBadges();\n      threadIdBadgeActive = false;"));
     assert!(script.contains("function refreshThreadIdBadges()"));
     assert!(script.contains("uuidV7TimestampMs(sessionId)"));
-    assert!(script.contains("refreshThreadIdBadges();"));
+    assert!(script.contains("runScanStep(refreshThreadIdBadges);"));
 }
 
 #[test]
@@ -1578,7 +1649,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"5\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = `5-${codexPlusRendererRuntimeVersion}`"));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -1592,6 +1663,9 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(!script.contains("|| settingsResp.relayProfiles[0]"));
     assert!(script.contains("refreshCodexModelWhitelistFromScan"));
     assert!(script.contains("codexPlusModelListRequestIds.size === 0"));
+    assert!(script.contains("const codexPlusModelPatchSnapshots"));
+    assert!(script.contains("function restoreCodexPlusModelPatches()"));
+    assert!(script.contains("restoreCodexPlusModelPatches();"));
     assert!(!script.contains("function patchReactModelState"));
     assert!(!script.contains("function patchObjectGraphForModels"));
     assert!(!script.contains("window.dispatchEvent = function patchedCodexPlusDispatchEvent"));

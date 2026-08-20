@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item};
@@ -1043,16 +1044,51 @@ impl SettingsStore {
             }
         };
 
-        Ok(normalize_settings_config_sections(
-            serde_json::from_str(&contents).unwrap_or_default(),
-        ))
+        let settings = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse settings {}", self.path.display()))?;
+        Ok(normalize_settings_config_sections(settings))
     }
 
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {
-        let mut settings = normalize_settings_config_sections(settings.clone());
-        settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
-        let bytes = serde_json::to_vec_pretty(&settings)?;
-        atomic_write(&self.path, &bytes)
+        self.with_exclusive_lock(|| {
+            let mut settings = normalize_settings_config_sections(settings.clone());
+            settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
+            let bytes = serde_json::to_vec_pretty(&settings)?;
+            atomic_write(&self.path, &bytes)
+        })
+    }
+
+    pub fn save_merged(
+        &self,
+        base: &BackendSettings,
+        desired: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        let mut base = normalize_settings_config_sections(base.clone());
+        base.codex_extra_args = normalize_codex_extra_args(&base.codex_extra_args);
+        let mut desired = normalize_settings_config_sections(desired.clone());
+        desired.codex_extra_args = normalize_codex_extra_args(&desired.codex_extra_args);
+        let base = serde_json::to_value(base)?;
+        let desired = serde_json::to_value(desired)?;
+        let patch = settings_snapshot_diff(&base, &desired);
+
+        self.with_exclusive_lock(|| {
+            let mut raw = self.load_raw_object()?;
+            merge_known_setting_fields(&mut raw, &patch);
+            let settings = serde_json::from_value(Value::Object(raw.clone()))
+                .with_context(|| format!("failed to parse settings {}", self.path.display()))?;
+            let settings = normalize_settings_config_sections(settings);
+            raw.insert(
+                "relayCommonConfigContents".to_string(),
+                Value::String(settings.relay_common_config_contents.clone()),
+            );
+            raw.insert(
+                "relayContextConfigContents".to_string(),
+                Value::String(settings.relay_context_config_contents.clone()),
+            );
+            let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
+            atomic_write(&self.path, &bytes)?;
+            Ok(())
+        })
     }
 
     pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
@@ -1060,22 +1096,24 @@ impl SettingsStore {
             return self.load();
         };
 
-        let mut raw = self.load_raw_object()?;
-        merge_known_setting_fields(&mut raw, &payload);
-        let settings = normalize_settings_config_sections(
-            serde_json::from_value(Value::Object(raw.clone())).unwrap_or_default(),
-        );
-        raw.insert(
-            "relayCommonConfigContents".to_string(),
-            Value::String(settings.relay_common_config_contents.clone()),
-        );
-        raw.insert(
-            "relayContextConfigContents".to_string(),
-            Value::String(settings.relay_context_config_contents.clone()),
-        );
-        let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
-        atomic_write(&self.path, &bytes)?;
-        Ok(settings)
+        self.with_exclusive_lock(|| {
+            let mut raw = self.load_raw_object()?;
+            merge_known_setting_fields(&mut raw, &payload);
+            let settings = serde_json::from_value(Value::Object(raw.clone()))
+                .with_context(|| format!("failed to parse settings {}", self.path.display()))?;
+            let settings = normalize_settings_config_sections(settings);
+            raw.insert(
+                "relayCommonConfigContents".to_string(),
+                Value::String(settings.relay_common_config_contents.clone()),
+            );
+            raw.insert(
+                "relayContextConfigContents".to_string(),
+                Value::String(settings.relay_context_config_contents.clone()),
+            );
+            let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
+            atomic_write(&self.path, &bytes)?;
+            Ok(settings)
+        })
     }
 
     fn load_raw_object(&self) -> anyhow::Result<Map<String, Value>> {
@@ -1090,11 +1128,59 @@ impl SettingsStore {
             }
         };
 
-        match serde_json::from_str::<Value>(&contents) {
-            Ok(Value::Object(map)) => Ok(map),
-            Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
+        match serde_json::from_str::<Value>(&contents)
+            .with_context(|| format!("failed to parse settings {}", self.path.display()))?
+        {
+            Value::Object(map) => Ok(map),
+            _ => anyhow::bail!("settings root must be an object: {}", self.path.display()),
         }
     }
+
+    fn with_exclusive_lock<T>(
+        &self,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        let lock_path = settings_lock_path(&self.path);
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open settings lock {}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .with_context(|| format!("failed to lock settings {}", self.path.display()))?;
+        let result = action();
+        let unlock_result = FileExt::unlock(&lock)
+            .with_context(|| format!("failed to unlock settings {}", self.path.display()));
+        match (result, unlock_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+}
+
+fn settings_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+fn settings_snapshot_diff(base: &Value, desired: &Value) -> Map<String, Value> {
+    let mut patch = Map::new();
+    let (Some(base), Some(desired)) = (base.as_object(), desired.as_object()) else {
+        return patch;
+    };
+    desired.iter().for_each(|(key, value)| {
+        if base.get(key) != Some(value) {
+            patch.insert(key.clone(), value.clone());
+        }
+    });
+    patch
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -1649,12 +1735,16 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
 fn temp_path_for(path: &Path) -> PathBuf {
     let mut temp_path = path.to_path_buf();
     let extension = path.extension().and_then(|value| value.to_str());
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let suffix = format!("tmp.{}.{}", std::process::id(), id);
     temp_path.set_extension(match extension {
-        Some(extension) => format!("{extension}.tmp"),
-        None => "tmp".to_string(),
+        Some(extension) => format!("{extension}.{suffix}"),
+        None => suffix,
     });
     temp_path
 }
+
+static NEXT_ATOMIC_WRITE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -1683,7 +1773,13 @@ mod tests {
         atomic_write(&path, b"new").unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert!(!dir.join("settings.json.tmp").exists());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("settings.json.tmp.")
+        }));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2182,13 +2278,13 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
-    fn settings_store_load_bad_json_returns_default() {
+    fn settings_store_load_bad_json_returns_error() {
         let dir = temp_dir();
         let path = dir.join("settings.json");
         std::fs::write(&path, "{bad json").unwrap();
         let store = SettingsStore::new(path);
 
-        assert_eq!(store.load().unwrap(), BackendSettings::default());
+        assert!(store.load().is_err());
     }
 
     #[test]
@@ -2204,6 +2300,29 @@ experimental_bearer_token = "sk-existing""#
         store.save(&settings).unwrap();
 
         assert_eq!(store.load().unwrap(), settings);
+    }
+
+    #[test]
+    fn settings_store_save_merged_preserves_changes_after_base_snapshot() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let base = BackendSettings {
+            provider_sync_enabled: false,
+            codex_app_thread_id_badge: false,
+            ..BackendSettings::default()
+        };
+        store.save(&base).unwrap();
+        store.update(json!({"providerSyncEnabled": true})).unwrap();
+
+        let desired = BackendSettings {
+            codex_app_thread_id_badge: true,
+            ..base.clone()
+        };
+        store.save_merged(&base, &desired).unwrap();
+
+        let saved = store.load().unwrap();
+        assert!(saved.provider_sync_enabled);
+        assert!(saved.codex_app_thread_id_badge);
     }
 
     #[test]

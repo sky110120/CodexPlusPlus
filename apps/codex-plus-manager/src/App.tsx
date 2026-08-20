@@ -1064,6 +1064,11 @@ export function App() {
 
   const call = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 
+  const saveSettingsArgs = (next: BackendSettings) => ({
+    settings: next,
+    baseSettings: settings ? normalizeSettings(settings.settings) : undefined,
+  });
+
   const logDiagnostic = (event: string, detail: Record<string, unknown> = {}) => {
     void invoke("write_diagnostic_event", { event, detail }).catch(() => {});
   };
@@ -2327,7 +2332,7 @@ export function App() {
 
   const saveSettings = async () => {
     const next = normalizeSettings(settingsForm);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2337,7 +2342,7 @@ export function App() {
 
   const saveSettingsValue = async (next: BackendSettings, silent = true) => {
     const normalized = normalizeSettings(next);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
     if (result && isSuccessStatus(result.status)) {
       const saved = normalizeSettings(result.settings);
       setSettings(result);
@@ -2562,7 +2567,7 @@ export function App() {
   };
 
   const applyRelayInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
+    const settingsResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(settingsForm)));
     if (settingsResult) {
       setSettings(settingsResult);
       setSettingsForm(normalizeSettings(settingsResult.settings));
@@ -2585,7 +2590,7 @@ export function App() {
   const saveLaunchMode = async (launchMode: LaunchMode, silent = false, baseSettings: BackendSettings = settingsForm) => {
     const next = { ...baseSettings, launchMode };
     setSettingsForm(next);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2595,7 +2600,7 @@ export function App() {
   };
 
   const applyPureApiInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
+    const settingsResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(settingsForm)));
     if (settingsResult) {
       setSettings(settingsResult);
       setSettingsForm(normalizeSettings(settingsResult.settings));
@@ -2644,7 +2649,7 @@ export function App() {
     );
     if (!result) return null;
     let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
     if (saveResult) {
       setSettings(saveResult);
       normalized = normalizeSettings(saveResult.settings);
@@ -2662,7 +2667,7 @@ export function App() {
     );
     if (!result) return null;
     let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
     if (saveResult) {
       setSettings(saveResult);
       normalized = normalizeSettings(saveResult.settings);
@@ -2951,7 +2956,7 @@ export function App() {
 
   const saveCodexAppPath = async (appPath: string) => {
     const next = { ...settingsForm, codexAppPath: appPath };
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
     if (result) {
       setSettings(result);
       const normalized = normalizeSettings(result.settings);
@@ -3115,7 +3120,7 @@ export function App() {
       },
       clearCodexAppPath: async () => {
         const next = { ...settingsForm, codexAppPath: "" };
-        const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+        const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
         if (result) {
           setSettings(result);
           setSettingsForm(normalizeSettings(result.settings));

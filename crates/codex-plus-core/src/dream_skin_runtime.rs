@@ -6,6 +6,8 @@ use serde_json::Value;
 
 use crate::settings::SettingsStore;
 
+static DREAM_SKIN_APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DreamSkinState {
@@ -280,6 +282,7 @@ pub async fn apply_dream_skin_live(
     debug_port: u16,
     helper_port: u16,
 ) -> anyhow::Result<DreamSkinRuntimeStatus> {
+    let _apply_guard = DREAM_SKIN_APPLY_LOCK.lock().await;
     let settings = SettingsStore::default().load()?;
     if !settings.enhancements_enabled || !settings.codex_app_dream_skin_enabled {
         bail!("Dream Skin is not enabled");
@@ -322,19 +325,40 @@ pub async fn apply_dream_skin_live(
             )
         })
     });
-    if live_signatures.as_ref().is_some_and(|(_, payload)| {
-        payload == &crate::assets::dream_skin_runtime_content_signature(&settings)
+    let settings = SettingsStore::default().load()?;
+    if !settings.enhancements_enabled || !settings.codex_app_dream_skin_enabled {
+        bail!("Dream Skin is not enabled");
+    }
+    if settings.codex_app_dream_skin_paused {
+        bail!("Dream Skin is paused");
+    }
+    let applied_payload_signature =
+        crate::assets::dream_skin_runtime_content_signature(&settings);
+    let expected_payload_signature =
+        crate::assets::dream_skin_runtime_content_signature(&settings);
+    let expected_art_signature = crate::assets::dream_skin_art_content_signature(&settings);
+    if live_signatures.as_ref().is_some_and(|(live_art, payload)| {
+        live_art == &expected_art_signature && payload == &expected_payload_signature
     }) {
         return Ok(dream_skin_status(debug_port).await);
     }
     let script = if let Some((live_art_signature, _)) = live_signatures {
-        let include_art =
-            live_art_signature != crate::assets::dream_skin_art_content_signature(&settings);
+        let include_art = live_art_signature != expected_art_signature;
         crate::assets::dream_skin_live_update_script(&settings, include_art)
     } else {
         crate::assets::injection_script_with_settings(helper_port, &settings)
     };
     crate::bridge::evaluate_script(websocket, &script).await?;
+    let latest_settings = SettingsStore::default().load()?;
+    if !latest_settings.enhancements_enabled
+        || !latest_settings.codex_app_dream_skin_enabled
+        || latest_settings.codex_app_dream_skin_paused
+        || crate::assets::dream_skin_runtime_content_signature(&latest_settings)
+            != applied_payload_signature
+    {
+        let _ = crate::bridge::evaluate_script(websocket, cleanup_script()).await;
+        bail!("Dream Skin settings changed while applying");
+    }
     Ok(dream_skin_status(debug_port).await)
 }
 
@@ -406,6 +430,15 @@ pub fn renderer_verification_script() -> &'static str {
       visible: rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden",
     };
   };
+  const firstVisibleBox = (selectors) => {
+    for (const selector of selectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        const candidate = box(node);
+        if (candidate?.visible) return candidate;
+      }
+    }
+    return null;
+  };
   const homeSignal = document.querySelector('[data-testid="home-icon"]') ||
     document.querySelector('[data-feature="game-source"]') ||
     document.querySelector('.group\\/home-suggestions');
@@ -415,10 +448,16 @@ pub fn renderer_verification_script() -> &'static str {
   const cards = suggestions ? [...suggestions.querySelectorAll('button')].map(box) : [];
   const chrome = document.getElementById('codex-dream-skin-chrome') ||
     document.getElementById('codex-glass-vision-skin-chrome');
+  const runtimeRevision = String(window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ || '');
+  const targetEngine = String(window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ || '');
+  const payloadSignature = String(window.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__ || '');
+  const managedVersion = window.__CODEX_PLUS_VERSION__ && runtimeRevision && targetEngine && payloadSignature
+    ? `codex-plus:${String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || 'unknown')}:${targetEngine}:r${runtimeRevision}`
+    : null;
   return JSON.stringify({
     installed: document.documentElement.classList.contains('codex-dream-skin') ||
       document.documentElement.classList.contains('codex-glass-vision-skin'),
-    version: window.__CODEX_DREAM_SKIN_STATE__?.version ||
+    version: managedVersion || window.__CODEX_DREAM_SKIN_STATE__?.version ||
       window.__CODEX_GLASS_VISION_SKIN_STATE__?.version || null,
     stylePresent: Boolean(document.getElementById('codex-dream-skin-style') ||
       document.getElementById('codex-glass-vision-skin-style')),
@@ -429,7 +468,11 @@ pub fn renderer_verification_script() -> &'static str {
     hero: box(home?.firstElementChild?.firstElementChild?.firstElementChild),
     visibleCardCount: cards.filter((item) => item?.visible).length,
     projectButton: box(home?.querySelector('.group\\/project-selector > button')),
-    composer: box(document.querySelector('.composer-surface-chrome')),
+    composer: firstVisibleBox([
+      '.composer-surface-chrome',
+      '[role="textbox"][contenteditable="true"]',
+      'textarea:not([disabled])',
+    ]),
     sidebar: box(document.querySelector('aside.app-shell-left-panel')),
     documentOverflow: {
       x: document.documentElement.scrollWidth > document.documentElement.clientWidth,
@@ -447,6 +490,15 @@ fn cleanup_script() -> &'static str {
   }
   window.__CODEX_DREAM_SKIN_DISABLED__ = true;
   window.__CODEX_GLASS_VISION_SKIN_DISABLED__ = true;
+  window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__?.disconnect?.();
+  delete window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__;
+  document.querySelectorAll('[data-ds-part]').forEach((node) => node.removeAttribute('data-ds-part'));
+  [
+    '--ds-theme-color-background', '--ds-theme-color-panel', '--ds-theme-color-panel-alt',
+    '--ds-theme-color-accent', '--ds-theme-color-accent-alt', '--ds-theme-color-secondary',
+    '--ds-theme-color-highlight', '--ds-theme-color-text', '--ds-theme-color-muted',
+    '--ds-theme-color-line', '--ds-theme-image-focus-x', '--ds-theme-image-focus-y',
+  ].forEach((name) => document.documentElement?.style.removeProperty(name));
   if (window.__CODEX_DREAM_SKIN_STATE__?.cleanup) {
     window.__CODEX_DREAM_SKIN_STATE__.cleanup();
     return true;
