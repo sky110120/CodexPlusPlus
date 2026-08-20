@@ -118,13 +118,15 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
     let no_horizontal_overflow = !bool_at(&raw, "/documentOverflow/x");
     let no_vertical_overflow = !bool_at(&raw, "/documentOverflow/y");
     let home_route = bool_at(&raw, "/homeRoute");
+    let home_content = bool_at(&raw, "/homeContent/visible");
+    let visible_cards = raw
+        .get("visibleCardCount")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| (1..=6).contains(&count));
     let home_pass = !home_route
         || (bool_at(&raw, "/homePresent")
-            && bool_at(&raw, "/hero/visible")
-            && raw
-                .get("visibleCardCount")
-                .and_then(Value::as_u64)
-                .is_some_and(|count| (1..=6).contains(&count)));
+            && (bool_at(&raw, "/hero/visible") || home_content)
+            && (home_content || visible_cards));
     let version_pass = version
         .as_deref()
         .is_some_and(|value| value.starts_with("codex-plus:"));
@@ -403,14 +405,20 @@ pub async fn verify_dream_skin(
         .web_socket_debugger_url
         .as_deref()
         .context("Codex renderer has no WebSocket URL")?;
-    let response =
-        crate::bridge::evaluate_script(websocket, renderer_verification_script()).await?;
-    let encoded = response
-        .pointer("/result/result/value")
-        .and_then(Value::as_str)
-        .context("Dream Skin verifier returned no value")?;
-    let raw: Value = serde_json::from_str(encoded).context("invalid Dream Skin verifier JSON")?;
-    let mut verification = parse_renderer_verification(raw)?;
+    let mut verification = None;
+    for attempt in 0..8 {
+        match read_renderer_verification(websocket).await {
+            Ok(result) if result.pass || attempt == 7 => {
+                verification = Some(result);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) if attempt == 7 => return Err(error),
+            Err(_) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    let mut verification = verification.context("Dream Skin verification did not complete")?;
     if let Some(path) = screenshot_path {
         crate::bridge::capture_page_screenshot(websocket, path).await?;
         verification.screenshot_path = Some(path.to_string_lossy().to_string());
@@ -420,6 +428,8 @@ pub async fn verify_dream_skin(
 
 pub fn renderer_verification_script() -> &'static str {
     r#"(() => {
+  const skinState = window.__CODEX_DREAM_SKIN_STATE__ || window.__CODEX_GLASS_VISION_SKIN_STATE__;
+  skinState?.ensure?.();
   const box = (node) => {
     if (!node) return null;
     const rect = node.getBoundingClientRect();
@@ -439,13 +449,20 @@ pub fn renderer_verification_script() -> &'static str {
     }
     return null;
   };
-  const homeSignal = document.querySelector('[data-testid="home-icon"]') ||
-    document.querySelector('[data-feature="game-source"]') ||
-    document.querySelector('.group\\/home-suggestions');
-  const homeRoute = homeSignal?.closest('[role="main"]') || null;
-  const home = document.querySelector('[role="main"].dream-home, [role="main"].dream-skin-home, [role="main"].glass-vision-home');
-  const suggestions = home?.querySelector('.group\\/home-suggestions') || null;
+  const homeChromeSelector = '[class*="home-suggestions"], [class*="_homeUtilityBar_"]';
+  const homeIndicator = document.querySelector('[data-testid="home-icon"]');
+  const homeSignal = homeIndicator || document.querySelector('[data-feature="game-source"]') || document.querySelector(homeChromeSelector);
+  const homeRoute = homeIndicator?.closest('[role="main"]') ||
+    homeSignal?.closest('[role="main"]') ||
+    [...document.querySelectorAll('[role="main"]')].find((candidate) =>
+      candidate.querySelector('[data-feature="game-source"]') && candidate.querySelector(homeChromeSelector)
+    ) || null;
+  const home = homeRoute && (
+    homeRoute.querySelector('[data-feature="game-source"]') || homeRoute.querySelector(homeChromeSelector)
+  ) ? homeRoute : null;
+  const suggestions = home?.querySelector(homeChromeSelector) || null;
   const cards = suggestions ? [...suggestions.querySelectorAll('button')].map(box) : [];
+  const homeContent = home?.querySelector('[data-feature="game-source"], ' + homeChromeSelector) || null;
   const chrome = document.getElementById('codex-dream-skin-chrome') ||
     document.getElementById('codex-glass-vision-skin-chrome');
   const runtimeRevision = String(window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ || '');
@@ -466,6 +483,7 @@ pub fn renderer_verification_script() -> &'static str {
     homeRoute: Boolean(homeRoute),
     homePresent: Boolean(home),
     hero: box(home?.firstElementChild?.firstElementChild?.firstElementChild),
+    homeContent: box(homeContent),
     visibleCardCount: cards.filter((item) => item?.visible).length,
     projectButton: box(home?.querySelector('.group\\/project-selector > button')),
     composer: firstVisibleBox([
@@ -480,6 +498,18 @@ pub fn renderer_verification_script() -> &'static str {
     },
   });
 })()"#
+}
+
+async fn read_renderer_verification(
+    websocket: &str,
+) -> anyhow::Result<DreamSkinVerification> {
+    let response = crate::bridge::evaluate_script(websocket, renderer_verification_script()).await?;
+    let encoded = response
+        .pointer("/result/result/value")
+        .and_then(Value::as_str)
+        .context("Dream Skin verifier returned no value")?;
+    let raw: Value = serde_json::from_str(encoded).context("invalid Dream Skin verifier JSON")?;
+    parse_renderer_verification(raw)
 }
 
 fn cleanup_script() -> &'static str {

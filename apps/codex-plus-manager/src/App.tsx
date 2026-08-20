@@ -1131,6 +1131,7 @@ export function App() {
   });
 
   const refreshDreamSkinStatus = async (silent = false) => {
+    setDreamSkinVerification(null);
     const result = await run(() => call<DreamSkinRuntimeResult>("dream_skin_status", dreamSkinRequest()));
     if (result) {
       setDreamSkinStatus(result);
@@ -3068,9 +3069,9 @@ export function App() {
       call<DreamSkinVerificationResult>("verify_dream_skin", dreamSkinRequest(screenshotPath)),
     );
     if (!result) return;
-    setDreamSkinVerification(result);
     showResultNotice(withScreenshot ? t("保存截图") : t("实机验证"), result);
     await refreshDreamSkinStatus(true);
+    setDreamSkinVerification(result);
   };
 
   const actions = useMemo(

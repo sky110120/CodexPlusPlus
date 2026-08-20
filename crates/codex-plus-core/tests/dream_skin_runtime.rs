@@ -121,6 +121,28 @@ fn verification_accepts_target_project_live_contract() {
 }
 
 #[test]
+fn verification_accepts_home_content_without_suggestion_cards() {
+    let result = parse_renderer_verification(serde_json::json!({
+        "installed": true,
+        "version": "codex-plus:macos:dream-skin:r20-modern-main-surface",
+        "stylePresent": true,
+        "chromePresent": true,
+        "chromePointerEvents": "none",
+        "homeRoute": true,
+        "homePresent": true,
+        "hero": { "visible": false },
+        "homeContent": { "visible": true },
+        "visibleCardCount": 0,
+        "composer": { "visible": true },
+        "sidebar": { "visible": true },
+        "documentOverflow": { "x": false, "y": false }
+    }))
+    .unwrap();
+
+    assert!(result.pass);
+}
+
+#[test]
 fn verification_script_supports_managed_versions_and_modern_composers() {
     let script = renderer_verification_script();
 
@@ -128,6 +150,10 @@ fn verification_script_supports_managed_versions_and_modern_composers() {
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__"));
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__"));
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__"));
+    assert!(script.contains("skinState?.ensure?.()"));
+    assert!(script.contains("homeChromeSelector"));
+    assert!(script.contains("_homeUtilityBar_"));
+    assert!(script.contains("homeContent"));
     assert!(script.contains(".composer-surface-chrome"));
     assert!(script.contains("[role=\"textbox\"][contenteditable=\"true\"]"));
     assert!(script.contains("textarea:not([disabled])"));
