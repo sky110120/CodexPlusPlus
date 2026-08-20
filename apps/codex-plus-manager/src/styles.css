@@ -5592,6 +5592,10 @@ select {
   border-color: hsl(var(--status-warning) / 0.72);
 }
 
+.dream-skin-theme-card.is-damaged {
+  border-color: hsl(var(--destructive) / 0.58);
+}
+
 .dream-skin-theme-select {
   position: relative;
   z-index: 1;
@@ -5610,6 +5614,15 @@ select {
 
 .dream-skin-theme-select:hover {
   background: hsl(var(--accent) / 0.68);
+}
+
+.dream-skin-theme-select:disabled {
+  cursor: default;
+  opacity: 0.74;
+}
+
+.dream-skin-theme-select:disabled:hover {
+  background: transparent;
 }
 
 .dream-skin-theme-image {
@@ -5681,6 +5694,19 @@ select {
   right: 36px;
   bottom: 6px;
   color: hsl(var(--status-warning));
+}
+
+.dream-skin-theme-card.is-damaged .dream-skin-theme-select em,
+.dream-skin-theme-error {
+  color: hsl(var(--destructive));
+}
+
+.dream-skin-theme-error {
+  display: block;
+  padding: 0 34px 8px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .dream-skin-pending-state {

@@ -1,7 +1,8 @@
 use std::io::{Cursor, Write};
 
 use codex_plus_core::dream_skin_library::{
-    load_stored_dream_skin_theme, prepare_dream_skin_activation, save_validated_dream_skin_package,
+    commit_dream_skin_activation, load_stored_dream_skin_theme, prepare_dream_skin_activation,
+    save_validated_dream_skin_package,
 };
 use codex_plus_core::dream_skin_package::{compile_safe_css, validate_and_read_package};
 use serde_json::json;
@@ -161,7 +162,8 @@ fn installed_package_preserves_and_activates_safe_css() {
 
     save_validated_dream_skin_package(temp.path(), &package).unwrap();
     let stored = load_stored_dream_skin_theme(temp.path(), "community.theme").unwrap();
-    prepare_dream_skin_activation(temp.path(), &stored).unwrap();
+    let activation = prepare_dream_skin_activation(temp.path(), &stored).unwrap();
+    commit_dream_skin_activation(temp.path(), &activation).unwrap();
 
     assert_eq!(
         std::fs::read(temp.path().join("dream-skin/theme/current.css")).unwrap(),

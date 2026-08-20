@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use codex_plus_core::dream_skin_library::{
-    DreamSkinThemeDraft, DreamSkinThemeKind, create_dream_skin_theme_from_image,
-    delete_dream_skin_theme, list_dream_skin_themes, load_stored_dream_skin_theme,
-    prepare_dream_skin_activation, rename_dream_skin_theme, save_dream_skin_theme,
+    DreamSkinThemeDraft, DreamSkinThemeKind, commit_dream_skin_activation,
+    create_dream_skin_theme_from_image, delete_dream_skin_theme, list_dream_skin_themes,
+    load_stored_dream_skin_theme, prepare_dream_skin_activation, rename_dream_skin_theme,
+    save_dream_skin_theme,
 };
 use codex_plus_core::settings::{BackendSettings, DreamSkinThemeConfig};
 
@@ -79,11 +80,18 @@ fn scan_ignores_invalid_ids_and_mismatched_theme_json() {
 
     let library = list_dream_skin_themes(temp.path(), &BackendSettings::default()).unwrap();
 
-    assert_eq!(library.themes.len(), 1);
+    assert_eq!(library.themes.len(), 2);
+    assert!(
+        library
+            .themes
+            .iter()
+            .any(|item| item.id == "valid-id" && item.damaged)
+    );
+    assert!(!library.warnings.is_empty());
 }
 
 #[test]
-fn legacy_active_settings_are_exposed_as_unsaved() {
+fn disabled_legacy_settings_are_not_exposed_as_active() {
     let temp = tempfile::tempdir().unwrap();
     let mut settings = BackendSettings::default();
     settings.codex_app_dream_skin_theme_config.id = "legacy-custom".into();
@@ -91,9 +99,13 @@ fn legacy_active_settings_are_exposed_as_unsaved() {
 
     let library = list_dream_skin_themes(temp.path(), &settings).unwrap();
 
-    let active = library.themes.iter().find(|item| item.active).unwrap();
-    assert_eq!(active.kind, DreamSkinThemeKind::ActiveUnsaved);
-    assert_eq!(active.name, "Legacy Custom");
+    assert!(!library.themes.iter().any(|item| item.active));
+    assert!(
+        !library
+            .themes
+            .iter()
+            .any(|item| item.kind == DreamSkinThemeKind::ActiveUnsaved)
+    );
 }
 
 #[test]
@@ -160,11 +172,11 @@ fn delete_rejects_builtin_current_and_unknown_files() {
     save_dream_skin_theme(temp.path(), &draft).unwrap();
     let dir = temp.path().join("dream-skin/themes/current");
 
-    assert!(delete_dream_skin_theme(temp.path(), "builtin", Some("current")).is_err());
-    assert!(delete_dream_skin_theme(temp.path(), "current", Some("current")).is_err());
+    assert!(delete_dream_skin_theme(temp.path(), "builtin", Some("current"), false).is_err());
+    assert!(delete_dream_skin_theme(temp.path(), "current", Some("current"), false).is_err());
 
     std::fs::write(dir.join("keep.txt"), b"unknown").unwrap();
-    assert!(delete_dream_skin_theme(temp.path(), "current", None).is_err());
+    assert!(delete_dream_skin_theme(temp.path(), "current", None, false).is_err());
     assert!(dir.join("keep.txt").exists());
 }
 
@@ -198,6 +210,8 @@ fn prepare_activation_copies_theme_into_current_slot() {
     let activation = prepare_dream_skin_activation(temp.path(), &draft).unwrap();
 
     assert_eq!(activation.config.id, "ready");
+    assert!(!Path::new(&activation.active_image_path).is_file());
+    commit_dream_skin_activation(temp.path(), &activation).unwrap();
     assert!(Path::new(&activation.active_image_path).is_file());
     assert!(
         Path::new(&activation.active_image_path).starts_with(temp.path().join("dream-skin/theme"))
@@ -239,7 +253,9 @@ fn activated_stored_theme_is_not_reported_as_modified() {
     save_dream_skin_theme(temp.path(), &draft).unwrap();
     let stored = load_stored_dream_skin_theme(temp.path(), "stable").unwrap();
     let activation = prepare_dream_skin_activation(temp.path(), &stored).unwrap();
+    commit_dream_skin_activation(temp.path(), &activation).unwrap();
     let mut settings = BackendSettings::default();
+    settings.codex_app_dream_skin_enabled = true;
     settings.codex_app_dream_skin_theme_config = activation.config;
     settings.codex_app_dream_skin_image_path = activation.active_image_path;
 

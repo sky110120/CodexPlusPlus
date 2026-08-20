@@ -341,20 +341,9 @@ fn update_tray_labels<R: tauri::Runtime>(
 }
 
 async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
-    let store = codex_plus_core::settings::SettingsStore::default();
-    let current = store.load()?;
-    if !current.enhancements_enabled {
-        anyhow::bail!("Codex enhancements are disabled");
-    }
-    let settings = store.update(serde_json::json!({
-        "codexAppDreamSkinEnabled": true,
-        "codexAppDreamSkinPaused": false
-    }))?;
-    debug_assert!(settings.enhancements_enabled);
-    codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
-        true,
-        &settings.codex_app_dream_skin_theme_config,
-    )?;
+    let _operation = commands::begin_dream_skin_operation()?;
+    let settings = commands::resume_enabled_dream_skin()?;
+    debug_assert!(settings.enhancements_enabled && settings.codex_app_dream_skin_enabled);
     codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
         DREAM_SKIN_DEBUG_PORT,
         codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,

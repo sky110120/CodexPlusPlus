@@ -271,7 +271,7 @@ describe("dream skin theme helpers", () => {
   it("restores the original appearance as pending without reloading or restarting Codex", async () => {
     const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
     const commands = await readFile(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
-    const restoreStart = app.indexOf("const restoreDreamSkin = async () =>");
+    const restoreStart = app.indexOf("const restoreDreamSkin = async (");
     const restoreEnd = app.indexOf("const verifyDreamSkin", restoreStart);
     const restoreHandler = app.slice(restoreStart, restoreEnd);
     const commandStart = commands.indexOf("pub async fn restore_dream_skin");
@@ -282,7 +282,7 @@ describe("dream skin theme helpers", () => {
     assert.match(restoreHandler, /setPendingDreamSkinRestart/);
     assert.doesNotMatch(restoreHandler, /window\.confirm|await restart\(\)/);
     assert.doesNotMatch(restoreCommand, /reload_dream_skin_live/);
-    assert.match(restoreCommand, /pending_restart\(false, false\)/);
+    assert.match(restoreCommand, /pending_restart\(\s*false,\s*false,?\s*\)/);
   });
 
   it("renders responsive three-column theme grids with platform guidance", async () => {

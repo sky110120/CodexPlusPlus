@@ -96,6 +96,8 @@ export type DreamSkinThemeSummary = {
   builtin: boolean;
   active: boolean;
   modified: boolean;
+  damaged: boolean;
+  error: string;
 };
 
 export type DreamSkinThemeDraft = {
@@ -107,12 +109,27 @@ export type DreamSkinThemeDraft = {
 export type DreamSkinThemeLibrary = {
   themes: DreamSkinThemeSummary[];
   activeDraft: DreamSkinThemeDraft;
+  warnings: string[];
 };
 
 export type DreamSkinThemeActivationPayload = {
   library: DreamSkinThemeLibrary;
   runtime: DreamSkinRuntimeStatus;
   savedForNextLaunch: boolean;
+  sourceThemeSaved: boolean;
+  sourceThemeKey: string;
+  sourceThemeName: string;
+  appliedThemeKey: string;
+  appliedThemeName: string;
+};
+
+export type DreamSkinRestorePayload = {
+  runtime: DreamSkinRuntimeStatus;
+  requiresDecision: boolean;
+  canSaveActive: boolean;
+  activeDraft: DreamSkinThemeDraft | null;
+  stableThemeKey: string;
+  liveCleared: boolean;
 };
 
 export type DreamSkinCommandResult<T> = T & {
@@ -124,8 +141,16 @@ export type DreamSkinRuntimeResult = DreamSkinCommandResult<DreamSkinRuntimeStat
 export type DreamSkinVerificationResult = DreamSkinCommandResult<DreamSkinVerification>;
 export type DreamSkinImageResult = DreamSkinCommandResult<DreamSkinImagePayload>;
 export type DreamSkinThemeLibraryResult = DreamSkinCommandResult<DreamSkinThemeLibrary>;
+export type DreamSkinThemeImportResult = DreamSkinCommandResult<DreamSkinThemeLibrary & {
+  installedThemeId: string;
+}>;
+export type DreamSkinThemeSaveResult = DreamSkinCommandResult<DreamSkinThemeLibrary & {
+  savedThemeKey: string;
+  savedThemeId: string;
+}>;
 export type DreamSkinThemeDraftResult = DreamSkinCommandResult<DreamSkinThemeDraft>;
 export type DreamSkinThemeActivationResult = DreamSkinCommandResult<DreamSkinThemeActivationPayload>;
+export type DreamSkinRestoreResult = DreamSkinCommandResult<DreamSkinRestorePayload>;
 
 export type DreamSkinMarketTheme = {
   id: string;
