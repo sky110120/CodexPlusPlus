@@ -334,10 +334,8 @@ pub async fn apply_dream_skin_live(
     if settings.codex_app_dream_skin_paused {
         bail!("Dream Skin is paused");
     }
-    let applied_payload_signature =
-        crate::assets::dream_skin_runtime_content_signature(&settings);
-    let expected_payload_signature =
-        crate::assets::dream_skin_runtime_content_signature(&settings);
+    let applied_payload_signature = crate::assets::dream_skin_runtime_content_signature(&settings);
+    let expected_payload_signature = crate::assets::dream_skin_runtime_content_signature(&settings);
     let expected_art_signature = crate::assets::dream_skin_art_content_signature(&settings);
     if live_signatures.as_ref().is_some_and(|(live_art, payload)| {
         live_art == &expected_art_signature && payload == &expected_payload_signature
@@ -500,10 +498,9 @@ pub fn renderer_verification_script() -> &'static str {
 })()"#
 }
 
-async fn read_renderer_verification(
-    websocket: &str,
-) -> anyhow::Result<DreamSkinVerification> {
-    let response = crate::bridge::evaluate_script(websocket, renderer_verification_script()).await?;
+async fn read_renderer_verification(websocket: &str) -> anyhow::Result<DreamSkinVerification> {
+    let response =
+        crate::bridge::evaluate_script(websocket, renderer_verification_script()).await?;
     let encoded = response
         .pointer("/result/result/value")
         .and_then(Value::as_str)

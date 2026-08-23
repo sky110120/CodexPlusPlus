@@ -1057,7 +1057,11 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"));
+    assert!(
+        script.contains(
+            "codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"
+        )
+    );
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -1069,7 +1073,11 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"));
+    assert!(
+        script.contains(
+            "codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"
+        )
+    );
     assert!(script.contains("codexPluginFilterSourceCache = new WeakMap()"));
     assert!(script.contains("function codexPluginFilterCallbackSource(callback)"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
@@ -1084,7 +1092,11 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"));
+    assert!(
+        script.contains(
+            "codexPluginMarketplaceUnlockVersion = `15-${codexPlusRendererRuntimeVersion}`"
+        )
+    );
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
@@ -1093,9 +1105,7 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
     assert!(script.contains("!filtered.includes(plugin) : !callback(plugin)"));
     assert!(script.contains("isCodexPluginMarketplaceHiddenFilter"));
-    assert!(script.contains(
-        "!filtered.includes(marketplace) : !callback(marketplace)"
-    ));
+    assert!(script.contains("!filtered.includes(marketplace) : !callback(marketplace)"));
     assert!(script.contains("plugin_marketplace_hidden_filter_bypassed"));
     assert!(script.contains("method === \"list-plugins\""));
     assert!(script.contains("method === \"vscode://codex/list-plugins\""));
@@ -1680,7 +1690,9 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = `5-${codexPlusRendererRuntimeVersion}`"));
+    assert!(script.contains(
+        "codexAppServerModelRequestPatchVersion = `5-${codexPlusRendererRuntimeVersion}`"
+    ));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));

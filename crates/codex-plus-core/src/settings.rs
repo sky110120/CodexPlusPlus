@@ -1947,7 +1947,6 @@ mod tests {
         assert_eq!(invalid.codex_app_stepwise_protocol, "chat_completions");
     }
 
-
     #[test]
     fn settings_deserialize_ignores_removed_cli_wrapper_keys() {
         let settings: BackendSettings = serde_json::from_str(
@@ -2519,7 +2518,6 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(saved["codexAppStepwiseProtocol"], "chat_completions");
     }
 
-
     #[test]
     fn settings_store_save_load_roundtrip_preserves_aggregate_relay_settings() {
         let dir = temp_dir();
@@ -2810,7 +2808,10 @@ experimental_bearer_token = "sk-existing""#
             .unwrap();
 
         assert!(updated.weixin_connect_enabled);
-        assert_eq!(updated.weixin_connect_base_url, "https://ilink.example.test");
+        assert_eq!(
+            updated.weixin_connect_base_url,
+            "https://ilink.example.test"
+        );
         assert_eq!(updated.weixin_connect_token, "token");
         assert_eq!(updated.weixin_connect_account_id, "bot-1");
         assert_eq!(updated.weixin_connect_allow_from, "user@im.wechat");

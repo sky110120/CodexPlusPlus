@@ -210,7 +210,9 @@ fn github_release_workflow_uploads_static_latest_json() {
         .join(".github/workflows/release-assets.yml");
     let workflow = std::fs::read_to_string(&workflow).expect("read release assets workflow");
 
-    assert!(workflow.contains("if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}"));
+    assert!(workflow.contains(
+        "if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}"
+    ));
     assert!(workflow.contains("latest-json:"));
     assert!(workflow.contains("latest.json"));
     assert!(workflow.contains("gh release upload \"$TAG\" latest.json --clobber"));

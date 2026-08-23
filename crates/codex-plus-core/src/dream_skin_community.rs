@@ -267,9 +267,7 @@ fn pending_link_path() -> std::path::PathBuf {
     crate::paths::default_app_state_dir().join(PENDING_LINK_FILE)
 }
 
-fn keep_valid_themes(
-    items: Vec<DreamSkinCommunityTheme>,
-) -> (Vec<DreamSkinCommunityTheme>, usize) {
+fn keep_valid_themes(items: Vec<DreamSkinCommunityTheme>) -> (Vec<DreamSkinCommunityTheme>, usize) {
     let mut kept = Vec::new();
     let mut skipped = 0usize;
     for theme in items {

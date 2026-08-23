@@ -496,10 +496,8 @@ fn inject_text_into_message(msg: &mut Value, text: &str, responses: bool) {
         }
         Some(Value::String(existing)) => {
             let old = existing.clone();
-            *msg.get_mut("content").unwrap() = serde_json::json!([
-                make_block(&old),
-                make_block(text),
-            ]);
+            *msg.get_mut("content").unwrap() =
+                serde_json::json!([make_block(&old), make_block(text),]);
         }
         _ => {}
     }

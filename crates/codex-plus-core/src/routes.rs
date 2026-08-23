@@ -263,10 +263,11 @@ pub async fn handle_bridge_request(
                 .to_string();
             ctx.data.recover_remote_control_session(thread_id).await
         }
-        "/session/export" => ctx
-            .data
-            .export_session_file(session_from_payload(&payload))
-            .await,
+        "/session/export" => {
+            ctx.data
+                .export_session_file(session_from_payload(&payload))
+                .await
+        }
         "/session/import" => ctx.data.import_session_file(payload.clone()).await,
         _ => {
             let _ = crate::diagnostic_log::append_diagnostic_log(

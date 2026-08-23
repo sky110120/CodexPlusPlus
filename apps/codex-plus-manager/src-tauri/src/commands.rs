@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use anyhow::Context;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -162,7 +162,6 @@ pub(crate) fn begin_dream_skin_operation() -> anyhow::Result<DreamSkinOperationG
         .map_err(|_| anyhow::anyhow!("另一个 Dream Skin 操作正在进行，请稍后重试"))?;
     Ok(DreamSkinOperationGuard)
 }
-
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -651,12 +650,8 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
         },
         Err(error) => {
             let message = format!("重启 Codex++ 失败：{error}");
-            let _ = save_requested_launch_status(
-                &request,
-                "failed",
-                &message,
-                launch_started_at_ms,
-            );
+            let _ =
+                save_requested_launch_status(&request, "failed", &message, launch_started_at_ms);
             failed(
                 &message,
                 json!({
@@ -862,12 +857,8 @@ fn spawn_codex_plus_launch(request: LaunchRequest, accepted_message: &str) -> Co
         },
         Err(error) => {
             let message = format!("启动静默入口失败：{error}");
-            let _ = save_requested_launch_status(
-                &request,
-                "failed",
-                &message,
-                launch_started_at_ms,
-            );
+            let _ =
+                save_requested_launch_status(&request, "failed", &message, launch_started_at_ms);
             failed(
                 &message,
                 json!({
@@ -943,15 +934,11 @@ pub async fn weixin_connect_qr_start(
     base_url: String,
     route_tag: String,
 ) -> CommandResult<WeixinQrPayload> {
-    match codex_plus_core::connect::weixin::WeixinClient::fetch_qr_code(
-        &base_url,
-        &route_tag,
-    )
-    .await
+    match codex_plus_core::connect::weixin::WeixinClient::fetch_qr_code(&base_url, &route_tag).await
     {
         Ok(qr) => {
-            let qr_svg = codex_plus_core::connect::weixin::render_qr_svg(&qr.qr_content)
-                .unwrap_or_default();
+            let qr_svg =
+                codex_plus_core::connect::weixin::render_qr_svg(&qr.qr_content).unwrap_or_default();
             let session = WeixinQrSession {
                 base_url: if base_url.trim().is_empty() {
                     codex_plus_core::connect::DEFAULT_WEIXIN_BASE_URL.to_string()
@@ -997,7 +984,10 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
         })
     });
     let Some(session) = session else {
-        return failed("当前没有待确认的微信二维码。", empty_weixin_qr_payload("missing"));
+        return failed(
+            "当前没有待确认的微信二维码。",
+            empty_weixin_qr_payload("missing"),
+        );
     };
 
     let result = codex_plus_core::connect::weixin::WeixinClient::poll_qr_status(
@@ -1042,7 +1032,8 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
         settings.weixin_connect_token = qr_status.bot_token;
         settings.weixin_connect_account_id = qr_status.ilink_bot_id.clone();
         if !qr_status.baseurl.trim().is_empty() {
-            settings.weixin_connect_base_url = qr_status.baseurl.trim().trim_end_matches('/').to_string();
+            settings.weixin_connect_base_url =
+                qr_status.baseurl.trim().trim_end_matches('/').to_string();
         } else {
             settings.weixin_connect_base_url = session.base_url.clone();
         }
@@ -1112,11 +1103,17 @@ pub fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::WeixinC
     }
     settings.weixin_connect_enabled = true;
     if let Err(error) = store.save(&settings) {
-        return failed(&format!("保存微信连接设置失败：{error}"), current_weixin_status());
+        return failed(
+            &format!("保存微信连接设置失败：{error}"),
+            current_weixin_status(),
+        );
     }
     match spawn_weixin_connect(settings) {
         Ok(status) => ok("微信连接正在启动。", status),
-        Err(error) => failed(&format!("启动微信连接失败：{error}"), current_weixin_status()),
+        Err(error) => failed(
+            &format!("启动微信连接失败：{error}"),
+            current_weixin_status(),
+        ),
     }
 }
 
@@ -1223,12 +1220,9 @@ fn spawn_weixin_connect(
     let task_status = Arc::clone(&status);
     let task_stop = Arc::clone(&stop);
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = codex_plus_core::connect::run_weixin_connect(
-            config,
-            stop,
-            Arc::clone(&task_status),
-        )
-        .await
+        if let Err(error) =
+            codex_plus_core::connect::run_weixin_connect(config, stop, Arc::clone(&task_status))
+                .await
             && let Ok(mut current) = task_status.lock()
         {
             current.state = "error".to_string();
@@ -2271,7 +2265,10 @@ pub fn list_local_sessions(
             Ok(items) => {
                 for item in items {
                     session_ids.insert(item.id.clone());
-                    if !sessions.iter().any(|existing: &codex_plus_data::LocalSession| existing.id == item.id) {
+                    if !sessions
+                        .iter()
+                        .any(|existing: &codex_plus_data::LocalSession| existing.id == item.id)
+                    {
                         sessions.push(item);
                     }
                 }
@@ -2374,10 +2371,7 @@ pub fn import_local_session(path: String) -> CommandResult<SessionImportPayload>
 #[tauri::command]
 pub fn load_pending_session_share() -> CommandResult<PendingSessionSharePayload> {
     match codex_plus_core::session_share::load_pending_session_share() {
-        Ok(url) => ok(
-            "已读取待导入会话链接。",
-            PendingSessionSharePayload { url },
-        ),
+        Ok(url) => ok("已读取待导入会话链接。", PendingSessionSharePayload { url }),
         Err(error) => failed(
             &format!("读取待导入会话链接失败：{error}"),
             PendingSessionSharePayload { url: None },
@@ -2555,9 +2549,7 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
         result.status,
         codex_plus_core::models::DeleteStatus::LocalDeleted
     ) {
-        if let Err(error) =
-            codex_plus_data::cleanup_thread_reference_state(&session.session_id)
-        {
+        if let Err(error) = codex_plus_data::cleanup_thread_reference_state(&session.session_id) {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                 "manager.delete_local_session.reference_cleanup_failed",
                 json!({
@@ -3044,9 +3036,7 @@ fn is_success_sync_status(status: &codex_plus_data::ProviderSyncStatus) -> bool 
     matches!(status, codex_plus_data::ProviderSyncStatus::Synced)
 }
 
-fn provider_sync_command_result(
-    sync: codex_plus_data::ProviderSyncResult,
-) -> CommandResult<Value> {
+fn provider_sync_command_result(sync: codex_plus_data::ProviderSyncResult) -> CommandResult<Value> {
     let succeeded = is_success_sync_status(&sync.status);
     let success_message = format!(
         "供应商已同步一次：{} 个会话文件，{} 行索引，跳过 {} 个占用文件。{}",
@@ -5486,7 +5476,6 @@ pub(crate) fn resume_enabled_dream_skin() -> anyhow::Result<BackendSettings> {
     }
     Ok(settings)
 }
-
 
 #[cfg(test)]
 mod tests {

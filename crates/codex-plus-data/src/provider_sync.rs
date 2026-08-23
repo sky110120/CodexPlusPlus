@@ -816,9 +816,7 @@ fn provider_sync_db_paths(home: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn load_provider_sync_thread_kinds(
-    paths: &[PathBuf],
-) -> anyhow::Result<ProviderSyncThreadKinds> {
+fn load_provider_sync_thread_kinds(paths: &[PathBuf]) -> anyhow::Result<ProviderSyncThreadKinds> {
     let mut kinds = ProviderSyncThreadKinds::default();
     for path in paths {
         if !path.exists() {
@@ -1097,10 +1095,9 @@ fn create_lock(path: &Path) -> std::io::Result<()> {
 }
 
 fn isolate_stale_lock(path: &Path) -> Option<(ProviderSyncLockOwner, PathBuf)> {
-    let owner = serde_json::from_slice::<ProviderSyncLockOwner>(
-        &fs::read(path.join("owner.json")).ok()?,
-    )
-    .ok()?;
+    let owner =
+        serde_json::from_slice::<ProviderSyncLockOwner>(&fs::read(path.join("owner.json")).ok()?)
+            .ok()?;
     if codex_plus_core::watcher::process_id_is_running(owner.pid) != Some(false) {
         return None;
     }
@@ -2371,14 +2368,9 @@ fn count_sqlite_updates(
     let catalog_columns = table_columns(&db, "local_thread_catalog")?;
     let mut total = 0;
     if columns.contains("id") && columns.contains("model_provider") {
-        total += provider_update_thread_ids(
-            &db,
-            "threads",
-            "id",
-            target_provider,
-            subagent_thread_ids,
-        )?
-        .len();
+        total +=
+            provider_update_thread_ids(&db, "threads", "id", target_provider, subagent_thread_ids)?
+                .len();
     }
     if catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider") {
         total += provider_update_thread_ids(
@@ -2456,13 +2448,9 @@ fn apply_sqlite_update(
     let tx = db.transaction()?;
     let mut counts = SqliteUpdateCounts::default();
     if columns.contains("id") && columns.contains("model_provider") {
-        for thread_id in provider_update_thread_ids(
-            &tx,
-            "threads",
-            "id",
-            target_provider,
-            subagent_thread_ids,
-        )? {
+        for thread_id in
+            provider_update_thread_ids(&tx, "threads", "id", target_provider, subagent_thread_ids)?
+        {
             counts.provider_rows += tx.execute(
                 "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
                 (target_provider, thread_id),
@@ -2649,12 +2637,8 @@ fn count_local_thread_catalog_repairs(
     target_provider: &str,
     subagent_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
-    let plan = collect_catalog_repair_plan(
-        paths,
-        target_provider,
-        None,
-        Some(subagent_thread_ids),
-    )?;
+    let plan =
+        collect_catalog_repair_plan(paths, target_provider, None, Some(subagent_thread_ids))?;
     if plan.threads.is_empty() && !plan.has_cleanup_candidates() {
         return Ok(0);
     }
@@ -2720,15 +2704,9 @@ fn repair_missing_local_thread_catalog_rows_filtered(
     update_full_sync_state: bool,
     subagent_thread_ids: Option<&HashSet<String>>,
 ) -> anyhow::Result<CatalogRepairCounts> {
-    let plan = collect_catalog_repair_plan(
-        paths,
-        target_provider,
-        thread_ids,
-        subagent_thread_ids,
-    )?;
-    if plan.threads.is_empty()
-        && (!update_full_sync_state || !plan.has_cleanup_candidates())
-    {
+    let plan =
+        collect_catalog_repair_plan(paths, target_provider, thread_ids, subagent_thread_ids)?;
+    if plan.threads.is_empty() && (!update_full_sync_state || !plan.has_cleanup_candidates()) {
         return Ok(CatalogRepairCounts::default());
     }
     let mut total = CatalogRepairCounts::default();
@@ -3009,8 +2987,7 @@ pub(crate) fn thread_source_is_user(thread_source: Option<&str>) -> bool {
 
 pub(crate) fn thread_source_marks_non_root(thread_source: Option<&str>) -> bool {
     thread_source.map(str::trim).is_some_and(|value| {
-        value.eq_ignore_ascii_case("subagent")
-            || value.eq_ignore_ascii_case("memory_consolidation")
+        value.eq_ignore_ascii_case("subagent") || value.eq_ignore_ascii_case("memory_consolidation")
     })
 }
 

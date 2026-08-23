@@ -198,8 +198,7 @@ fn bundled_skin_runtimes_gate_structural_home_layout_on_classic_chrome() {
         assert!(
             source.contains("data-dream-home-layout=\"soft\"")
                 || (source.contains("data-dream-home-layout=\"structured\"")
-                    && source.contains(":not([data-dream-home-layout=\"structured\"])")
-                    )
+                    && source.contains(":not([data-dream-home-layout=\"structured\"])"))
                 || source.contains("data-dream-home-layout=\\\"soft\\\"")
                 || source.contains("data-dream-home-layout=\\\"structured\\\""),
             "missing soft layout CSS in {relative_path}"

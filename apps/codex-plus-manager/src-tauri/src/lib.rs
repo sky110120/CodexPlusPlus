@@ -174,7 +174,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event {
                 for url in urls {
-                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str()) {
+                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str())
+                    {
                         show_main_window(app_handle);
                     }
                 }
