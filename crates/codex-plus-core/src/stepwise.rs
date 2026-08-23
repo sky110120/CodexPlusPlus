@@ -730,25 +730,9 @@ mod tests {
         }
     }
 
-    static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn proxy_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        let lock = PROXY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            unsafe { std::env::remove_var(key) };
-        }
+    fn set_local_proxy_exclusion() {
         unsafe { std::env::set_var("NO_PROXY", "127.0.0.1,localhost") };
         unsafe { std::env::set_var("no_proxy", "127.0.0.1,localhost") };
-        lock
     }
 
     fn test_settings(base_url: String, protocol: &str) -> BackendSettings {
@@ -1013,8 +997,8 @@ mod tests {
 
     #[tokio::test]
     async fn auto_protocol_falls_back_on_unsupported_endpoint_statuses() {
-        let _proxy_guard = proxy_env_guard();
         let server = MockServer::start().await;
+        set_local_proxy_exclusion();
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(404))
@@ -1054,8 +1038,8 @@ mod tests {
 
     #[tokio::test]
     async fn auto_protocol_falls_back_on_success_with_empty_body() {
-        let _proxy_guard = proxy_env_guard();
         let server = MockServer::start().await;
+        set_local_proxy_exclusion();
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(""))
@@ -1087,8 +1071,8 @@ mod tests {
 
     #[tokio::test]
     async fn auto_protocol_falls_back_on_incompatible_response_shape() {
-        let _proxy_guard = proxy_env_guard();
         let server = MockServer::start().await;
+        set_local_proxy_exclusion();
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
