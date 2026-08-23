@@ -5622,7 +5622,6 @@ mod tests {
             sqlite_catalog_rows_removed: 0,
             updated_workspace_roots: 0,
             encrypted_content_warning: None,
-            repair_audit: codex_plus_data::ProviderSyncAudit::default(),
         }
     }
 
