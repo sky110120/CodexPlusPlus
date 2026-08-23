@@ -223,7 +223,7 @@ pub async fn generate(
         ));
     }
 
-    let client = crate::http_client::stepwise_client("")?;
+    let client = crate::http_client::proxied_client("")?;
     let timeout = Duration::from_millis(settings.codex_app_stepwise_timeout_ms);
     let protocols = stepwise_protocols(&configured_protocol);
     let auto_protocol = configured_protocol == "auto";
