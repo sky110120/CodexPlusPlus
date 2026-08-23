@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use codex_plus_core::launcher::{
     BridgeReinjector, DefaultLaunchHooks, LaunchHooks, LaunchOptions, launch_and_inject_with_hooks,
 };
-use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
+use codex_plus_core::models::{DeleteResult, DeleteStatus, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
 use codex_plus_core::status::LaunchStatus;
 use codex_plus_core::user_scripts::UserScriptManager;
@@ -618,15 +618,26 @@ impl BridgeDataService for LauncherDataService {
     async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult> {
         let db_paths = self.candidate_db_paths();
         let backup_store = codex_plus_data::BackupStore::new(self.backup_dir.clone());
-        tokio::task::spawn_blocking(move || {
-            codex_plus_data::delete_local_from_paths(
-                db_paths,
-                backup_store,
-                &session,
-            )
+        let session_for_cleanup = session.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            codex_plus_data::delete_local_from_paths(db_paths, backup_store, &session)
         })
         .await
-        .map_err(|error| anyhow::anyhow!("delete task failed: {error}"))
+        .map_err(|error| anyhow::anyhow!("delete task failed: {error}"))?;
+        if matches!(result.status, DeleteStatus::LocalDeleted) {
+            if let Err(error) =
+                codex_plus_data::cleanup_thread_reference_state(&session_for_cleanup.session_id)
+            {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.delete_reference_cleanup_failed",
+                    json!({
+                        "session_id": session_for_cleanup.session_id,
+                        "error": error.to_string()
+                    }),
+                );
+            }
+        }
+        Ok(result)
     }
 
     async fn undo(&self, undo_token: String) -> anyhow::Result<DeleteResult> {
