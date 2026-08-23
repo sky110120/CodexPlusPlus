@@ -4233,6 +4233,7 @@ function OverviewScreen({
   const health = healthItems(overview);
   return (
     <>
+      {/* 项目赞助商面板暂时隐藏，保留代码便于恢复
       <Panel className="jojocode-overview">
         <CardContent>
           <div className="jojocode-overview-layout">
@@ -4267,6 +4268,7 @@ function OverviewScreen({
           </div>
         </CardContent>
       </Panel>
+      */}
       <Panel>
         <CardHead title={t("健康检查")} detail={t("概览只展示关键问题，具体配置在对应页面处理")} />
         <CardContent>
