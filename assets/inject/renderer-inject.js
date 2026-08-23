@@ -434,6 +434,11 @@
   const sessionCopyMenuItemClass = "codex-session-copy-menu-item";
   const sessionCopyMenuItemVersion = "1";
   const sessionCopyMenuActivationTimeoutMs = 12000;
+  const sessionShareButtonClass = "codex-session-share-button";
+  const sessionShareButtonVersion = "1";
+  const codexPlusShareBaseUrl = "https://share.codexpp.cc";
+  const codexPlusShareFallbackBaseUrl = "https://codexpp-share.pages.dev";
+  const codexPlusShareMaxCharacters = 900000;
   const sessionAutoRenameTimeoutMs = 20000;
   const zedRemoteToastClass = "codex-zed-remote-toast";
   const upstreamWorktreeDialogClass = "codex-upstream-worktree-dialog";
@@ -775,6 +780,31 @@
       }
       .${sessionCopyMenuItemClass} {
         cursor: pointer;
+      }
+      .${sessionShareButtonClass} {
+        position: static;
+        flex: 0 0 auto;
+        pointer-events: auto;
+        -webkit-app-region: no-drag;
+        margin-left: 2px;
+        z-index: 2147483001;
+        min-height: var(--height-button-composer, 32px);
+        border-radius: var(--border-radius-lg, 8px);
+        font: inherit;
+        font-size: 13px;
+        line-height: 18px;
+        cursor: pointer;
+        box-shadow: none;
+      }
+      .${sessionShareButtonClass}:hover,
+      .${sessionShareButtonClass}:focus-visible {
+        background: var(--token-list-hover-background, rgba(70,70,70,.96));
+        color: var(--token-text-default, #fff);
+        outline: none;
+      }
+      .${sessionShareButtonClass}[aria-busy="true"] {
+        cursor: wait;
+        opacity: .65;
       }
       .codex-zed-open-in-menu-icon {
         width: 18px;
@@ -2047,6 +2077,293 @@
     };
     ensure();
   }
+
+  function shareBase64Url(bytes) {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function shareTextFromElement(element) {
+    const clone = element.cloneNode(true);
+    clone.querySelectorAll?.("button, textarea, input, select, [contenteditable='true'], .codex-delete-toast, .codex-plus-modal-overlay, .codex-plus-page-overlay, .codex-session-share-button").forEach((node) => node.remove());
+    return String(clone.innerText || clone.textContent || "").replace(/\u00a0/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function sessionShareMarkdown() {
+    const ref = currentSessionRef();
+    if (!ref.session_id) return { ref, markdown: "" };
+    const root = conversationRoot();
+    if (!root) return { ref, markdown: "" };
+    const authored = Array.from(root.querySelectorAll("[data-message-author-role]"));
+    const knownTurns = Array.from(root.querySelectorAll([
+      '[data-testid="conversation-turn"]',
+      '[data-testid*="message"]',
+      '[data-message-content]',
+      'main .prose',
+      '[class*="message-bubble"]',
+      '[class*="MessageBubble"]',
+      '[class*="user-message"]',
+      '[class*="UserMessage"]',
+    ].join(",")));
+    const turns = authored.length ? authored : knownTurns;
+    const seen = new Set();
+    const messages = turns.map((node) => {
+      if (!(node instanceof HTMLElement) || seen.has(node)) return "";
+      if (node.parentElement?.closest?.('[data-message-author-role], [data-testid="conversation-turn"]')) return "";
+      seen.add(node);
+      const text = shareTextFromElement(node);
+      if (!text) return "";
+      const role = String(node.getAttribute("data-message-author-role") || "").toLowerCase();
+      const label = role === "user" ? "用户" : role === "assistant" ? "助手" : "消息";
+      return { role: role === "user" || role === "assistant" ? role : "message", label, text };
+    }).filter(Boolean);
+    const title = String(ref.title || document.querySelector(selectors.threadTitle)?.textContent || "未命名会话").replace(/\s+/g, " ").trim();
+    let content = messages.map((message) => `### ${message.label}\n\n${message.text}`).join("\n\n");
+    if (!content) {
+      const fallback = root.cloneNode(true);
+      fallback.querySelectorAll?.([
+        ".composer-footer", ".composer-surface-chrome", "form", "header", "nav", "aside",
+        "button", "textarea", "input", "select", "[contenteditable='true']",
+        ".codex-delete-toast", ".codex-plus-modal-overlay", ".codex-plus-page-overlay",
+        ".codex-session-share-button",
+      ].join(",")).forEach((node) => node.remove());
+      content = String(fallback.innerText || fallback.textContent || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      if (content) messages.push({ role: "message", label: "会话", text: content });
+    }
+    const markdown = `# ${title || "未命名会话"}\n\n- 会话 ID：\`${ref.session_id}\`\n\n${content}`.slice(0, codexPlusShareMaxCharacters);
+    return {
+      ref,
+      markdown: content ? markdown : "",
+      session: content ? {
+        version: 1,
+        kind: "codex-session",
+        session_id: ref.session_id,
+        title: title || "未命名会话",
+        messages: messages.map(({ role, text }) => ({ role, text })),
+      } : null,
+    };
+  }
+
+  async function encryptSessionShare(value) {
+    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(value));
+    const exportedKey = await crypto.subtle.exportKey("raw", key);
+    return {
+      key: shareBase64Url(new Uint8Array(exportedKey)),
+      encrypted: {
+        v: 1,
+        iv: shareBase64Url(iv),
+        ciphertext: shareBase64Url(new Uint8Array(ciphertext)),
+      },
+    };
+  }
+
+  async function createSessionShare() {
+    const { ref, markdown, session } = sessionShareMarkdown();
+    if (!ref.session_id) {
+      showToast("当前页面还没有可分享的会话", null);
+      return;
+    }
+    if (!markdown || !session) {
+      showToast("当前会话还没有可分享的消息", null);
+      return;
+    }
+    const shareWindow = window.open("about:blank", "_blank");
+    const button = document.querySelector(`.${sessionShareButtonClass}`);
+    if (button) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = "正在创建…";
+    }
+    try {
+      let shareDocument = session;
+      const nativeSession = await postJson("/session/export", {
+        session_id: ref.session_id,
+        title: session.title,
+      });
+      if (nativeSession?.status !== "ok" || nativeSession.kind !== "codex-rollout" || typeof nativeSession.content !== "string") {
+        throw new Error(nativeSession?.message || "无法读取完整 Codex 会话文件");
+      }
+      shareDocument = { ...nativeSession, title: session.title };
+      const encrypted = await encryptSessionShare(JSON.stringify(shareDocument));
+      const payload = { ttl: 604800, encrypted: encrypted.encrypted };
+      let result;
+      let baseUrl = codexPlusShareBaseUrl;
+      try {
+        result = await postJson("/share/create", payload);
+        if (result?.id) {
+          baseUrl = codexPlusShareBaseUrl;
+        } else if (result?.status !== "failed") {
+          throw new Error(result?.message || "创建分享失败");
+        }
+      } catch (_) {
+        result = null;
+      }
+      if (!result?.id) {
+        let response;
+        try {
+          response = await fetch(`${baseUrl}/api/shares`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        } catch (_) {
+          baseUrl = codexPlusShareFallbackBaseUrl;
+          response = await fetch(`${baseUrl}/api/shares`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        }
+        result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.id) throw new Error(result.error || `创建分享失败（HTTP ${response.status}）`);
+      }
+      const shareUrl = `${baseUrl}/?s=${encodeURIComponent(result.id)}#k=${encrypted.key}`;
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+      } catch (_) {
+        const input = document.createElement("input");
+        input.value = shareUrl;
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand("copy");
+        input.remove();
+      }
+      showToast("会话分享链接已复制", null);
+      if (shareWindow && !shareWindow.closed) shareWindow.location.href = shareUrl;
+    } catch (error) {
+      if (shareWindow && !shareWindow.closed) shareWindow.close();
+      showToast(error?.message || "创建分享失败，请稍后重试", null);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+        button.textContent = "分享会话";
+      }
+    }
+  }
+
+  function installSessionShareButton() {
+    const existing = document.querySelectorAll(`.${sessionShareButtonClass}`);
+    const ref = currentSessionRef();
+    if (!ref.session_id) {
+      existing.forEach((button) => button.remove());
+      return;
+    }
+    let button = existing[0];
+    existing.forEach((node) => { if (node !== button) node.remove(); });
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = `${sessionShareButtonClass} ${headerContextButtonClass}`;
+      button.textContent = "分享会话";
+      button.setAttribute("aria-label", "分享当前会话");
+      button.dataset.codexSessionShareVersion = sessionShareButtonVersion;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void createSessionShare();
+      }, true);
+    }
+    const nativeShare = Array.from(document.querySelectorAll('header button[aria-label="Share"], header button[aria-label="分享"], header button[aria-label*="Share"], header button[aria-label*="分享"]')).find(visibleElement);
+    const actionGroup = nativeShare?.closest?.(".ms-auto")
+      || document.querySelector("header .ms-auto")
+      || nativeShare?.parentElement?.parentElement?.parentElement;
+    if (actionGroup instanceof HTMLElement) {
+      button.style.position = "static";
+      button.style.pointerEvents = "auto";
+      button.style.webkitAppRegion = "no-drag";
+      if (button.parentElement !== actionGroup || button !== actionGroup.lastElementChild) {
+        actionGroup.appendChild(button);
+      }
+      return;
+    }
+    const header = document.querySelector('[data-testid="app-shell-header-context-menu-surface"]')?.closest?.("header")
+      || document.querySelector(selectors.appHeader);
+    if (header instanceof HTMLElement) {
+      // 没有明确操作栏时也保持文档流，避免遮挡原生按钮。
+      button.style.position = "static";
+      button.style.pointerEvents = "auto";
+      button.style.webkitAppRegion = "no-drag";
+      button.style.marginLeft = "8px";
+      if (button.parentElement !== header) header.appendChild(button);
+    } else if (!button.isConnected) {
+      document.body.appendChild(button);
+    }
+  }
+
+  function sessionImportMarkdown(session) {
+    const title = String(session?.title || "未命名会话").trim() || "未命名会话";
+    const messages = Array.isArray(session?.messages) ? session.messages : [];
+    const body = messages.map((message) => {
+      const role = message?.role === "user" ? "用户" : message?.role === "assistant" ? "助手" : "消息";
+      const text = String(message?.text || "").trim();
+      return text ? `### ${role}\n\n${text}` : "";
+    }).filter(Boolean).join("\n\n");
+    return `# ${title}\n\n${body}`.trim();
+  }
+
+  function importSharedSessionIntoNewChat(session) {
+    if (session?.kind === "codex-rollout" && typeof session.content === "string") {
+      void postJson("/session/import", session).then((result) => {
+        if (result?.status !== "ok") {
+          showToast(result?.message || "原生会话导入失败", null);
+          return;
+        }
+        void refreshRecentConversationsForHost();
+        showToast("已导入完整 Codex 会话", null);
+      }).catch((error) => showToast(error?.message || "原生会话导入失败", null));
+      return;
+    }
+    const markdown = sessionImportMarkdown(session);
+    if (!markdown) {
+      showToast("分享内容为空，无法导入", null);
+      return;
+    }
+    const newChat = Array.from(document.querySelectorAll("button")).find((button) => {
+      if (!visibleElement(button) || isExtensionUiNode(button)) return false;
+      const text = String(button.textContent || "").replace(/\s+/g, " ").trim();
+      const label = button.getAttribute("aria-label") || "";
+      return /^(新对话|New chat)$/i.test(text) || /^(新对话|New chat)$/i.test(label);
+    });
+    if (newChat instanceof HTMLElement) newChat.click();
+    const deadline = Date.now() + 5000;
+    const fill = () => {
+      const editor = Array.from(document.querySelectorAll("textarea, [contenteditable='true']"))
+        .filter((node) => visibleElement(node))
+        .at(-1);
+      if (!(editor instanceof HTMLElement)) {
+        if (Date.now() < deadline) window.setTimeout(fill, 100);
+        else showToast("无法找到 Codex 输入框，请手动打开新对话后重试", null);
+        return;
+      }
+      editor.focus();
+      if (editor instanceof HTMLTextAreaElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        setter?.call(editor, markdown);
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        document.execCommand("insertText", false, markdown);
+        editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: markdown }));
+      }
+      showToast("已导入完整会话内容，请发送以继续", null);
+    };
+    window.setTimeout(fill, newChat ? 350 : 0);
+  }
+
+  function installSessionShareImportListener() {
+    window.removeEventListener("message", window.__codexSessionShareImportHandler);
+    window.__codexSessionShareImportHandler = (event) => {
+      if (!/^(https:\/\/share\.codexpp\.cc|https:\/\/codexpp-share\.pages\.dev)$/.test(event.origin || "") || event.data?.type !== "codexpp-import-session") return;
+      const session = event.data?.session;
+      if (!session || !["codex-session", "codex-rollout"].includes(session.kind)) return;
+      if (session.kind === "codex-session" && !Array.isArray(session.messages)) return;
+      if (session.kind === "codex-rollout" && typeof session.content !== "string") return;
+      importSharedSessionIntoNewChat(session);
+    };
+    window.addEventListener("message", window.__codexSessionShareImportHandler);
+  }
+
 
   function refreshDreamSkin() {
     const settings = codexPlusSettings();
@@ -9200,6 +9517,7 @@
       );
     }
     installCodexPlusMenu();
+    installSessionShareImportListener();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
     installDeleteButtonEventDelegation();
@@ -10155,6 +10473,7 @@
     runScanStep(() => archivedPageRows().forEach(attachArchivedPageDeleteButton));
     runScanStep(refreshConversationView);
     runScanStep(installCodexServiceTierBadge);
+    runScanStep(installSessionShareButton);
     runScanStep(scheduleThreadScrollSync);
     runScanStep(() => refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations));
     runScanStep(() => {

@@ -67,7 +67,6 @@ import {
   TestTube,
   Trash2,
   Wrench,
-  X,
   type LucideIcon,
 } from "lucide-react";
 import { ProviderPresetSelector } from "@/components/ProviderPresetSelector";
@@ -111,16 +110,13 @@ import {
   type DreamSkinImageResult,
   type DreamSkinMarketResult,
   type DreamSkinMarketTheme,
-  type DreamSkinRestoreResult,
   type DreamSkinRuntimeResult,
   type DreamSkinThemeActivationResult,
   type DreamSkinThemeConfig,
   type DreamSkinThemeDraft,
   type DreamSkinThemeDraftResult,
-  type DreamSkinThemeImportResult,
   type DreamSkinThemeLibrary,
   type DreamSkinThemeLibraryResult,
-  type DreamSkinThemeSaveResult,
   type DreamSkinThemeSummary,
   type DreamSkinVerificationResult,
 } from "./dream-skin";
@@ -144,7 +140,6 @@ type PendingDreamSkinCommunityResult = CommandResult<{ versionId: string }>;
 type PendingDreamSkinRestart = {
   currentThemeKey: string | null;
   currentThemeName: string;
-  currentMayStillBeRunning?: boolean;
   pendingThemeKey: string;
   pendingThemeName: string;
 };
@@ -286,6 +281,7 @@ export type RelayProfile = {
   apiKey: string;
   protocol: RelayProtocol;
   relayMode: RelayMode;
+  sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
   hideOfficialUsageAlert: boolean;
   testModel: string;
@@ -325,6 +321,7 @@ type AggregateRelayMember = {
 type AggregateRelayProfile = {
   id: string;
   name: string;
+  sessionProvider?: RelaySessionProvider;
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
 };
@@ -354,6 +351,7 @@ type CodexContextEntries = {
 
 type RelayProtocol = "responses" | "chatCompletions";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
+type RelaySessionProvider = "custom" | "openai";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
 const SCRIPT_MARKET_REPOSITORY_URL = "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket";
 
@@ -447,6 +445,16 @@ type LocalSessionsResult = CommandResult<{
   offset: number;
   limit: number;
   hasMore: boolean;
+  totalCount: number;
+}>;
+
+type SessionImportResult = CommandResult<{
+  sessionId: string;
+  title: string;
+}>;
+
+type PendingSessionShareResult = CommandResult<{
+  url: string | null;
 }>;
 
 type ZedRemoteProject = {
@@ -475,10 +483,11 @@ type ZedRemoteOpenResult = CommandResult<{
 }>;
 
 type DeleteLocalSessionResult = CommandResult<{
-  deleteStatus: "server_deleted" | "local_deleted" | "partial" | "failed" | "undone" | string;
-  sessionId: string;
-  undoToken: string | null;
-  backupPath: string | null;
+  status: string;
+  session_id: string;
+  message: string;
+  undo_token: string | null;
+  backup_path: string | null;
 }>;
 
 type ContextEntriesResult = CommandResult<{
@@ -630,6 +639,12 @@ type ProviderSyncPayload = {
   updatedWorkspaceRoots?: number;
   prunedSessionIndexEntries?: number;
   encryptedContentWarning?: string | null;
+  repairAudit?: {
+    catalogOnlySessions: number;
+    catalogOnlyWithCurrentRollout: number;
+    catalogOnlyWithBackupDatabase: number;
+    catalogOnlyWithoutRecoverySource: number;
+  };
   backupDir?: string | null;
 };
 
@@ -637,7 +652,6 @@ type SessionIndexCleanupCandidate = {
   id: string;
   threadName: string;
   updatedAt: string;
-  reason: "missing_local_source" | "non_root_agent";
 };
 
 type SessionIndexCleanupPreviewPayload = {
@@ -763,7 +777,7 @@ function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>)
   const pruned = result.prunedSessionIndexEntries ?? 0;
   const target = result.targetProvider || t("当前 provider");
   const skipped = result.skippedLockedRolloutFiles?.length ?? 0;
-  const prunedText = pruned ? tf("，清理 {0} 条普通任务索引", [pruned]) : "";
+  const prunedText = pruned ? tf("，清理 {0} 条失效任务索引", [pruned]) : "";
   const skippedText = skipped ? tf("，跳过 {0} 个占用文件", [skipped]) : "";
   const catalogText = insertedCatalogRows ? tf("，补齐 {0} 条侧边栏索引", [insertedCatalogRows]) : "";
   const catalogCleanupText = removedCatalogRows
@@ -835,8 +849,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink },
   { id: "userScripts", label: t("脚本市场"), icon: FileCode2 },
-  // 推荐内容菜单暂时隐藏，保留代码便于恢复
-  // { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
+  { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
   { id: "maintenance", label: t("安装维护"), icon: Wrench },
   { id: "about", label: t("关于"), icon: Info },
   { id: "settings", label: t("设置"), icon: Settings },
@@ -854,12 +867,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
   {
     label: t("系统"),
-    routes: [
-      // "recommendations",
-      "maintenance",
-      "about",
-      "settings",
-    ],
+    routes: ["recommendations", "maintenance", "about", "settings"],
     placement: "bottom",
   },
 ];
@@ -990,6 +998,7 @@ export function App() {
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
   const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
+  const [sessionShareUrl, setSessionShareUrl] = useState("");
   const [zedRemoteProjects, setZedRemoteProjects] = useState<ZedRemoteProjectsResult | null>(null);
   const [liveContextEntries, setLiveContextEntries] = useState<CodexContextEntries | null>(null);
   const [logs, setLogs] = useState<LogsResult | null>(null);
@@ -1001,18 +1010,12 @@ export function App() {
   const [dreamSkinMarket, setDreamSkinMarket] = useState<DreamSkinMarketResult | null>(null);
   const [dreamSkinCommunity, setDreamSkinCommunity] = useState<DreamSkinCommunityResult | null>(null);
   const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
-  const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("");
+  const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
   const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
   const [dreamSkinThemeDraft, setDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
   const [pendingDreamSkinRestart, setPendingDreamSkinRestart] = useState<PendingDreamSkinRestart | null>(null);
   const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
-  const dreamSkinDraftGuardResolveRef = useRef<((proceed: boolean) => void) | null>(null);
-  const dreamSkinSelectionInitializedRef = useRef(false);
-  const dreamSkinLibraryRequestRef = useRef(0);
-  const dreamSkinDraftReplacementRequestRef = useRef(0);
-  const dreamSkinSelectedThemeRef = useRef("");
-  const dreamSkinThemeDraftRef = useRef<DreamSkinThemeDraft | null>(null);
-  const [dreamSkinRestoreDecision, setDreamSkinRestoreDecision] = useState<DreamSkinRestoreResult | null>(null);
+  const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
@@ -1054,20 +1057,12 @@ export function App() {
       && dreamSkinThemeDraft
       && isDreamSkinDraftDirty(savedDreamSkinThemeDraft, dreamSkinThemeDraft),
   );
-  useEffect(() => {
-    dreamSkinThemeDraftRef.current = dreamSkinThemeDraft;
-  }, [dreamSkinThemeDraft]);
   const settingsDirty = useMemo(
     () => Boolean(settings && !backendSettingsEqual(settingsForm, settings.settings)),
     [settings, settingsForm],
   );
 
   const call = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
-
-  const saveSettingsArgs = (next: BackendSettings) => ({
-    settings: next,
-    baseSettings: settings ? normalizeSettings(settings.settings) : undefined,
-  });
 
   const logDiagnostic = (event: string, detail: Record<string, unknown> = {}) => {
     void invoke("write_diagnostic_event", { event, detail }).catch(() => {});
@@ -1131,7 +1126,6 @@ export function App() {
   });
 
   const refreshDreamSkinStatus = async (silent = false) => {
-    setDreamSkinVerification(null);
     const result = await run(() => call<DreamSkinRuntimeResult>("dream_skin_status", dreamSkinRequest()));
     if (result) {
       setDreamSkinStatus(result);
@@ -1305,6 +1299,51 @@ export function App() {
     return result;
   };
 
+  const importLocalSession = async () => {
+    let selected: string | string[] | null;
+    try {
+      selected = await open({
+        title: t("导入 Codex 会话"),
+        multiple: false,
+        directory: false,
+        filters: [{ name: t("会话文件"), extensions: ["jsonl", "json", "txt"] }],
+      });
+    } catch (error) {
+      showNotice(t("会话导入"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
+      return;
+    }
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (!path) return;
+    const result = await run(() => call<SessionImportResult>("import_local_session", { path }));
+    if (!result) return;
+    showResultNotice(t("会话导入"), result);
+    if (isSuccessStatus(result.status)) await refreshLocalSessions(true, 0);
+  };
+
+  const refreshPendingSessionShare = async (silent = true) => {
+    const result = await run(() => call<PendingSessionShareResult>("load_pending_session_share"));
+    if (result?.url) setSessionShareUrl(result.url);
+    if (result && (!silent || !isSuccessStatus(result.status))) {
+      showResultNotice(t("会话导入"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const importSessionUrl = async (value = sessionShareUrl) => {
+    const url = value.trim();
+    if (!url) {
+      showNotice(t("会话导入"), t("请粘贴 Codex++ 分享链接。"), "failed");
+      return;
+    }
+    const result = await run(() => call<SessionImportResult>("import_session_url", { url }));
+    if (!result) return;
+    showResultNotice(t("会话导入"), result);
+    if (isSuccessStatus(result.status)) {
+      setSessionShareUrl("");
+      await refreshLocalSessions(true, 0);
+    }
+  };
+
   const refreshZedRemoteProjects = async (silent = false) => {
     const result = await run(() => call<ZedRemoteProjectsResult>("list_zed_remote_projects"));
     if (result) {
@@ -1363,99 +1402,28 @@ export function App() {
     key: string,
     draft: DreamSkinThemeDraft,
   ) => {
-    dreamSkinSelectionInitializedRef.current = true;
-    dreamSkinDraftReplacementRequestRef.current += 1;
-    dreamSkinSelectedThemeRef.current = key;
-    dreamSkinThemeDraftRef.current = draft;
     setSelectedDreamSkinTheme(key);
     setSavedDreamSkinThemeDraft(draft);
     setDreamSkinThemeDraft(draft);
   };
 
-  const clearDreamSkinDraftSelection = () => {
-    dreamSkinSelectionInitializedRef.current = true;
-    dreamSkinDraftReplacementRequestRef.current += 1;
-    dreamSkinSelectedThemeRef.current = "";
-    dreamSkinThemeDraftRef.current = null;
-    setSelectedDreamSkinTheme("");
-    setSavedDreamSkinThemeDraft(null);
-    setDreamSkinThemeDraft(null);
-  };
-
-  const updateDreamSkinThemeDraft = (draft: DreamSkinThemeDraft | null) => {
-    dreamSkinDraftReplacementRequestRef.current += 1;
-    dreamSkinThemeDraftRef.current = draft;
-    setDreamSkinThemeDraft(draft);
-  };
-
-  const replaceDreamSkinLibrary = (library: DreamSkinThemeLibrary) => {
-    dreamSkinLibraryRequestRef.current += 1;
-    setDreamSkinLibrary(library);
-  };
-
-  const rebindDreamSkinDraftSelection = (
-    sourceKey: string,
-    sourceDraft: DreamSkinThemeDraft | null,
-    stableThemeKey: string,
-    stableDraft: DreamSkinThemeDraft,
-    preserveEdits: boolean,
-  ) => {
-    if (dreamSkinSelectedThemeRef.current !== sourceKey) return;
-    const current = dreamSkinThemeDraftRef.current;
-    setDreamSkinDraftSelection(stableThemeKey, stableDraft);
-    const activeSource = sourceDraft ?? current;
-    if (!preserveEdits || !current || !activeSource || !isDreamSkinDraftDirty(activeSource, current)) {
-      return;
-    }
-    updateDreamSkinThemeDraft({
-      ...current,
-      builtin: stableDraft.builtin,
-      config: {
-        ...current.config,
-        id: stableDraft.config.id,
-        name: current.config.name === activeSource.config.name
-          ? stableDraft.config.name
-          : current.config.name,
-      },
-      imagePath: current.imagePath.trim() === activeSource.imagePath.trim()
-        ? stableDraft.imagePath
-        : current.imagePath,
-    });
-  };
-
   const refreshDreamSkinLibrary = async (silent = false) => {
-    const requestId = ++dreamSkinLibraryRequestRef.current;
     const result = await run(() => call<DreamSkinThemeLibraryResult>("list_dream_skin_themes"));
-    if (!result || requestId !== dreamSkinLibraryRequestRef.current) return null;
-    if (!isSuccessStatus(result.status)) {
-      showResultNotice(t("主题库"), result);
-      return null;
-    }
+    if (!result) return null;
     const library: DreamSkinThemeLibrary = {
       themes: result.themes,
       activeDraft: result.activeDraft,
-      warnings: result.warnings,
     };
     setDreamSkinLibrary(library);
-    if (!dreamSkinThemeDraftRef.current && !dreamSkinSelectionInitializedRef.current) {
-      dreamSkinSelectionInitializedRef.current = true;
-      const replacementRequest = dreamSkinDraftReplacementRequestRef.current;
-      const active = library.themes.find((item) => item.active);
-      if (!active) return library;
+    const active = library.themes.find((item) => item.active) ?? library.themes[0];
+    if (active) {
       const draft = active.builtin
         ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
-        : active.kind === "stored"
-          ? await loadDreamSkinThemeDraft(active.id)
-          : library.activeDraft;
-      if (
-        requestId !== dreamSkinLibraryRequestRef.current
-        || replacementRequest !== dreamSkinDraftReplacementRequestRef.current
-        || dreamSkinThemeDraftRef.current
-      ) {
-        return library;
-      }
-      if (!draft) return library;
+        : library.activeDraft;
       setDreamSkinDraftSelection(active.key, draft);
+    }
+    if (!silent && !isSuccessStatus(result.status)) {
+      showResultNotice(t("主题库"), result);
     }
     return library;
   };
@@ -1483,8 +1451,6 @@ export function App() {
   };
 
   const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
-    if (!await confirmDreamSkinDraftReplacement()) return false;
-    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     const result = await run(() => call<DreamSkinCommunityResult>(
       "install_dream_skin_community_theme",
       { id: theme.id },
@@ -1493,12 +1459,9 @@ export function App() {
     setDreamSkinCommunity(result);
     showResultNotice(t("DreamSkin 社区"), result);
     if (!isSuccessStatus(result.status)) return false;
-    dreamSkinSelectionInitializedRef.current = true;
     await refreshDreamSkinLibrary(true);
     const draft = await loadDreamSkinThemeDraft(theme.themeId);
-    if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-      setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
-    }
+    if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
     return true;
   };
 
@@ -1509,21 +1472,19 @@ export function App() {
   };
 
   const confirmPendingDreamSkinCommunity = async () => {
-    if (!await confirmDreamSkinDraftReplacement()) return;
-    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
     if (!result) return;
     setDreamSkinCommunity(result);
     showResultNotice(t("DreamSkin 社区"), result);
     if (!isSuccessStatus(result.status)) return;
     setPendingDreamSkinCommunity("");
-    dreamSkinSelectionInitializedRef.current = true;
     setRoute("dreamSkin");
     await refreshDreamSkinLibrary(true);
     if (result.installedThemeId) {
       const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
-      if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+      if (draft) {
         setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
+        await activateDreamSkinDraft(draft);
       }
     }
   };
@@ -1536,8 +1497,6 @@ export function App() {
   };
 
   const importDreamSkinThemePackage = async () => {
-    if (!await confirmDreamSkinDraftReplacement()) return;
-    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     let selected: string | string[] | null;
     try {
       selected = await open({
@@ -1552,58 +1511,43 @@ export function App() {
     }
     const path = Array.isArray(selected) ? selected[0] : selected;
     if (!path) return;
-    const result = await run(() => call<DreamSkinThemeImportResult>(
+    const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
+    const result = await run(() => call<DreamSkinThemeLibraryResult>(
       "import_dream_skin_theme_package",
       { path },
     ));
     if (!result) return;
     showResultNotice(t("主题库"), result);
     if (!isSuccessStatus(result.status)) return;
-    dreamSkinSelectionInitializedRef.current = true;
-    const library = {
-      themes: result.themes,
-      activeDraft: result.activeDraft,
-      warnings: result.warnings,
-    };
-    replaceDreamSkinLibrary(library);
-    const imported = result.themes.find((item) => (
-      item.kind === "stored"
-      && !item.damaged
-      && item.id === result.installedThemeId
-    ));
+    const library = { themes: result.themes, activeDraft: result.activeDraft };
+    setDreamSkinLibrary(library);
+    const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
     if (imported) {
       const draft = await loadDreamSkinThemeDraft(imported.id);
-      if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-        setDreamSkinDraftSelection(imported.key, draft);
-      }
+      if (draft) setDreamSkinDraftSelection(imported.key, draft);
     }
     await refreshDreamSkinCommunity(true);
   };
 
   const installDreamSkinMarketTheme = async (theme: DreamSkinMarketTheme) => {
-    if (!await confirmDreamSkinDraftReplacement()) return false;
-    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
     if (!result) return false;
     setDreamSkinMarket(result);
     showResultNotice(t("主题市场"), result);
     if (!isSuccessStatus(result.status)) return false;
-    dreamSkinSelectionInitializedRef.current = true;
     await refreshDreamSkinLibrary(true);
     const draft = await loadDreamSkinThemeDraft(theme.id);
-    if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-      setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
-    }
+    if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
     return true;
   };
 
-  const confirmDreamSkinDraftReplacement = () => {
-    if (!dreamSkinDraftDirty) return Promise.resolve(true);
-    if (dreamSkinDraftGuardResolveRef.current) return Promise.resolve(false);
-    return new Promise<boolean>((resolve) => {
-      dreamSkinDraftGuardResolveRef.current = resolve;
-      setDreamSkinUnsavedDialog(true);
-    });
+  const runAfterDreamSkinDraftGuard = (action: () => void) => {
+    if (!dreamSkinDraftDirty) {
+      action();
+      return;
+    }
+    dreamSkinPendingActionRef.current = action;
+    setDreamSkinUnsavedDialog(true);
   };
 
   const loadDreamSkinThemeDraft = async (id: string) => {
@@ -1619,82 +1563,60 @@ export function App() {
     } satisfies DreamSkinThemeDraft;
   };
 
-  const selectDreamSkinTheme = async (item: DreamSkinThemeSummary) => {
-    if (item.key === selectedDreamSkinTheme || item.damaged) return;
-    if (!await confirmDreamSkinDraftReplacement()) return;
-    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
-    if (item.builtin) {
-      if (replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-        setDreamSkinDraftSelection(item.key, {
-          config: defaultDreamSkinTheme(),
-          imagePath: "",
-          builtin: true,
-        });
-      }
-      return;
-    }
-    if (item.active && item.kind === "activeUnsaved" && dreamSkinLibrary) {
-      if (replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-        setDreamSkinDraftSelection(item.key, dreamSkinLibrary.activeDraft);
-      }
-      return;
-    }
-    const draft = await loadDreamSkinThemeDraft(item.id);
-    if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-      setDreamSkinDraftSelection(item.key, draft);
-    }
+  const selectDreamSkinTheme = (item: DreamSkinThemeSummary) => {
+    if (item.key === selectedDreamSkinTheme) return;
+    runAfterDreamSkinDraftGuard(() => {
+      void (async () => {
+        if (item.builtin) {
+          setDreamSkinDraftSelection(item.key, {
+            config: defaultDreamSkinTheme(),
+            imagePath: "",
+            builtin: true,
+          });
+          return;
+        }
+        if (item.active && dreamSkinLibrary) {
+          setDreamSkinDraftSelection(item.key, dreamSkinLibrary.activeDraft);
+          return;
+        }
+        const draft = await loadDreamSkinThemeDraft(item.id);
+        if (draft) setDreamSkinDraftSelection(item.key, draft);
+      })();
+    });
   };
 
-  const saveDreamSkinDraftValue = async (
-    draft: DreamSkinThemeDraft,
-    sourceKey: string,
-    selectSaved: boolean,
-  ) => {
-    const result = await run(() => call<DreamSkinThemeSaveResult>("save_dream_skin_theme", {
-      draft,
-      sourceKey,
-    }));
+  const saveDreamSkinThemeDraft = async (): Promise<DreamSkinThemeDraft | null> => {
+    if (!dreamSkinThemeDraft) return null;
+    const selected = dreamSkinLibrary?.themes.find((item) => item.key === selectedDreamSkinTheme);
+    const saveAsNew = dreamSkinThemeDraft.builtin || selected?.kind === "activeUnsaved";
+    const draft: DreamSkinThemeDraft = saveAsNew
+      ? {
+          ...dreamSkinThemeDraft,
+          config: {
+            ...dreamSkinThemeDraft.config,
+            id: dreamSkinThemeDraft.builtin
+              ? `theme-${Date.now()}`
+              : dreamSkinThemeDraft.config.id,
+            name: dreamSkinThemeDraft.config.name === "Dream Skin"
+              ? t("Dream Skin 副本")
+              : dreamSkinThemeDraft.config.name,
+          },
+          builtin: false,
+        }
+      : dreamSkinThemeDraft;
+    const result = await run(() => call<DreamSkinThemeLibraryResult>("save_dream_skin_theme", { draft }));
     if (!result || !isSuccessStatus(result.status)) {
       if (result) showResultNotice(t("主题库"), result);
       return null;
     }
-    const library: DreamSkinThemeLibrary = {
-      themes: result.themes,
-      activeDraft: result.activeDraft,
-      warnings: result.warnings,
-    };
-    const storedSummary = result.themes.find((item) => (
-      item.key === result.savedThemeKey
-      && item.id === result.savedThemeId
-      && !item.damaged
-    ));
-    if (!storedSummary) {
-      replaceDreamSkinLibrary(library);
-      showNotice(t("主题库"), t("主题已保存，但无法确定新主题位置，请刷新后重试。"), "failed");
-      return null;
-    }
-    const stored = await loadDreamSkinThemeDraft(storedSummary.id);
+    const stored = await loadDreamSkinThemeDraft(draft.config.id);
     if (!stored) return null;
-    replaceDreamSkinLibrary(library);
-    if (selectSaved) {
-      rebindDreamSkinDraftSelection(sourceKey, draft, storedSummary.key, stored, true);
-    }
-    return { draft: stored, key: storedSummary.key, library };
-  };
-
-  const saveDreamSkinThemeDraft = async (): Promise<DreamSkinThemeDraft | null> => {
-    if (!dreamSkinThemeDraft || !selectedDreamSkinTheme) return null;
-    const saved = await saveDreamSkinDraftValue(
-      dreamSkinThemeDraft,
-      selectedDreamSkinTheme,
-      true,
-    );
-    return saved?.draft ?? null;
+    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
+    setDreamSkinDraftSelection(`stored:${draft.config.id}`, stored);
+    return stored;
   };
 
   const createDreamSkinTheme = async () => {
-    if (!await confirmDreamSkinDraftReplacement()) return;
-    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     let selected: unknown;
     try {
       selected = await open({
@@ -1723,11 +1645,8 @@ export function App() {
       imagePath: result.imagePath,
       builtin: result.builtin,
     };
-    dreamSkinSelectionInitializedRef.current = true;
     await refreshDreamSkinLibrary(true);
-    if (replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
-      setDreamSkinDraftSelection(`stored:${draft.config.id}`, draft);
-    }
+    setDreamSkinDraftSelection(`stored:${draft.config.id}`, draft);
   };
 
   const chooseDreamSkinDraftImage = async () => {
@@ -1749,74 +1668,52 @@ export function App() {
       return;
     }
     if (typeof selected === "string" && selected.trim()) {
-      const current = dreamSkinThemeDraftRef.current;
-      updateDreamSkinThemeDraft(current ? { ...current, imagePath: selected.trim() } : current);
+      setDreamSkinThemeDraft((current) => current ? { ...current, imagePath: selected.trim() } : current);
     }
   };
 
   const activateDreamSkinDraft = async (initialDraft: DreamSkinThemeDraft) => {
-    if (!selectedDreamSkinTheme) {
-      showNotice(t("皮肤管理"), t("请先选择主题。"), "failed");
-      return false;
-    }
-    const activationSelectionKey = selectedDreamSkinTheme;
     const currentTheme = pendingDreamSkinRestart
       ? {
           key: pendingDreamSkinRestart.currentThemeKey,
           name: pendingDreamSkinRestart.currentThemeName,
         }
-      : dreamSkinLibrary?.themes.find((item) => item.active) ?? {
-          key: null,
-          name: t("Codex 原始外观"),
-        };
+      : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
+    let draft = initialDraft;
+    if (draft.builtin && dreamSkinDraftDirty) {
+      const stored = await saveDreamSkinThemeDraft();
+      if (!stored) return false;
+      draft = stored;
+    }
+    const saved = await persistDreamSkinSettings({
+      ...settingsForm,
+      codexAppDreamSkinEnabled: true,
+      codexAppDreamSkinPaused: false,
+    });
+    if (!saved) return false;
     const ports = dreamSkinRequest().request;
     const result = await run(() => call<DreamSkinThemeActivationResult>("activate_dream_skin_theme", {
       request: {
-        draft: initialDraft,
-        sourceThemeKey: selectedDreamSkinTheme,
+        draft,
         debugPort: ports.debugPort,
         helperPort: ports.helperPort,
       },
     }));
-    if (!result) return false;
-    replaceDreamSkinLibrary(result.library);
-    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
-    await refreshSettings(true);
-    if (isSuccessStatus(result.status) || result.sourceThemeSaved) {
-      const source = result.library.themes.find((item) => item.key === result.sourceThemeKey && !item.damaged);
-      let stableDraft: DreamSkinThemeDraft | null = null;
-      if (source?.builtin) {
-        stableDraft = {
-          config: defaultDreamSkinTheme(),
-          imagePath: "",
-          builtin: true,
-        };
-      } else if (source?.kind === "stored") {
-        stableDraft = await loadDreamSkinThemeDraft(source.id);
-      } else if (source?.kind === "activeUnsaved") {
-        stableDraft = result.library.activeDraft;
-      }
-      if (source && stableDraft) {
-        rebindDreamSkinDraftSelection(
-          activationSelectionKey,
-          initialDraft,
-          source.key,
-          stableDraft,
-          true,
-        );
-      }
-    }
-    if (!isSuccessStatus(result.status)) {
-      showResultNotice(t("主题库"), result);
+    if (!result || !isSuccessStatus(result.status)) {
+      if (result) showResultNotice(t("主题库"), result);
       return false;
     }
+    setDreamSkinLibrary(result.library);
+    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
+    const active = result.library.themes.find((item) => item.active);
+    if (active) setDreamSkinDraftSelection(active.key, result.library.activeDraft);
+    await refreshSettings(true);
     if (result.savedForNextLaunch) {
       setPendingDreamSkinRestart({
         currentThemeKey: currentTheme?.key ?? null,
         currentThemeName: currentTheme?.name ?? t("当前皮肤"),
-        currentMayStillBeRunning: true,
-        pendingThemeKey: result.appliedThemeKey,
-        pendingThemeName: result.appliedThemeName,
+        pendingThemeKey: active?.key ?? selectedDreamSkinTheme,
+        pendingThemeName: active?.name ?? draft.config.name,
       });
       showNotice(t("主题库"), t("主题已保存并设为待应用，不会自动重启 Codex。"), "not_checked");
     } else {
@@ -1826,10 +1723,7 @@ export function App() {
   };
 
   const activateDreamSkinTheme = async () => {
-    if (!dreamSkinThemeDraft) {
-      showNotice(t("皮肤管理"), t("请先选择主题。"), "failed");
-      return;
-    }
+    if (!dreamSkinThemeDraft) return;
     await activateDreamSkinDraft(dreamSkinThemeDraft);
   };
 
@@ -1841,16 +1735,11 @@ export function App() {
       if (result) showResultNotice(t("主题库"), result);
       return;
     }
-    replaceDreamSkinLibrary({
-      themes: result.themes,
-      activeDraft: result.activeDraft,
-      warnings: result.warnings,
-    });
+    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
     if (selectedDreamSkinTheme === item.key) {
-      const currentDraft = dreamSkinThemeDraftRef.current;
-      updateDreamSkinThemeDraft(currentDraft
-        ? { ...currentDraft, config: { ...currentDraft.config, name } }
-        : currentDraft);
+      setDreamSkinThemeDraft((current) => current
+        ? { ...current, config: { ...current.config, name } }
+        : current);
       setSavedDreamSkinThemeDraft((current) => current
         ? { ...current, config: { ...current.config, name } }
         : current);
@@ -1863,20 +1752,19 @@ export function App() {
       tf("删除主题“{0}”？此操作无法撤销。", [item.name]),
     );
     if (!confirmed) return;
-    const result = await run(() => call<DreamSkinThemeLibraryResult>("delete_dream_skin_theme", {
-      id: item.id,
-      allowDamaged: item.damaged,
-    }));
+    const result = await run(() => call<DreamSkinThemeLibraryResult>("delete_dream_skin_theme", { id: item.id }));
     if (!result || !isSuccessStatus(result.status)) {
       if (result) showResultNotice(t("主题库"), result);
       return;
     }
-    replaceDreamSkinLibrary({
-      themes: result.themes,
-      activeDraft: result.activeDraft,
-      warnings: result.warnings,
-    });
-    if (selectedDreamSkinTheme === item.key) clearDreamSkinDraftSelection();
+    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
+    const active = result.themes.find((candidate) => candidate.active) ?? result.themes[0];
+    if (active) {
+      const draft = active.builtin
+        ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
+        : result.activeDraft;
+      setDreamSkinDraftSelection(active.key, draft);
+    }
   };
 
   const selectSessionIndexCleanupCandidates = (candidates: SessionIndexCleanupCandidate[]) =>
@@ -1988,7 +1876,11 @@ export function App() {
     }
   };
 
-  const navigate = async (next: Route) => {
+  const navigate = async (next: Route, skipDreamSkinDraftGuard = false) => {
+    if (!skipDreamSkinDraftGuard && route === "dreamSkin" && next !== "dreamSkin" && dreamSkinDraftDirty) {
+      runAfterDreamSkinDraftGuard(() => void navigate(next, true));
+      return;
+    }
     setRoute(next);
     if (next === "overview") await refreshOverview(true);
     if (next === "relay") {
@@ -2033,8 +1925,7 @@ export function App() {
       await refreshScriptMarket(true);
       await refreshUserScriptInventory();
     }
-    // 推荐页面已隐藏，暂不触发推荐内容拉取
-    // if (next === "recommendations") await refreshAds(true);
+    if (next === "recommendations") await refreshAds(true);
     if (next === "about") {
       await refreshOverview(true);
       await refreshLogs(true);
@@ -2333,7 +2224,7 @@ export function App() {
 
   const saveSettings = async () => {
     const next = normalizeSettings(settingsForm);
-    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
+    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2343,7 +2234,7 @@ export function App() {
 
   const saveSettingsValue = async (next: BackendSettings, silent = true) => {
     const normalized = normalizeSettings(next);
-    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
+    const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
     if (result && isSuccessStatus(result.status)) {
       const saved = normalizeSettings(result.settings);
       setSettings(result);
@@ -2498,7 +2389,7 @@ export function App() {
           if (!preview) {
             cleanupFailure = {
               status: "failed",
-              message: t("任务索引处理失败，请查看错误提示后重试。"),
+              message: t("幽灵任务索引处理失败，请查看错误提示后重试。"),
             };
           } else if (isSuccessStatus(preview.status) && preview.candidates.length > 0) {
             const selectedIds = await selectSessionIndexCleanupCandidates(preview.candidates);
@@ -2517,7 +2408,7 @@ export function App() {
               } else {
                 cleanupFailure = cleanup ?? {
                   status: "failed",
-                  message: t("任务索引处理失败，请查看错误提示后重试。"),
+                  message: t("幽灵任务索引处理失败，请查看错误提示后重试。"),
                 };
               }
             }
@@ -2548,7 +2439,7 @@ export function App() {
         }
         await refreshProviderSyncTargets(true);
         const noticeTitle =
-          completion.noticeKind === "cleanup" ? t("清理任务索引") : t("历史会话修复");
+          completion.noticeKind === "cleanup" ? t("清理幽灵任务索引") : t("历史会话修复");
         showNotice(
           noticeTitle,
           completion.result.message,
@@ -2568,7 +2459,7 @@ export function App() {
   };
 
   const applyRelayInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(settingsForm)));
+    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
     if (settingsResult) {
       setSettings(settingsResult);
       setSettingsForm(normalizeSettings(settingsResult.settings));
@@ -2591,7 +2482,7 @@ export function App() {
   const saveLaunchMode = async (launchMode: LaunchMode, silent = false, baseSettings: BackendSettings = settingsForm) => {
     const next = { ...baseSettings, launchMode };
     setSettingsForm(next);
-    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
+    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2601,7 +2492,7 @@ export function App() {
   };
 
   const applyPureApiInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(settingsForm)));
+    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
     if (settingsResult) {
       setSettings(settingsResult);
       setSettingsForm(normalizeSettings(settingsResult.settings));
@@ -2650,7 +2541,7 @@ export function App() {
     );
     if (!result) return null;
     let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
+    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
     if (saveResult) {
       setSettings(saveResult);
       normalized = normalizeSettings(saveResult.settings);
@@ -2668,7 +2559,7 @@ export function App() {
     );
     if (!result) return null;
     let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
+    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
     if (saveResult) {
       setSettings(saveResult);
       normalized = normalizeSettings(saveResult.settings);
@@ -2888,6 +2779,7 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
+      await refreshPendingSessionShare(true);
       await refreshPendingDreamSkinCommunity();
       await refreshRemotePluginMarketplace(true);
     })();
@@ -2907,6 +2799,7 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void refreshPendingProviderImport(true);
+      void refreshPendingSessionShare(true);
       void refreshPendingDreamSkinCommunity();
     }, 1200);
     return () => window.clearInterval(timer);
@@ -2957,7 +2850,7 @@ export function App() {
 
   const saveCodexAppPath = async (appPath: string) => {
     const next = { ...settingsForm, codexAppPath: appPath };
-    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
+    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
       setSettings(result);
       const normalized = normalizeSettings(result.settings);
@@ -2968,85 +2861,39 @@ export function App() {
     return result;
   };
 
-  const loadStableDreamSkinDraft = async (key: string) => {
-    if (key === "builtin") {
-      return {
-        config: defaultDreamSkinTheme(),
-        imagePath: "",
-        builtin: true,
-      } satisfies DreamSkinThemeDraft;
+  const persistDreamSkinSettings = async (next: BackendSettings) => {
+    const normalized = normalizeSettings(next);
+    const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    if (!result) return null;
+    setSettings(result);
+    setSettingsForm(normalizeSettings(result.settings));
+    if (!isSuccessStatus(result.status)) {
+      showNotice(t("皮肤管理"), result.message, result.status);
+      return null;
     }
-    const id = key.startsWith("stored:") ? key.slice("stored:".length) : "";
-    return id ? loadDreamSkinThemeDraft(id) : null;
+    return result;
   };
 
-  const restoreDreamSkin = async (discardUnrecoverableActive = false) => {
+  const restoreDreamSkin = async () => {
     const currentTheme = pendingDreamSkinRestart
       ? {
           key: pendingDreamSkinRestart.currentThemeKey,
           name: pendingDreamSkinRestart.currentThemeName,
         }
       : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
-    const request = dreamSkinRequest().request;
-    const result = await run(() => call<DreamSkinRestoreResult>("restore_dream_skin", {
-      request: {
-        ...request,
-        discardUnrecoverableActive,
-      },
-    }));
+    const result = await run(() => call<DreamSkinRuntimeResult>("restore_dream_skin", dreamSkinRequest()));
     if (!result) return;
-    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
-    if (result.status === "decision_required" && result.requiresDecision) {
-      setDreamSkinRestoreDecision(result);
-      return;
-    }
-    setDreamSkinRestoreDecision(null);
+    setDreamSkinStatus(result);
     await refreshSettings(true);
-    const library = await refreshDreamSkinLibrary(true);
     showResultNotice(t("皮肤管理"), result);
-    if (!isSuccessStatus(result.status)) return;
-    if (dreamSkinSelectedThemeRef.current === "active-unsaved") {
-      const stableSummary = library?.themes.find((item) => (
-        item.key === result.stableThemeKey && !item.damaged
-      ));
-      const stableDraft = stableSummary
-        ? await loadStableDreamSkinDraft(stableSummary.key)
-        : null;
-      if (stableDraft && stableSummary) {
-        rebindDreamSkinDraftSelection(
-          "active-unsaved",
-          result.activeDraft,
-          stableSummary.key,
-          stableDraft,
-          !discardUnrecoverableActive,
-        );
-      } else if (discardUnrecoverableActive) {
-        clearDreamSkinDraftSelection();
-      }
+    if (isSuccessStatus(result.status)) {
+      setPendingDreamSkinRestart({
+        currentThemeKey: currentTheme?.key ?? null,
+        currentThemeName: currentTheme?.name ?? t("当前皮肤"),
+        pendingThemeKey: "codex-original-appearance",
+        pendingThemeName: t("Codex 原始外观"),
+      });
     }
-    setPendingDreamSkinRestart({
-      currentThemeKey: result.liveCleared ? null : currentTheme?.key ?? null,
-      currentThemeName: result.liveCleared
-        ? t("实时皮肤已清理")
-        : currentTheme?.name ?? t("当前皮肤"),
-      currentMayStillBeRunning: !result.liveCleared,
-      pendingThemeKey: "codex-original-appearance",
-      pendingThemeName: t("Codex 原始外观"),
-    });
-  };
-
-  const saveActiveDreamSkinBeforeRestore = async () => {
-    const activeDraft = dreamSkinRestoreDecision?.activeDraft;
-    if (!activeDraft) return;
-    const saved = await saveDreamSkinDraftValue(
-      activeDraft,
-      "active-unsaved",
-      false,
-    );
-    if (!saved) return;
-    rebindDreamSkinDraftSelection("active-unsaved", activeDraft, saved.key, saved.draft, true);
-    setDreamSkinRestoreDecision(null);
-    await restoreDreamSkin(false);
   };
 
   const verifyDreamSkin = async (withScreenshot: boolean) => {
@@ -3069,9 +2916,9 @@ export function App() {
       call<DreamSkinVerificationResult>("verify_dream_skin", dreamSkinRequest(screenshotPath)),
     );
     if (!result) return;
+    setDreamSkinVerification(result);
     showResultNotice(withScreenshot ? t("保存截图") : t("实机验证"), result);
     await refreshDreamSkinStatus(true);
-    setDreamSkinVerification(result);
   };
 
   const actions = useMemo(
@@ -3121,7 +2968,7 @@ export function App() {
       },
       clearCodexAppPath: async () => {
         const next = { ...settingsForm, codexAppPath: "" };
-        const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
+        const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
         if (result) {
           setSettings(result);
           setSettingsForm(normalizeSettings(result.settings));
@@ -3153,17 +3000,11 @@ export function App() {
         }
       },
       chooseDreamSkinImagePath: chooseDreamSkinDraftImage,
-      resetDreamSkinImage: async () => {
-        if (!await confirmDreamSkinDraftReplacement()) return;
-        const current = dreamSkinThemeDraftRef.current;
-        updateDreamSkinThemeDraft(current
-          ? { ...current, imagePath: "" }
-          : null);
-      },
-      resetDreamSkinTheme: async () => {
-        if (!await confirmDreamSkinDraftReplacement()) return;
-        const next = (() => {
-          const current = dreamSkinThemeDraftRef.current;
+      resetDreamSkinImage: async () => runAfterDreamSkinDraftGuard(() => {
+        setDreamSkinThemeDraft((current) => current ? { ...current, imagePath: "" } : current);
+      }),
+      resetDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => {
+        setDreamSkinThemeDraft((current) => {
           if (!current) return current;
           if (isWindowsPlatform) {
             const config = { ...current.config };
@@ -3179,36 +3020,28 @@ export function App() {
               : { ...defaults, id: current.config.id, name: current.config.name },
             imagePath: "",
           };
-        })();
-        updateDreamSkinThemeDraft(next);
-      },
+        });
+      }),
       refreshDreamSkinLibrary,
       refreshDreamSkinMarket,
       refreshDreamSkinCommunity,
       installDreamSkinMarketTheme,
       installDreamSkinCommunityTheme,
       importDreamSkinThemePackage,
-      createDreamSkinTheme,
+      createDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => void createDreamSkinTheme()),
       saveDreamSkinTheme: saveDreamSkinThemeDraft,
       selectDreamSkinTheme,
-      clearDreamSkinDraft: async () => {
-        if (!await confirmDreamSkinDraftReplacement()) return;
-        clearDreamSkinDraftSelection();
-      },
       renameDreamSkinTheme,
       deleteDreamSkinTheme: async (item: DreamSkinThemeSummary) => {
         if (item.key === selectedDreamSkinTheme && dreamSkinDraftDirty) {
-          if (!await confirmDreamSkinDraftReplacement()) return;
+          runAfterDreamSkinDraftGuard(() => void deleteDreamSkinTheme(item));
+          return;
         }
         await deleteDreamSkinTheme(item);
       },
       activateDreamSkinTheme,
-      setDreamSkinEnabled: async (enabled: boolean) => {
-        if (enabled) await activateDreamSkinTheme();
-        else await restoreDreamSkin();
-      },
       refreshDreamSkinStatus,
-      restoreDreamSkin: () => restoreDreamSkin(),
+      restoreDreamSkin,
       verifyDreamSkin: () => verifyDreamSkin(false),
       saveDreamSkinScreenshot: () => verifyDreamSkin(true),
       saveManualCodexAppPath: async () => {
@@ -3247,6 +3080,10 @@ export function App() {
       setUserScriptEnabled,
       deleteUserScript,
       refreshLocalSessions,
+      importLocalSession,
+      importSessionUrl,
+      sessionShareUrl,
+      setSessionShareUrl,
       deleteLocalSession,
       deleteLocalSessions,
       refreshZedRemoteProjects,
@@ -3288,7 +3125,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -3459,7 +3296,8 @@ export function App() {
               selectedTheme={selectedDreamSkinTheme}
               status={dreamSkinStatus}
               verification={dreamSkinVerification}
-              onDraftChange={updateDreamSkinThemeDraft}
+              onFormChange={setSettingsForm}
+              onDraftChange={setDreamSkinThemeDraft}
               actions={actions}
             />
           ) : null}
@@ -3538,37 +3376,24 @@ export function App() {
       {dreamSkinUnsavedDialog ? (
         <DreamSkinUnsavedDialog
           onCancel={() => {
-            const resolve = dreamSkinDraftGuardResolveRef.current;
-            dreamSkinDraftGuardResolveRef.current = null;
+            dreamSkinPendingActionRef.current = null;
             setDreamSkinUnsavedDialog(false);
-            resolve?.(false);
           }}
           onDiscard={() => {
-            const resolve = dreamSkinDraftGuardResolveRef.current;
-            dreamSkinDraftGuardResolveRef.current = null;
-            updateDreamSkinThemeDraft(savedDreamSkinThemeDraft);
+            const pending = dreamSkinPendingActionRef.current;
+            dreamSkinPendingActionRef.current = null;
+            setDreamSkinThemeDraft(savedDreamSkinThemeDraft);
             setDreamSkinUnsavedDialog(false);
-            resolve?.(true);
+            pending?.();
           }}
           onSave={() => void (async () => {
             const saved = await saveDreamSkinThemeDraft();
             if (!saved) return;
-            const resolve = dreamSkinDraftGuardResolveRef.current;
-            dreamSkinDraftGuardResolveRef.current = null;
+            const pending = dreamSkinPendingActionRef.current;
+            dreamSkinPendingActionRef.current = null;
             setDreamSkinUnsavedDialog(false);
-            resolve?.(true);
+            pending?.();
           })()}
-        />
-      ) : null}
-      {dreamSkinRestoreDecision ? (
-        <DreamSkinRestoreDecisionDialog
-          canSave={dreamSkinRestoreDecision.canSaveActive && Boolean(dreamSkinRestoreDecision.activeDraft)}
-          onCancel={() => setDreamSkinRestoreDecision(null)}
-          onDiscard={() => void (async () => {
-            setDreamSkinRestoreDecision(null);
-            await restoreDreamSkin(true);
-          })()}
-          onSave={() => void saveActiveDreamSkinBeforeRestore()}
         />
       ) : null}
       {pendingProviderImport ? (
@@ -3620,12 +3445,10 @@ type Actions = {
   importDreamSkinThemePackage: () => Promise<void>;
   createDreamSkinTheme: () => Promise<void>;
   saveDreamSkinTheme: () => Promise<DreamSkinThemeDraft | null>;
-  selectDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
-  clearDreamSkinDraft: () => Promise<void>;
+  selectDreamSkinTheme: (item: DreamSkinThemeSummary) => void;
   renameDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
   deleteDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
   activateDreamSkinTheme: () => Promise<void>;
-  setDreamSkinEnabled: (enabled: boolean) => Promise<void>;
   refreshDreamSkinStatus: (silent?: boolean) => Promise<DreamSkinRuntimeResult | null>;
   restoreDreamSkin: () => Promise<void>;
   verifyDreamSkin: () => Promise<void>;
@@ -3651,6 +3474,10 @@ type Actions = {
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
+  importLocalSession: () => Promise<void>;
+  importSessionUrl: (url?: string) => Promise<void>;
+  sessionShareUrl: string;
+  setSessionShareUrl: (url: string) => void;
   deleteLocalSession: (session: LocalSession) => Promise<void>;
   deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
   refreshZedRemoteProjects: () => Promise<ZedRemoteProjectsResult | null>;
@@ -4155,7 +3982,6 @@ function OverviewScreen({
   const health = healthItems(overview);
   return (
     <>
-      {/* 项目赞助商面板暂时隐藏，保留代码便于恢复
       <Panel className="jojocode-overview">
         <CardContent>
           <div className="jojocode-overview-layout">
@@ -4190,7 +4016,6 @@ function OverviewScreen({
           </div>
         </CardContent>
       </Panel>
-      */}
       <Panel>
         <CardHead title={t("健康检查")} detail={t("概览只展示关键问题，具体配置在对应页面处理")} />
         <CardContent>
@@ -4653,7 +4478,6 @@ function EnhanceScreen({
               {isWindowsPlatform ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
               <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
               <FeatureToggle title={t("快速启动")} detail={t("默认关闭；无 VPN 时可开启，让 Statsig 初始化快速失败，减少启动时长。需重启 Codex 才生效。")} checked={form.codexAppFastStartup} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppFastStartup", value)} />
-              <FeatureToggle title={t("原生菜单栏位置")} detail={t("把 Codex++ 菜单插入 Codex 顶部原生菜单栏。")} checked={form.codexAppNativeMenuPlacement} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeMenuPlacement", value)} />
               <FeatureToggle title={t("原生菜单汉化")} detail={t("启动时通过本地主进程调试端口汉化 Codex 原生菜单；不修改安装包。需重启 Codex 才生效。")} checked={form.codexAppNativeMenuLocalization} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeMenuLocalization", value)} />
             </FeatureGroup>
             <FeatureGroup title={t("远程项目")} detail={t("连接 Zed Remote 和 upstream worktree 辅助能力。")}>
@@ -4719,6 +4543,7 @@ function DreamSkinScreen({
   selectedTheme,
   status,
   verification,
+  onFormChange,
   onDraftChange,
   actions,
 }: {
@@ -4732,6 +4557,7 @@ function DreamSkinScreen({
   selectedTheme: string;
   status: DreamSkinRuntimeResult | null;
   verification: DreamSkinVerificationResult | null;
+  onFormChange: (value: BackendSettings) => void;
   onDraftChange: (value: DreamSkinThemeDraft | null) => void;
   actions: Actions;
 }) {
@@ -4834,8 +4660,12 @@ function DreamSkinScreen({
             <label className="switch-row compact">
               <input
                 checked={form.codexAppDreamSkinEnabled}
-                disabled={!masterEnabled && !form.codexAppDreamSkinEnabled}
-                onChange={(event) => void actions.setDreamSkinEnabled(event.currentTarget.checked)}
+                disabled={!masterEnabled}
+                onChange={(event) => onFormChange({
+                  ...form,
+                  codexAppDreamSkinEnabled: event.currentTarget.checked,
+                  codexAppDreamSkinPaused: false,
+                })}
                 type="checkbox"
               />
               <span>
@@ -4878,11 +4708,7 @@ function DreamSkinScreen({
               <div>
                 <strong>{t("待应用主题")}：{pendingRestart.pendingThemeName}</strong>
                 <small>
-                  {pendingRestart.pendingThemeKey === "codex-original-appearance"
-                    ? pendingRestart.currentMayStillBeRunning
-                      ? tf("{0} 可能仍在当前 Codex 窗口运行，重启后恢复原始外观。", [pendingRestart.currentThemeName])
-                      : t("实时皮肤已清理，重启后 Codex 原始基础外观完整生效。")
-                    : tf("当前运行：{0}。配置已保存，可以继续浏览和编辑，稍后重启即可生效。", [pendingRestart.currentThemeName])}
+                  {t("当前运行")}：{pendingRestart.currentThemeName}。{t("配置已保存，可以继续浏览和编辑，稍后重启即可生效。")}
                 </small>
               </div>
               <Button onClick={() => void actions.restart()}>
@@ -4997,10 +4823,6 @@ function DreamSkinScreen({
                 </small>
               </div>
               <Toolbar>
-                <Button disabled={!draft} variant="outline" onClick={() => void actions.clearDreamSkinDraft()}>
-                  <X className="h-4 w-4" />
-                  {t("清空草稿")}
-                </Button>
                 <Button variant="outline" onClick={() => void actions.importDreamSkinThemePackage()}>
                   <PackageOpen className="h-4 w-4" />
                   {t("导入主题包")}
@@ -5015,12 +4837,6 @@ function DreamSkinScreen({
                 </Button>
               </Toolbar>
             </div>
-            {library?.warnings.length ? (
-              <div className="dream-skin-market-warning">
-                <Info className="h-4 w-4" />
-                <span>{library.warnings.join("；")}</span>
-              </div>
-            ) : null}
             <div className="dream-skin-theme-list">
               {(library?.themes ?? []).map((item) => {
                 const cardPreview = item.previewPath
@@ -5033,33 +4849,18 @@ function DreamSkinScreen({
                   ? pendingRestart.currentThemeKey === item.key
                   : item.active;
                 const pendingApplication = pendingRestart?.pendingThemeKey === item.key;
-                const marketRepair = item.damaged
-                  ? market?.themes.find((themeItem) => themeItem.id === item.id)
-                  : null;
-                const communityRepair = item.damaged
-                  ? community?.items.find((themeItem) => themeItem.themeId === item.id)
-                  : null;
                 return (
                   <article
-                    className={`dream-skin-theme-card${item.key === selectedTheme ? " is-selected" : ""}${currentRunning ? " is-current" : ""}${pendingApplication ? " is-pending" : ""}${item.damaged ? " is-damaged" : ""}`}
+                    className={`dream-skin-theme-card${item.key === selectedTheme ? " is-selected" : ""}${currentRunning ? " is-current" : ""}${pendingApplication ? " is-pending" : ""}`}
                     key={item.key}
                   >
                     <button
                       className="dream-skin-theme-select"
-                      disabled={item.damaged}
-                      onClick={() => void actions.selectDreamSkinTheme(item)}
+                      onClick={() => actions.selectDreamSkinTheme(item)}
                       type="button"
                     >
                       <span className="dream-skin-theme-image">
-                        <img
-                          alt={item.name}
-                          loading="lazy"
-                          onError={(event) => {
-                            event.currentTarget.onerror = null;
-                            event.currentTarget.src = isWindowsPlatform ? dreamSkinWindowsPreviewUrl : dreamSkinMacPreviewUrl;
-                          }}
-                          src={cardPreview}
-                        />
+                        <img alt={item.name} loading="lazy" src={cardPreview} />
                         {currentRunning || pendingApplication ? (
                           <span className="dream-skin-theme-badges">
                             {currentRunning ? <b>{t("当前运行")}</b> : null}
@@ -5072,50 +4873,21 @@ function DreamSkinScreen({
                         <small>
                           {item.builtin
                             ? t("内置主题")
-                            : item.damaged
-                              ? t("主题文件缺失或损坏")
                             : item.kind === "activeUnsaved"
                               ? t("当前未保存主题")
                               : t("用户主题")}
                         </small>
                       </span>
-                      {item.damaged
-                        ? <em>{t("损坏")}</em>
-                        : item.modified || cardDirty
-                          ? <em>{t("已修改")}</em>
-                          : null}
+                      {item.modified || cardDirty ? <em>{t("已修改")}</em> : null}
                     </button>
-                    {item.damaged && item.error ? (
-                      <small className="dream-skin-theme-error">{item.error}</small>
-                    ) : null}
                     {item.kind === "stored" ? (
                       <details className="dream-skin-theme-menu">
                         <summary title={t("主题操作")}><MoreHorizontal className="h-4 w-4" /></summary>
                         <div>
-                          {!item.damaged ? (
-                            <button onClick={() => void actions.renameDreamSkinTheme(item)} type="button">
-                              <Edit3 className="h-4 w-4" />
-                              {t("重命名")}
-                            </button>
-                          ) : null}
-                          {marketRepair ? (
-                            <button onClick={() => void actions.installDreamSkinMarketTheme(marketRepair)} type="button">
-                              <Download className="h-4 w-4" />
-                              {t("从市场重新安装")}
-                            </button>
-                          ) : null}
-                          {communityRepair ? (
-                            <button onClick={() => void actions.installDreamSkinCommunityTheme(communityRepair)} type="button">
-                              <Download className="h-4 w-4" />
-                              {t("从社区重新安装")}
-                            </button>
-                          ) : null}
-                          {item.damaged && !marketRepair && !communityRepair ? (
-                            <button onClick={() => void actions.importDreamSkinThemePackage()} type="button">
-                              <PackageOpen className="h-4 w-4" />
-                              {t("重新导入")}
-                            </button>
-                          ) : null}
+                          <button onClick={() => void actions.renameDreamSkinTheme(item)} type="button">
+                            <Edit3 className="h-4 w-4" />
+                            {t("重命名")}
+                          </button>
                           <button disabled={item.active || currentRunning} onClick={() => void actions.deleteDreamSkinTheme(item)} type="button">
                             <Trash2 className="h-4 w-4" />
                             {t("删除")}
@@ -5149,10 +4921,6 @@ function DreamSkinScreen({
                 </Button>
               </div>
 
-              {!draft ? (
-                <p className="empty">{t("请先从“我的主题”选择一个主题，或从图片创建新主题。")}</p>
-              ) : (
-                <>
               <div className="dream-skin-platform-note">
                 <Info className="h-4 w-4" />
                 <span>
@@ -5363,8 +5131,6 @@ function DreamSkinScreen({
                   {isWindowsPlatform ? t("恢复 Codex 默认配色") : t("恢复 Dream Skin 默认主题")}
                 </Button>
               </Toolbar>
-                </>
-              )}
             </div>
           </details>
             </>
@@ -6007,6 +5773,7 @@ function SessionsScreen({
   const hasNextPage = sessions?.hasMore === true;
   const activeCount = items.filter((item) => !item.archived).length;
   const archivedCount = items.length - activeCount;
+  const totalCount = sessions?.totalCount ?? items.length;
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -6061,6 +5828,10 @@ function SessionsScreen({
         <CardContent className="sessions-overview-content">
           <div className="session-summary-bar">
             <div>
+              <span>{t("会话总数")}</span>
+              <strong>{tf("{0} 个", [totalCount])}</strong>
+            </div>
+            <div>
               <span>{t("当前页会话")}</span>
               <strong>{tf("{0} 个", [items.length])}</strong>
             </div>
@@ -6113,6 +5884,10 @@ function SessionsScreen({
                 <RefreshCw className="h-4 w-4" />
                 {t("刷新会话")}
               </Button>
+              <Button onClick={() => void actions.importLocalSession()} variant="outline">
+                <PackageOpen className="h-4 w-4" />
+                {t("导入文件")}
+              </Button>
               <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline">
                 <Wrench className="h-4 w-4" />
                 {providerSyncProgress.active ? t("正在修复…") : t("修复历史会话")}
@@ -6122,13 +5897,25 @@ function SessionsScreen({
                 {t("保存设置")}
               </Button>
             </div>
+            <div className="session-share-import">
+              <Input
+                aria-label={t("会话分享链接")}
+                onChange={(event) => actions.setSessionShareUrl(event.currentTarget.value)}
+                placeholder={t("粘贴 Codex++ 会话分享链接")}
+                value={actions.sessionShareUrl}
+              />
+              <Button disabled={!actions.sessionShareUrl.trim()} onClick={() => void actions.importSessionUrl()} variant="outline">
+                <Download className="h-4 w-4" />
+                {t("导入链接")}
+              </Button>
+            </div>
           </div>
 
           {providerSyncProgress.active || providerSyncProgress.percent > 0 ? (
             <div className="provider-sync-progress session-repair-progress" data-active={providerSyncProgress.active}>
               <div className="provider-sync-progress-head">
                 <strong>{providerSyncProgress.active ? t("正在修复历史会话") : t("历史会话修复进度")}</strong>
-                <span>{providerSyncProgress.percent}%</span>
+                <span>{formatProgressPercent(providerSyncProgress.percent)}%</span>
               </div>
               <div
                 aria-valuemax={100}
@@ -6446,7 +6233,7 @@ function AboutScreen({
             <Metric label={t("状态")} value={update?.status ?? "not_checked"} />
             <Metric label={t("最新版本")} value={update?.latestVersion ?? t("未检查")} />
             <Metric label={t("资源")} value={update?.assetName ?? "-"} />
-            <Metric label={t("进度")} value={`${update?.progress ?? 0}%`} />
+            <Metric label={t("进度")} value={`${formatProgressPercent(update?.progress ?? 0)}%`} />
           </div>
           <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
           <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
@@ -7013,9 +6800,10 @@ function RelayProfileDetail({
     setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm));
   }, [profile.id, profile.modelList, profile.modelWindows, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
-  const validationError = isAggregateRelayProfile(draft)
-    ? aggregateRelayProfileValidation(draft)
-    : relayModelRoutesSettingsValidation(validationSettings);
+  const validationError = relaySessionProviderValidation(draft)
+    ?? (isAggregateRelayProfile(draft)
+      ? aggregateRelayProfileValidation(draft)
+      : relayModelRoutesSettingsValidation(validationSettings));
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
     return { ...draft, modelList: serializedRows.modelList, modelWindows: serializedRows.modelWindows, modelVlm: serializedRows.modelVlm };
@@ -7027,7 +6815,7 @@ function RelayProfileDetail({
     const next = normalizeSettings(isNew
       ? addRelayProfile(form, normalizedDraft)
       : updateRelayProfile(form, profile.id, normalizedDraft));
-    const settingsValidationError = relayModelRoutesSettingsValidation(next);
+    const settingsValidationError = relaySettingsValidation(next);
     if (settingsValidationError) return;
     const activeLiveBaseUrl = codexBaseUrlFromConfig(
       relayFiles?.configContents ?? profile.configContents,
@@ -7214,6 +7002,8 @@ function RelayProfileEditor({
   }
 
   const showApiFields = profile.relayMode !== "official" || profile.officialMixApiKey;
+  const sessionProvider = relaySessionProvider(profile);
+  const canUseOpenAiSessionProvider = profile.relayMode !== "official" || profile.officialMixApiKey;
   const goalsFeatureState = codexGoalsFeatureState(
     profile.configContents,
     form.relayCommonConfigContents,
@@ -7408,6 +7198,27 @@ function RelayProfileEditor({
                   Chat Completions
                 </button>
               </div>
+            </Field>
+            <Field className="relay-field-session-provider" label={t("Codex 会话身份")}>
+              <AppSelect
+                value={sessionProvider}
+                onChange={(value) => updateDraft({ sessionProvider: value })}
+                options={[
+                  { value: "custom", label: t("Custom（默认）") },
+                  {
+                    value: "openai",
+                    label: t("OpenAI（兼容 ChatGPT Remote）"),
+                    disabled: !canUseOpenAiSessionProvider || profile.protocol !== "responses",
+                  },
+                ]}
+              />
+              <p className="field-hint">
+                {profile.protocol !== "responses"
+                  ? t("OpenAI 会话身份需要 Responses API；Chat Completions 不支持远程压缩。")
+                  : canUseOpenAiSessionProvider
+                    ? t("选择 OpenAI 后，Codex Remote 会把当前会话识别为 ChatGPT 会话；中转仍使用 custom 表。")
+                    : t("官方登录未混入 API 时不写入会话 provider")}
+              </p>
             </Field>
             <Field className="relay-field-sub2api" label="Sub2API">
               <div className="sub2api-field">
@@ -7681,6 +7492,7 @@ function AggregateRelayProfileEditor({
   const candidates = aggregateMemberCandidates(form, profile.id);
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
   const memberIds = new Set(aggregate.members.map((member) => member.profileId));
+  const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const updateAggregate = (nextAggregate: RelayAggregateConfig) => {
     onProfileChange(normalizeAggregateRelayProfile({ ...profile, aggregate: nextAggregate }, form));
   };
@@ -7723,6 +7535,19 @@ function AggregateRelayProfileEditor({
             onChange={(value) => updateAggregate({ ...aggregate, strategy: value })}
             options={aggregateStrategyOptions.map((option) => ({ value: option.value, label: option.label }))}
           />
+        </Field>
+        <Field className="relay-field-session-provider" label={t("Codex 会话身份")}>
+          <AppSelect
+            value={sessionProvider}
+            onChange={(value) => onProfileChange(normalizeAggregateRelayProfile({ ...profile, sessionProvider: value }, form))}
+            options={[
+              { value: "custom", label: t("Custom（默认）") },
+              { value: "openai", label: t("OpenAI（兼容 ChatGPT Remote）") },
+            ]}
+          />
+          <p className="field-hint">
+            {t("聚合请求仍由本地 Responses 代理轮转成员；OpenAI 身份用于让 ChatGPT Remote 识别会话。")}
+          </p>
         </Field>
       </div>
       <div className="aggregate-strategy-grid">
@@ -8336,6 +8161,11 @@ function formatBytes(bytes: number) {
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
 }
 
+function formatProgressPercent(value: number): string {
+  if (!Number.isFinite(value)) return "0.00";
+  return Math.min(100, Math.max(0, value)).toFixed(2);
+}
+
 function GuideList({ items }: { items: string[] }) {
   return (
     <div className="guide-list">
@@ -8374,44 +8204,6 @@ function DreamSkinUnsavedDialog({
             {t("保存并继续")}
           </Button>
           <Button onClick={onDiscard} variant="secondary">{t("放弃修改")}</Button>
-          <Button onClick={onCancel} variant="outline">{t("取消")}</Button>
-        </Toolbar>
-      </div>
-    </div>
-  );
-}
-
-function DreamSkinRestoreDecisionDialog({
-  canSave,
-  onSave,
-  onDiscard,
-  onCancel,
-}: {
-  canSave: boolean;
-  onSave: () => void;
-  onDiscard: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal-card">
-        <div className="modal-head">
-          <div>
-            <h2>{t("活动主题尚未保存")}</h2>
-            <p className="modal-message">
-              {canSave
-                ? t("当前活动副本无法从内置或已安装主题重建，请先保存，或明确放弃后恢复 Codex 外观。")
-                : t("当前活动副本已缺失或损坏，无法保存；可以明确放弃后恢复 Codex 外观。")}
-            </p>
-          </div>
-          <button className="toast-close" onClick={onCancel} type="button">×</button>
-        </div>
-        <Toolbar>
-          <Button disabled={!canSave} onClick={onSave}>
-            <Save className="h-4 w-4" />
-            {t("保存为主题")}
-          </Button>
-          <Button onClick={onDiscard} variant="secondary">{t("放弃并恢复")}</Button>
           <Button onClick={onCancel} variant="outline">{t("取消")}</Button>
         </Toolbar>
       </div>
@@ -8490,13 +8282,7 @@ function SessionIndexCleanupDialog({
   onConfirm: (selectedIds: string[]) => void;
   onCancel: () => void;
 }) {
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(
-    () => new Set(
-      request.candidates
-        .filter((candidate) => candidate.reason === "non_root_agent")
-        .map((candidate) => candidate.id),
-    ),
-  );
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const allSelected = request.candidates.length > 0 && selectedIds.size === request.candidates.length;
   const toggleCandidate = (id: string, selected: boolean) => {
     setSelectedIds((current) => {
@@ -8512,9 +8298,9 @@ function SessionIndexCleanupDialog({
       <div className="modal-card session-index-cleanup-modal">
         <div className="modal-head">
           <div>
-            <h2>{t("清理任务索引")}</h2>
+            <h2>{t("清理幽灵任务索引")}</h2>
             <p className="modal-message">
-              {tf("发现 {0} 条不应保留在普通任务索引中的候选记录，包括已确认的内部子任务，以及仅存在于 session_index.jsonl 的疑似失效记录。清理只会移除普通任务索引；子任务的数据库记录、rollout 和父子关系会保留。清理前请先完全退出 Codex App / ChatGPT。", [request.candidates.length])}
+              {tf("发现 {0} 条仅存在于 session_index.jsonl、未在本地数据库或 rollout 中找到来源的候选记录。它们也可能是云端或尚未落盘的任务，请逐项核对。任务标题仅用于预览，实际按 thread ID 与数据来源判断。清理前请先完全退出 Codex App / ChatGPT。", [request.candidates.length])}
             </p>
           </div>
           <button className="toast-close" onClick={onCancel} type="button">×</button>
@@ -8540,11 +8326,6 @@ function SessionIndexCleanupDialog({
               <span>
                 <strong>{candidate.threadName || t("未命名任务")}</strong>
                 <code>{candidate.id}</code>
-                <small>
-                  {candidate.reason === "non_root_agent"
-                    ? t("内部子任务：仅从普通任务列表隐藏，原始记录与父子关系保留。")
-                    : t("未找到本地数据库或 rollout 来源，请确认后清理。")}
-                </small>
                 <small>{candidate.updatedAt}</small>
               </span>
             </label>
@@ -8647,7 +8428,7 @@ function TaskProgressBox({ progress, title, completedTitle = t("上次修复结�
     <div className="provider-sync-progress task-progress" data-active={progress.active}>
       <div className="provider-sync-progress-head">
         <strong>{progress.active ? title : completedTitle}</strong>
-        <span>{progress.percent}%</span>
+        <span>{formatProgressPercent(progress.percent)}%</span>
       </div>
       <div
         aria-valuemax={100}
@@ -9566,6 +9347,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             apiKey: settings.relayApiKey || "",
             protocol: "responses" as RelayProtocol,
             relayMode: "official" as RelayMode,
+            sessionProvider: "custom" as RelaySessionProvider,
             officialMixApiKey: false,
             hideOfficialUsageAlert: false,
             testModel: "",
@@ -9650,6 +9432,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         apiKey: "",
         protocol: "responses",
         relayMode: "aggregate",
+        sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
         officialMixApiKey: false,
         hideOfficialUsageAlert: false,
         testModel: profile.testModel || "",
@@ -9681,6 +9464,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     apiKey: profile.apiKey || "",
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
     relayMode,
+    sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
     hideOfficialUsageAlert: profile.hideOfficialUsageAlert === true,
     testModel: profile.testModel || "",
@@ -9710,6 +9494,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
     ...profile,
     name: profile.name || aggregate.name,
     relayMode: "aggregate",
+    sessionProvider: normalizeRelaySessionProvider(aggregate.sessionProvider),
     aggregate: {
       strategy: aggregate.strategy,
       members: aggregate.members.map((member) => ({
@@ -9743,6 +9528,19 @@ function normalizeRelayMode(mode: RelayMode | undefined): RelayMode {
   if (mode === "aggregate") return mode;
   if (mode === "pureApi") return mode;
   return "official";
+}
+
+function normalizeRelaySessionProvider(value: string | undefined): RelaySessionProvider {
+  return value === "openai" ? "openai" : "custom";
+}
+
+function relaySessionProviderFromConfig(contents: string): RelaySessionProvider {
+  return normalizeRelaySessionProvider(rootTomlStringValue(contents, "model_provider"));
+}
+
+function relaySessionProvider(profile: Pick<RelayProfile, "configContents" | "sessionProvider">): RelaySessionProvider {
+  const fromConfig = relaySessionProviderFromConfig(profile.configContents);
+  return fromConfig === "openai" || profile.sessionProvider === "openai" ? "openai" : "custom";
 }
 
 function normalizeContextSelection(
@@ -9875,20 +9673,22 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
   }
   return {
     ...profile,
-    configContents: buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: false }),
+    configContents: buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true }),
     authContents: buildRelayAuthJson(profile),
   };
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol">,
+  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
+  const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const rootLines = [
     profile.model.trim() ? `model = "${tomlString(profile.model.trim())}"` : null,
-    'model_provider = "custom"',
+    `model_provider = "${sessionProvider}"`,
+    sessionProvider === "openai" ? `openai_base_url = "${PROTOCOL_PROXY_BASE_URL}"` : null,
     "",
   ].filter((line): line is string => line !== null);
   return [
@@ -9938,6 +9738,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
   return {
     ...profile,
     model,
+    sessionProvider: relaySessionProviderFromConfig(configContents),
     baseUrl: upstreamBaseUrl,
     upstreamBaseUrl,
     apiKey: profile.relayMode === "official"
@@ -9964,6 +9765,13 @@ function applyRelayProfilePatchToFiles(
   const needsAuthFile = next.relayMode === "pureApi";
   if (options.allowGenerateFiles && shouldHaveFiles && (!next.configContents.trim() || (needsAuthFile && !next.authContents.trim()))) {
     next = withGeneratedRelayFiles(next);
+  }
+
+  if ("sessionProvider" in patch) {
+    const sessionProvider = normalizeRelaySessionProvider(patch.sessionProvider);
+    next.sessionProvider = sessionProvider;
+    next.configContents = setRootTomlStringKey(next.configContents, "model_provider", sessionProvider);
+    next.configContents = setManagedOpenAiBaseUrl(next.configContents, sessionProvider === "openai");
   }
 
   if ("model" in patch) {
@@ -10057,6 +9865,7 @@ function codexProviderStringFromConfig(contents: string, key: string): string {
   const lines = contents.split(/\r?\n/);
   let currentSection = "";
   const matches: string[] = [];
+  const providerMatches: string[] = [];
 
   for (const line of lines) {
     const section = tomlSectionName(line);
@@ -10067,10 +9876,12 @@ function codexProviderStringFromConfig(contents: string, key: string): string {
     const value = tomlStringAssignmentValue(line, key);
     if (value === null) continue;
     if (targetSection && currentSection === targetSection) return value;
-    if (!currentSection || !currentSection.startsWith("model_providers.")) matches.push(value);
+    if (currentSection.startsWith("model_providers.")) providerMatches.push(value);
+    else matches.push(value);
   }
 
-  return matches.length === 1 ? matches[0] : "";
+  if (matches.length === 1) return matches[0];
+  return providerMatches.length === 1 ? providerMatches[0] : "";
 }
 
 function codexApiKeyFromAuth(contents: string): string {
@@ -10130,6 +9941,16 @@ function setRootTomlStringKey(contents: string, key: string, value: string): str
   return setRootTomlLine(contents, key, `${key} = "${tomlString(trimmed)}"`);
 }
 
+function setManagedOpenAiBaseUrl(contents: string, enabled: boolean): string {
+  const current = rootTomlStringValue(contents, "openai_base_url");
+  if (enabled) {
+    return !current || current === PROTOCOL_PROXY_BASE_URL
+      ? setRootTomlStringKey(contents, "openai_base_url", PROTOCOL_PROXY_BASE_URL)
+      : contents;
+  }
+  return current === PROTOCOL_PROXY_BASE_URL ? removeRootTomlKey(contents, "openai_base_url") : contents;
+}
+
 function setRootTomlIntKey(contents: string, key: string, value: string): string {
   const trimmed = value.replace(/[^\d]/g, "");
   if (!trimmed) return removeRootTomlKey(contents, key);
@@ -10183,10 +10004,11 @@ function setCodexProviderStringKey(
   value: string,
   options: { requiresOpenAiAuth?: boolean } = {},
 ): string {
-  const provider = rootTomlStringValue(contents, "model_provider") || "custom";
+  const sessionProvider = rootTomlStringValue(contents, "model_provider") || "custom";
+  const provider = sessionProvider === "openai" ? "custom" : sessionProvider;
   let next = contents;
   if (!rootTomlStringValue(next, "model_provider")) {
-    next = setRootTomlStringKey(next, "model_provider", provider);
+    next = setRootTomlStringKey(next, "model_provider", sessionProvider);
   }
   next = ensureCodexProviderDefaults(next, provider, { requiresOpenAiAuth: options.requiresOpenAiAuth !== false });
   return setTomlSectionStringKey(next, `model_providers.${provider}`, key, value);
@@ -10200,7 +10022,8 @@ function setCodexExperimentalBearerToken(contents: string, apiKey: string): stri
 }
 
 function removeCodexExperimentalBearerToken(contents: string): string {
-  const provider = rootTomlStringValue(contents, "model_provider") || "custom";
+  const sessionProvider = rootTomlStringValue(contents, "model_provider") || "custom";
+  const provider = sessionProvider === "openai" ? "custom" : sessionProvider;
   return removeTomlSectionKey(contents, `model_providers.${provider}`, "experimental_bearer_token");
 }
 
@@ -10276,6 +10099,8 @@ function removeTomlSectionKey(contents: string, sectionName: string, key: string
 }
 
 function relayProfileSwitchValidation(profile: RelayProfile, settings: BackendSettings | null = null): string | null {
+  const sessionProviderError = relaySessionProviderValidation(profile);
+  if (sessionProviderError) return sessionProviderError;
   if (isAggregateRelayProfile(profile)) {
     return aggregateRelayProfileValidation(profile);
   }
@@ -10298,6 +10123,21 @@ function relayModelRoutesSettingsValidation(settings: BackendSettings): string |
   return relayModelRouteIssueMessage(
     findRelayModelRouteIssue(settings.relayProfiles, settings.relayProfiles),
   );
+}
+
+function relaySettingsValidation(settings: BackendSettings): string | null {
+  for (const profile of settings.relayProfiles) {
+    const sessionProviderError = relaySessionProviderValidation(profile);
+    if (sessionProviderError) return sessionProviderError;
+  }
+  return relayModelRoutesSettingsValidation(settings);
+}
+
+function relaySessionProviderValidation(profile: RelayProfile): string | null {
+  if (relaySessionProvider(profile) === "openai" && profile.protocol !== "responses") {
+    return t("OpenAI 会话身份仅支持 Responses API；Chat Completions 不支持 ChatGPT Remote 的远程压缩。请切换协议或改回 Custom。");
+  }
+  return null;
 }
 
 function relayModelRouteIssueMessage(issue: ReturnType<typeof findRelayModelRouteIssue>): string | null {
@@ -10378,6 +10218,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
     return {
       id: profile.id,
       name: profile.name || t("聚合供应商"),
+      sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
       strategy: aggregate.strategy,
       members: aggregate.members.map((member) => ({
         relayId: member.profileId,
@@ -10416,6 +10257,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     apiKey: "",
     protocol: "responses" as RelayProtocol,
     relayMode: "official" as RelayMode,
+    sessionProvider: "custom" as RelaySessionProvider,
     officialMixApiKey: false,
     hideOfficialUsageAlert: false,
     testModel: "",
@@ -10454,6 +10296,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       apiKey: "",
       protocol: "responses",
       relayMode: "aggregate",
+      sessionProvider: "custom",
       officialMixApiKey: false,
       hideOfficialUsageAlert: false,
       testModel: "",
@@ -10594,6 +10437,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     apiKey: "",
     protocol: "responses",
     relayMode: "aggregate",
+    sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
     officialMixApiKey: false,
     hideOfficialUsageAlert: false,
     configContents: "",
