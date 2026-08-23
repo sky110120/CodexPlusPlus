@@ -9,6 +9,8 @@ const SHARE_ENDPOINTS: &[&str] = &[
 pub async fn create_share(payload: Value) -> anyhow::Result<Value> {
     let client = reqwest::Client::builder()
         .user_agent("CodexPlusPlus share proxy")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .context("创建分享请求客户端失败")?;
     let mut last_error = None;
@@ -41,4 +43,14 @@ pub async fn create_share(payload: Value) -> anyhow::Result<Value> {
         last_error = Some(format!("{message}（HTTP {status}）"));
     }
     bail!(last_error.unwrap_or_else(|| "分享服务不可用".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn share_requests_have_bounded_connect_and_response_timeouts() {
+        let source = include_str!("share.rs");
+        assert!(source.contains("connect_timeout"));
+        assert!(source.contains("timeout(std::time::Duration::from_secs(20))"));
+    }
 }

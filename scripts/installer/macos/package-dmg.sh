@@ -150,19 +150,23 @@ ln -s /Applications "$STAGE/Applications"
 
 MAX_ATTEMPTS="${DMG_CREATE_MAX_ATTEMPTS:-3}"
 attempt=0
+DMG_CREATED=false
 while :; do
   attempt=$((attempt + 1))
   if hdiutil create -volname "Codex++" -srcfolder "$STAGE" -ov -format UDZO "$DMG_TMP"; then
+    DMG_CREATED=true
     break
   fi
-  status=$?
   rm -f "$DMG_TMP"
   if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-    echo "error: hdiutil create failed after $MAX_ATTEMPTS attempts" >&2
-    exit "$status"
+    break
   fi
   echo "hdiutil create failed (attempt $attempt/$MAX_ATTEMPTS); retrying..." >&2
   sleep "$((attempt * 2))"
 done
+if [ "$DMG_CREATED" != true ]; then
+  echo "error: hdiutil create failed after $MAX_ATTEMPTS attempts" >&2
+  exit 1
+fi
 mv -f "$DMG_TMP" "$DMG"
 echo "$DMG"

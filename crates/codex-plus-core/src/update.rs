@@ -4,8 +4,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
+pub const DEFAULT_REPOSITORY: &str = "sky110120/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
+    "https://github.com/sky110120/CodexPlusPlus/releases/latest/download/latest.json";
+pub const UPSTREAM_LATEST_JSON_URL: &str =
     "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -182,8 +184,39 @@ pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Relea
     release_from_latest_json_payload(&payload)
 }
 
+pub async fn fetch_latest_release_with_fallback(
+    primary_url: &str,
+    fallback_url: &str,
+) -> anyhow::Result<Release> {
+    match fetch_latest_release(primary_url).await {
+        Ok(release) => Ok(release),
+        Err(primary_error) => {
+            let mut release = fetch_latest_release(fallback_url).await.map_err(
+                |fallback_error| {
+                    anyhow::anyhow!(
+                        "主更新源请求失败：{primary_error}；上游更新源请求失败：{fallback_error}"
+                    )
+                },
+            )?;
+            release.asset_name = None;
+            release.asset_url = None;
+            release.body = if release.body.trim().is_empty() {
+                "本地 fork 更新源暂不可用，仅显示上游版本信息；不会安装上游构建。".to_string()
+            } else {
+                format!(
+                    "本地 fork 更新源暂不可用，仅显示上游版本信息；不会安装上游构建。\n\n{}",
+                    release.body
+                )
+            };
+            Ok(release)
+        }
+    }
+}
+
 pub async fn check_for_update(current_version: &str) -> anyhow::Result<UpdateCheck> {
-    let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
+    let release =
+        fetch_latest_release_with_fallback(DEFAULT_LATEST_JSON_URL, UPSTREAM_LATEST_JSON_URL)
+            .await?;
     let update_available = is_newer_version(&release.version, current_version)?;
     Ok(UpdateCheck {
         current_version: current_version.to_string(),
@@ -346,16 +379,13 @@ pub fn safe_asset_name(name: &str) -> anyhow::Result<String> {
 
 fn platform_asset_rank(name: &str) -> u8 {
     // 0 = exact match (current OS + native arch)
-    // 1 = same OS, other arch (acceptable fallback, e.g. x86_64 on arm64 or vice versa)
+    // 1 = same OS, architecture-neutral fallback
     // 2 = wrong platform
     if cfg!(target_os = "macos") {
         if !is_macos_installer_asset(name) {
             return 2;
         }
-        if is_macos_native_arch_asset(name) {
-            return 0;
-        }
-        return 1;
+        return macos_asset_arch_rank(name);
     }
     if cfg!(windows) && is_windows_installer_asset(name) {
         return 0;
@@ -363,20 +393,20 @@ fn platform_asset_rank(name: &str) -> u8 {
     2
 }
 
-fn is_macos_native_arch_asset(name: &str) -> bool {
+fn macos_asset_arch_rank(name: &str) -> u8 {
     let lower = name.to_ascii_lowercase();
     let native_arch_token = match std::env::consts::ARCH {
         "x86_64" => "x64",
         "aarch64" => "arm64",
-        _ => return true, // unknown arch — accept anything
+        _ => return 1,
     };
     // Modern filename shape: `...-macos-x64.dmg` or `...-macos-arm64.dmg`
     if lower.contains(&format!("-{native_arch_token}.")) {
-        return true;
+        return 0;
     }
     // Old filename shape: `CodexPlusPlus_1.0.9_x64.dmg`
     if lower.contains(&format!("_{native_arch_token}.")) {
-        return true;
+        return 0;
     }
     // Newer but alternative shape: `..._x64.dmg` (no `macos-` token)
     let other_token = if native_arch_token == "x64" {
@@ -385,10 +415,10 @@ fn is_macos_native_arch_asset(name: &str) -> bool {
         "x64"
     };
     if lower.contains(&format!("_{other_token}.")) || lower.contains(&format!("-{other_token}.")) {
-        return false;
+        return 2;
     }
-    // No arch token at all — assume it matches the current arch.
-    true
+    // No arch token at all — accept it as an architecture-neutral fallback.
+    1
 }
 
 fn is_windows_installer_asset(name: &str) -> bool {

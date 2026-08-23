@@ -268,6 +268,30 @@ describe("dream skin theme helpers", () => {
     assert.doesNotMatch(source, /当前 Codex 无法实时切换完整主题，需要重启 Codex\+\+。是否立即重启/);
   });
 
+  it("keeps DreamSkin draft state and async refs synchronized", async () => {
+    const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.match(source, /onDraftChange=\{updateDreamSkinThemeDraft\}/);
+    assert.match(source, /resetDreamSkinImage:[\s\S]*updateDreamSkinThemeDraft/);
+    assert.match(source, /resetDreamSkinTheme:[\s\S]*updateDreamSkinThemeDraft/);
+  });
+
+  it("clears stale verification before refreshing DreamSkin runtime status", async () => {
+    const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    const start = source.indexOf("const refreshDreamSkinStatus = async");
+    const end = source.indexOf("const refreshScriptMarket", start);
+    const handler = source.slice(start, end);
+
+    assert.match(handler, /setDreamSkinVerification\(null\)/);
+  });
+
+  it("loads pending shared sessions on startup and while the manager is open", async () => {
+    const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.ok((source.match(/refreshPendingSessionShare\(true\)/g) ?? []).length >= 2);
+    assert.equal((source.match(/<PendingProviderImportDialog/g) ?? []).length, 1);
+  });
+
   it("restores the original appearance as pending without reloading or restarting Codex", async () => {
     const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
     const commands = await readFile(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
@@ -318,6 +342,18 @@ describe("dream skin theme helpers", () => {
     assert.match(customizer, /t\("保存主题"\)/);
     assert.match(customizer, /t\("恢复 Dream Skin 默认主题"\)/);
     assert.match(customizer, /t\("恢复 Codex 默认配色"\)/);
+  });
+
+  it("keeps local draft clearing and damaged-theme recovery controls", async () => {
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.match(app, /clearDreamSkinDraft/);
+    assert.match(app, /library\?\.warnings\.length/);
+    assert.match(app, /item\.damaged \? " is-damaged"/);
+    assert.match(app, /从市场重新安装/);
+    assert.match(app, /从社区重新安装/);
+    assert.match(app, /重新导入/);
+    assert.match(app, /请先从“我的主题”选择一个主题/);
   });
 
   it("exposes only effective Windows appearance and accent controls", async () => {

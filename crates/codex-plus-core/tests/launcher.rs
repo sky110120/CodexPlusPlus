@@ -13,8 +13,9 @@ use codex_plus_core::launcher::{
     build_codex_command, build_codex_command_with_native_menu_inspector,
     build_macos_cleanup_command, build_macos_open_command,
     build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
-    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
-    probe_helper_status, select_macos_debug_launch_action,
+    build_packaged_activation_with_native_menu_inspector, helper_port_for_settings,
+    helper_required_for_settings, launch_and_inject_with_hooks, probe_helper_status,
+    select_macos_debug_launch_action,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -31,6 +32,28 @@ fn browser_identity_change_requires_two_distinct_observations() {
     assert!(!browser_identity_changed(None, "browser-a"));
     assert!(!browser_identity_changed(Some("browser-a"), "browser-a"));
     assert!(browser_identity_changed(Some("browser-a"), "browser-b"));
+}
+
+#[test]
+fn helper_requirement_covers_protocol_proxy_without_enhancements() {
+    let settings = BackendSettings {
+        enhancements_enabled: false,
+        active_relay_id: "official-mix".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "official-mix".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    assert!(helper_required_for_settings(&settings));
+    assert_eq!(
+        helper_port_for_settings(&settings, 58123),
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    );
 }
 
 #[test]

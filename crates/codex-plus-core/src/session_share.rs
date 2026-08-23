@@ -1,10 +1,11 @@
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use anyhow::{Context, bail};
 use base64::Engine;
+use fs2::FileExt;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -78,7 +79,14 @@ pub async fn import_shared_session_url(home: &Path, url: &str) -> anyhow::Result
     endpoint.set_path(&format!("/api/shares/{share_id}"));
     endpoint.set_query(None);
     endpoint.set_fragment(None);
-    let record = reqwest::get(endpoint)
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("创建分享会话下载客户端失败")?;
+    let record = client
+        .get(endpoint)
+        .send()
         .await
         .context("读取分享会话失败")?
         .error_for_status()
@@ -229,30 +237,134 @@ pub fn import_rollout(home: &Path, payload: &Value) -> anyhow::Result<Value> {
     let directory = home.join("sessions").join("imported");
     fs::create_dir_all(&directory).context("创建会话目录失败")?;
     let path = directory.join(format!("rollout-{now}-{new_id}.jsonl"));
-    fs::write(&path, rewritten).context("写入导入会话失败")?;
-
-    register_imported_thread(home, &new_id, &path, title, content, now)?;
-
     let index_path = home.join("session_index.jsonl");
-    let mut index = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&index_path)
-        .context("打开会话索引失败")?;
-    writeln!(
-        index,
-        "{}",
-        serde_json::to_string(&json!({
+    crate::settings::atomic_write(&path, rewritten.as_bytes()).context("写入导入会话失败")?;
+
+    let registered_db = match register_imported_thread(home, &new_id, &path, title, content, now) {
+        Ok(db_path) => db_path,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = append_session_index_entry(
+        &index_path,
+        &json!({
             "id": new_id,
             "thread_name": if title.is_empty() { "导入的会话" } else { title },
             "updated_at": now.to_string(),
-        }))?
-    )
-    .context("更新会话索引失败")?;
+        }),
+    ) {
+        let mut rollback_errors = Vec::new();
+        if let Some(db_path) = registered_db.as_deref()
+            && let Err(rollback_error) = rollback_imported_thread(db_path, &new_id)
+        {
+            rollback_errors.push(format!("回滚会话数据库失败：{rollback_error}"));
+        }
+        if let Err(rollback_error) = fs::remove_file(&path)
+            && rollback_error.kind() != std::io::ErrorKind::NotFound
+        {
+            rollback_errors.push(format!("回滚会话文件失败：{rollback_error}"));
+        }
+        let mut message = format!("更新会话索引失败：{error}");
+        if !rollback_errors.is_empty() {
+            message.push_str(&format!("；{}", rollback_errors.join("；")));
+        }
+        bail!(message);
+    }
 
     Ok(
         json!({ "status": "ok", "session_id": new_id, "title": if title.is_empty() { "导入的会话" } else { title } }),
     )
+}
+
+fn append_session_index_entry(index_path: &Path, entry: &Value) -> anyhow::Result<()> {
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent).context("创建会话索引目录失败")?;
+    }
+    let mut index = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(index_path)
+        .with_context(|| format!("打开会话索引失败：{}", index_path.display()))?;
+    index
+        .lock_exclusive()
+        .with_context(|| format!("锁定会话索引失败：{}", index_path.display()))?;
+
+    let result = (|| -> anyhow::Result<()> {
+        let original_len = index.metadata()?.len();
+        let mut appended = Vec::new();
+        if original_len > 0 {
+            index.seek(SeekFrom::End(-1))?;
+            let mut last = [0_u8; 1];
+            index.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                appended.push(b'\n');
+            }
+        }
+        appended.extend_from_slice(&serde_json::to_vec(entry)?);
+        appended.push(b'\n');
+        let written = index.write(&appended)?;
+        if written != appended.len() {
+            let rollback =
+                rollback_session_index_append(&mut index, original_len, &appended[..written]);
+            return Err(match rollback {
+                Ok(()) => {
+                    anyhow::anyhow!("会话索引追加不完整：写入 {written}/{} 字节", appended.len())
+                }
+                Err(rollback_error) => anyhow::anyhow!(
+                    "会话索引追加不完整：写入 {written}/{} 字节；清理失败：{rollback_error}",
+                    appended.len()
+                ),
+            });
+        }
+        if let Err(error) = index.sync_data() {
+            let rollback = rollback_session_index_append(&mut index, original_len, &appended);
+            return Err(match rollback {
+                Ok(()) => anyhow::anyhow!("同步会话索引失败：{error}"),
+                Err(rollback_error) => {
+                    anyhow::anyhow!("同步会话索引失败：{error}；清理失败：{rollback_error}")
+                }
+            });
+        }
+        Ok(())
+    })();
+    let _ = FileExt::unlock(&index);
+    result
+}
+
+fn rollback_session_index_append(
+    index: &mut std::fs::File,
+    original_len: u64,
+    appended: &[u8],
+) -> anyhow::Result<()> {
+    if appended.is_empty() {
+        return Ok(());
+    }
+    let segment_end = original_len
+        .checked_add(appended.len() as u64)
+        .context("会话索引回滚长度溢出")?;
+    let current_len = index.metadata()?.len();
+    if current_len < segment_end {
+        bail!("会话索引长度不足，无法清理失败追加");
+    }
+    index.seek(SeekFrom::Start(original_len))?;
+    let mut observed = vec![0_u8; appended.len()];
+    index.read_exact(&mut observed)?;
+    if observed != appended {
+        bail!("会话索引已被并发修改，无法安全清理失败追加");
+    }
+    index.seek(SeekFrom::Start(segment_end))?;
+    let mut trailing = Vec::new();
+    index.read_to_end(&mut trailing)?;
+    index.set_len(original_len)?;
+    if !trailing.is_empty() {
+        index.write_all(&trailing)?;
+    }
+    index.sync_data()?;
+    Ok(())
 }
 
 fn register_imported_thread(
@@ -262,10 +374,10 @@ fn register_imported_thread(
     title: &str,
     content: &str,
     now: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<PathBuf>> {
     let db_path = crate::codex_sqlite::codex_session_db_path_from_home(home);
     if !db_path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let db = Connection::open(&db_path)
         .with_context(|| format!("打开 Codex 会话数据库失败：{}", db_path.display()))?;
@@ -275,7 +387,7 @@ fn register_imported_thread(
         |row| row.get(0),
     )?;
     if !has_threads {
-        return Ok(());
+        return Ok(None);
     }
     let columns = db
         .prepare("PRAGMA table_info(threads)")?
@@ -361,6 +473,13 @@ fn register_imported_thread(
         .map(|(_, value)| value.as_ref())
         .collect::<Vec<_>>();
     db.execute(&sql, rusqlite::params_from_iter(params))?;
+    Ok(Some(db_path))
+}
+
+fn rollback_imported_thread(db_path: &Path, session_id: &str) -> anyhow::Result<()> {
+    let db = Connection::open(db_path)
+        .with_context(|| format!("打开 Codex 会话数据库失败：{}", db_path.display()))?;
+    db.execute("DELETE FROM threads WHERE id = ?1", [session_id])?;
     Ok(())
 }
 
@@ -488,6 +607,7 @@ fn find_uuid(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
     fn rewrites_ids_in_rollout_lines() {
@@ -495,5 +615,105 @@ mod tests {
         let rewritten = rewrite_rollout(content, "old", "new").unwrap();
         assert!(rewritten.contains("\"id\":\"new\""));
         assert!(rewritten.contains("\"session_id\":\"new\""));
+    }
+
+    #[test]
+    fn session_index_append_preserves_all_concurrent_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("session_index.jsonl");
+        fs::write(&index_path, "{\"id\":\"existing\"}").unwrap();
+        let handles = (0..16)
+            .map(|index| {
+                let path = index_path.clone();
+                std::thread::spawn(move || {
+                    append_session_index_entry(
+                        &path,
+                        &json!({ "id": format!("imported-{index}") }),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let contents = fs::read_to_string(index_path).unwrap();
+        let ids = contents
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 17);
+        assert!(ids.contains("existing"));
+        for index in 0..16 {
+            assert!(ids.contains(&format!("imported-{index}")));
+        }
+    }
+
+    #[test]
+    fn failed_session_index_append_cleanup_preserves_following_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("session_index.jsonl");
+        let original = b"{\"id\":\"existing\"}\n";
+        let failed_prefix = b"{\"id\":\"ghost";
+        let following = b"{\"id\":\"following\"}\n";
+        let mut contents = original.to_vec();
+        contents.extend_from_slice(failed_prefix);
+        contents.extend_from_slice(following);
+        fs::write(&index_path, contents).unwrap();
+        let mut index = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&index_path)
+            .unwrap();
+
+        rollback_session_index_append(&mut index, original.len() as u64, failed_prefix).unwrap();
+
+        assert_eq!(
+            fs::read(index_path).unwrap(),
+            [original.as_slice(), following].concat()
+        );
+    }
+
+    #[test]
+    fn imported_thread_registration_can_be_rolled_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let db_path = home.join("state_5.sqlite");
+        let db = Connection::open(&db_path).unwrap();
+        db.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT)",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let rollout_path = home.join("sessions/imported/rollout-test.jsonl");
+
+        let registered = register_imported_thread(
+            home,
+            "imported-id",
+            &rollout_path,
+            "Imported",
+            r#"{"type":"session_meta","payload":{"id":"imported-id"}}"#,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        rollback_imported_thread(&registered, "imported-id").unwrap();
+
+        let db = Connection::open(db_path).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'imported-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

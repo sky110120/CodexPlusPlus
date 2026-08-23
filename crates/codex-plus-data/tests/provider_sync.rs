@@ -1175,6 +1175,119 @@ fn provider_sync_repairs_missing_local_thread_catalog_rows_from_threads() {
 }
 
 #[test]
+fn provider_sync_audits_catalog_only_sessions_without_claiming_recovery() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+
+    let state_db = home.join("state_5.sqlite");
+    create_state_db_with_providers(&state_db, &[("canonical", "openai", 0)]);
+    let current_rollout_id = "01a01579-4a5d-77e3-89c0-751d38ad21f8";
+    write_rollout(
+        &home.join("sessions/2026/08/18").join(format!(
+            "rollout-2026-08-18T23-24-25-{current_rollout_id}.jsonl"
+        )),
+        "custom",
+        current_rollout_id,
+        "C:/workspace",
+    );
+
+    let catalog_db = sqlite_dir.join("codex-dev.db");
+    create_local_thread_catalog_db(
+        &catalog_db,
+        &[
+            (current_rollout_id, "custom"),
+            ("backup-only", "custom"),
+            ("no-source", "custom"),
+            ("agent-only", "custom"),
+        ],
+    );
+    Connection::open(&catalog_db)
+        .unwrap()
+        .execute(
+            "UPDATE local_thread_catalog SET thread_source = 'subagent' WHERE thread_id = 'agent-only'",
+            [],
+        )
+        .unwrap();
+
+    let backup_db = home.join("backups_state/provider-sync/20260818233010/db/state_5.sqlite");
+    fs::create_dir_all(backup_db.parent().unwrap()).unwrap();
+    create_state_db_with_providers(&backup_db, &[("backup-only", "custom", 0)]);
+    fs::write(
+        home.join("backups_state/provider-sync/20260818233010/db/broken.sqlite"),
+        b"not a sqlite database",
+    )
+    .unwrap();
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.repair_audit.catalog_only_sessions, 3);
+    assert_eq!(result.repair_audit.catalog_only_with_current_rollout, 1);
+    assert_eq!(result.repair_audit.catalog_only_with_backup_database, 1);
+    assert_eq!(result.repair_audit.catalog_only_without_recovery_source, 1);
+    assert!(result.message.contains("未自动重建缺失的 canonical 会话"));
+}
+
+#[test]
+fn provider_sync_continues_when_repair_audit_backup_root_is_not_directory() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    create_state_db_with_providers(&home.join("state_5.sqlite"), &[]);
+    create_local_thread_catalog_db(
+        &sqlite_dir.join("codex-dev.db"),
+        &[("catalog-only", "apigather")],
+    );
+
+    let backup_root = home.join("backups_state/provider-sync");
+    fs::create_dir_all(backup_root.parent().unwrap()).unwrap();
+    fs::write(&backup_root, b"unreadable backup root").unwrap();
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(
+        result.status,
+        ProviderSyncStatus::Synced,
+        "{}",
+        result.message
+    );
+    assert_eq!(result.sqlite_rows_updated, 0);
+    assert_eq!(result.repair_audit.catalog_only_sessions, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_sync_repair_audit_skips_cyclic_backup_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    create_state_db_with_providers(&home.join("state_5.sqlite"), &[]);
+    create_local_thread_catalog_db(
+        &sqlite_dir.join("codex-dev.db"),
+        &[("catalog-only", "apigather")],
+    );
+
+    let backup_root = home.join("backups_state/provider-sync");
+    let cycle = backup_root.join("cycle");
+    fs::create_dir_all(&backup_root).unwrap();
+    symlink(&backup_root, &cycle).unwrap();
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.sqlite_rows_updated, 0);
+}
+
+#[test]
 fn provider_sync_catalogs_user_threads_but_skips_subagents() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
@@ -2946,8 +3059,11 @@ fn session_index_cleanup_hides_subagent_without_deleting_source_records() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn session_index_cleanup_write_failure_reports_backup_and_preserves_original() {
+    use std::os::unix::fs::PermissionsExt;
+
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     fs::create_dir(&home).unwrap();
@@ -2955,14 +3071,17 @@ fn session_index_cleanup_write_failure_reports_backup_and_preserves_original() {
     let original = format!("{}\n", session_index_line(stale_id, "stale"));
     fs::write(home.join("session_index.jsonl"), &original).unwrap();
     let preview = preview_session_index_cleanup(Some(&home)).unwrap();
-    fs::create_dir(home.join("session_index.jsonl.tmp")).unwrap();
+    fs::create_dir_all(home.join("backups_state/provider-sync")).unwrap();
+    fs::create_dir(home.join("tmp")).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
 
-    let error = apply_session_index_cleanup(
+    let result = apply_session_index_cleanup(
         Some(&home),
         &preview.snapshot_sha256,
         &[stale_id.to_string()],
-    )
-    .unwrap_err();
+    );
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = result.unwrap_err();
 
     assert!(error.message.contains("原子写入"));
     let backup = error.backup_dir.expect("failure must expose backup");

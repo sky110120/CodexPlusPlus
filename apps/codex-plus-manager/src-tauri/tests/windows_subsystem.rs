@@ -73,11 +73,15 @@ fn manager_close_minimizes_to_tray_without_confirmation() {
 fn manager_queues_codexplusplus_provider_urls_for_confirmation_on_startup() {
     let main_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
         .expect("read manager main.rs");
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read manager lib.rs");
 
     assert!(main_rs.contains("codexplusplus://"));
-    assert!(main_rs.contains("provider_import::save_pending_provider_import_from_url"));
+    assert!(main_rs.contains("handle_provider_import_url"));
     assert!(!main_rs.contains("provider_import::import_provider_from_url"));
-    assert!(main_rs.contains("manager.provider_import_url.pending"));
+    assert!(lib_rs.contains("provider_import::save_pending_provider_import_from_url"));
+    assert!(lib_rs.contains("manager.provider_import_url.pending"));
+    assert!(lib_rs.contains("handle_provider_import_url(url.as_str())"));
 }
 
 #[test]
@@ -194,6 +198,7 @@ fn github_release_workflow_builds_only_macos_arm64_dmg() {
     assert!(workflow.contains("macos-14"));
     assert!(workflow.contains("aarch64-apple-darwin"));
     assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("default: v1.2.52"));
     assert!(workflow.contains("draft: true"));
     assert!(workflow.contains("BINARY_DIR=\"$PWD/target/${{ matrix.target }}/release\""));
     assert!(workflow.contains("target/${{ matrix.target }}/release"));
@@ -211,7 +216,7 @@ fn github_release_workflow_uploads_static_latest_json() {
     let workflow = std::fs::read_to_string(&workflow).expect("read release assets workflow");
 
     assert!(workflow.contains(
-        "if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}"
+        "if: ${{ always() && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && needs.macos-dmg.result == 'success')) }}"
     ));
     assert!(workflow.contains("latest-json:"));
     assert!(workflow.contains("latest.json"));

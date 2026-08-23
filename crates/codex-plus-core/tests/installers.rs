@@ -118,6 +118,10 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
     assert!(script.contains("mktemp -d \"${TMPDIR:-/tmp}/codex-plus-plus-dmg.XXXXXX\""));
     assert!(script.contains("MAX_ATTEMPTS=\"${DMG_CREATE_MAX_ATTEMPTS:-3}\""));
     assert!(script.contains("sleep \"$((attempt * 2))\""));
+    assert!(script.contains("DMG_CREATED=false"));
+    assert!(script.contains("if [ \"$DMG_CREATED\" != true ]; then"));
+    assert!(script.contains("exit 1"));
+    assert!(!script.contains("status=$?"));
     assert!(script.contains("mv -f \"$DMG_TMP\" \"$DMG\""));
 }
 

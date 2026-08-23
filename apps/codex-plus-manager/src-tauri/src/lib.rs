@@ -174,7 +174,9 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event {
                 for url in urls {
-                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str())
+                    if handle_session_share_url(url.as_str())
+                        || handle_provider_import_url(url.as_str())
+                        || handle_dream_skin_url(url.as_str())
                     {
                         show_main_window(app_handle);
                     }
@@ -188,6 +190,31 @@ pub fn run() {
                     "error": error.to_string()
                 }),
             );
+        }
+    }
+}
+
+pub fn handle_provider_import_url(url: &str) -> bool {
+    if !url.starts_with("codexplusplus://") || url.starts_with("codexplusplus://session") {
+        return false;
+    }
+    match codex_plus_core::provider_import::save_pending_provider_import_from_url(url) {
+        Ok(request) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.provider_import_url.pending",
+                serde_json::json!({
+                    "name": request.name,
+                    "baseUrl": request.base_url
+                }),
+            );
+            true
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.provider_import_url.failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            false
         }
     }
 }

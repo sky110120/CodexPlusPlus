@@ -44,6 +44,28 @@ impl LauncherHooks {
     }
 }
 
+struct ExistingActivation {
+    hooks: LauncherHooks,
+    helper_port: u16,
+    helper_started: bool,
+}
+
+impl ExistingActivation {
+    async fn shutdown_started_helper(&self) {
+        if self.helper_started {
+            self.hooks.shutdown_helper(self.helper_port).await;
+        }
+    }
+
+    async fn keep_alive_until_codex_exit(self, debug_port: u16) {
+        if !self.helper_started {
+            return;
+        }
+        wait_for_activated_codex_exit(debug_port).await;
+        self.shutdown_started_helper().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -82,17 +104,24 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
         return Ok(());
     }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
-        options.status_store.save_latest(&LaunchStatus {
+        let activation = activate_existing_codex_app(&options).await?;
+        let active_helper_port = activation.helper_port;
+        if let Err(error) = options.status_store.save_latest(&LaunchStatus {
             status: "running".to_string(),
             message: "Existing Codex instance activated".to_string(),
             started_at_ms: current_timestamp_ms(),
             debug_port: Some(options.debug_port),
-            helper_port: Some(options.helper_port),
+            helper_port: Some(active_helper_port),
             codex_app: options
                 .app_dir
                 .map(|path| path.to_string_lossy().to_string()),
-        })?;
+        }) {
+            activation.shutdown_started_helper().await;
+            return Err(error);
+        }
+        activation
+            .keep_alive_until_codex_exit(options.debug_port)
+            .await;
         return Ok(());
     };
     tokio::spawn(async {
@@ -186,10 +215,15 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
+async fn activate_existing_codex_app(
+    options: &LaunchOptions,
+) -> anyhow::Result<ExistingActivation> {
     let hooks = LauncherHooks::default();
-    let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
+    let helper_port = codex_plus_core::launcher::helper_port_for_settings(
+        &settings,
+        hooks.select_helper_port(options.helper_port),
+    );
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
     let blocking_process_ids = if has_pending_recovery {
@@ -206,6 +240,19 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"blocking_process_ids": blocking_process_ids}),
         );
     }
+    let mut helper_started = false;
+    if codex_plus_core::launcher::helper_required_for_settings(&settings) {
+        match hooks.helper_status(helper_port).await {
+            codex_plus_core::launcher::HelperStatus::Compatible => {}
+            codex_plus_core::launcher::HelperStatus::Missing => {
+                hooks.start_helper(helper_port).await?;
+                helper_started = true;
+            }
+            codex_plus_core::launcher::HelperStatus::Incompatible(reason) => {
+                anyhow::bail!("helper 端口 {helper_port} 已被不兼容的服务占用：{reason}");
+            }
+        }
+    }
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -214,47 +261,73 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(helper_port).await?;
+    let activation_result = async {
+        let process_ids = codex_plus_core::watcher::find_codex_processes();
+        #[cfg(windows)]
+        let activated = process_ids
+            .iter()
+            .copied()
+            .any(codex_plus_core::windows_activate_process_window);
+        #[cfg(not(windows))]
+        let activated = false;
+        let injection_ready = if settings.enhancements_enabled {
+            hooks
+                .ensure_injection(options.debug_port, helper_port, &app_dir)
+                .await
+        } else {
+            false
+        };
+        if injection_ready {
+            hooks
+                .start_bridge_watchdog(options.debug_port, helper_port)
+                .await?;
+            hooks.write_status("running").await;
+        } else if settings.enhancements_enabled {
+            hooks.write_status("running_degraded").await;
+        }
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.activate_existing_codex",
+            json!({
+                "app_dir": app_dir.to_string_lossy(),
+                "debug_port": options.debug_port,
+                "helper_port": helper_port,
+                "requested_helper_port": options.helper_port,
+                "process_ids": process_ids,
+                "activated": activated,
+                "injection_ready": injection_ready,
+                "launch_ok": launch_result.is_ok(),
+                "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
+            }),
+        );
+        launch_result?;
+        Ok(ExistingActivation {
+            hooks: hooks.clone(),
+            helper_port,
+            helper_started,
+        })
     }
-    let process_ids = codex_plus_core::watcher::find_codex_processes();
-    #[cfg(windows)]
-    let activated = process_ids
-        .iter()
-        .copied()
-        .any(codex_plus_core::windows_activate_process_window);
-    #[cfg(not(windows))]
-    let activated = false;
-    let injection_ready = if settings.enhancements_enabled {
-        hooks
-            .ensure_injection(options.debug_port, helper_port, &app_dir)
-            .await
-    } else {
-        false
-    };
-    if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, helper_port)
-            .await?;
-        hooks.write_status("running").await;
-    } else if settings.enhancements_enabled {
-        hooks.write_status("running_degraded").await;
+    .await;
+    if activation_result.is_err() && helper_started {
+        hooks.shutdown_helper(helper_port).await;
     }
-    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-        "launcher.activate_existing_codex",
-        json!({
-            "app_dir": app_dir.to_string_lossy(),
-            "debug_port": options.debug_port,
-            "helper_port": helper_port,
-            "requested_helper_port": options.helper_port,
-            "process_ids": process_ids,
-            "activated": activated,
-            "injection_ready": injection_ready,
-            "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
-        }),
-    );
-    launch_result.map(|_| ())
+    activation_result
+}
+
+async fn wait_for_activated_codex_exit(debug_port: u16) {
+    let mut empty_streak = 0u32;
+    loop {
+        let has_codex_process = !codex_plus_core::watcher::find_codex_processes().is_empty();
+        let cdp_listening = codex_plus_core::watcher::cdp_listening(debug_port);
+        if !(has_codex_process || cdp_listening) {
+            empty_streak = empty_streak.saturating_add(1);
+            if empty_streak >= 5 {
+                break;
+            }
+        } else {
+            empty_streak = 0;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 fn should_finalize_pending_remote_control_recovery(
@@ -348,6 +421,10 @@ impl LaunchHooks for LauncherHooks {
         self.core.select_helper_port(requested)
     }
 
+    async fn helper_status(&self, helper_port: u16) -> codex_plus_core::launcher::HelperStatus {
+        self.core.helper_status(helper_port).await
+    }
+
     async fn load_settings(&self) -> anyhow::Result<codex_plus_core::settings::BackendSettings> {
         self.core.load_settings().await
     }
@@ -416,6 +493,7 @@ impl LaunchHooks for LauncherHooks {
                             updated_workspace_roots: 0,
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
+                            repair_audit: Default::default(),
                         },
                         completion_error,
                     ));
@@ -446,6 +524,7 @@ impl LaunchHooks for LauncherHooks {
                             updated_workspace_roots: 0,
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
+                            repair_audit: Default::default(),
                         },
                         None,
                     ));
@@ -1153,6 +1232,76 @@ mod tests {
     }
 
     #[test]
+    fn existing_launcher_keeps_missing_helper_alive_until_codex_exit() {
+        let source = include_str!("main.rs");
+        let activation_support = source
+            .split("#[tokio::main]")
+            .next()
+            .expect("existing activation support section");
+        let launcher_main = source
+            .split("async fn launcher_main")
+            .nth(1)
+            .and_then(|body| body.split("fn current_timestamp_ms").next())
+            .expect("launcher main body");
+        let wait_for_exit = source
+            .split("async fn wait_for_activated_codex_exit")
+            .nth(1)
+            .and_then(|body| {
+                body.split("fn should_finalize_pending_remote_control_recovery")
+                    .next()
+            })
+            .expect("existing Codex wait loop");
+
+        assert!(activation_support.contains("struct ExistingActivation"));
+        assert!(activation_support.contains("async fn keep_alive_until_codex_exit"));
+        assert!(activation_support.contains("async fn shutdown_started_helper"));
+        assert!(activation_support.contains("shutdown_helper(self.helper_port)"));
+        assert!(
+            launcher_main.contains("let activation = activate_existing_codex_app(&options).await?")
+        );
+        assert!(launcher_main.contains("activation"));
+        assert!(launcher_main.contains("let active_helper_port = activation.helper_port"));
+        assert!(launcher_main.contains("helper_port: Some(active_helper_port)"));
+        assert!(launcher_main.contains("activation.shutdown_started_helper().await"));
+        assert!(launcher_main.contains(".keep_alive_until_codex_exit(options.debug_port)"));
+        assert!(wait_for_exit.contains("find_codex_processes"));
+        assert!(wait_for_exit.contains("cdp_listening(debug_port)"));
+    }
+
+    #[test]
+    fn existing_launcher_probes_helper_status_before_starting_helper() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let body = source[start..]
+            .split("fn should_finalize_pending_remote_control_recovery")
+            .next()
+            .expect("existing launcher activation body");
+        let helper_status = body
+            .find("match hooks.helper_status(helper_port).await")
+            .expect("helper status probe");
+        let recovery = body
+            .find(
+                "let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries()",
+            )
+            .expect("pending recovery guard");
+        let launch = body
+            .find("let launch_result = hooks")
+            .expect("Codex activation");
+
+        assert!(recovery < helper_status);
+        assert!(helper_status < launch);
+        assert!(body[helper_status..launch].contains("HelperStatus::Compatible"));
+        assert!(body[helper_status..launch].contains("HelperStatus::Missing"));
+        assert!(body[helper_status..launch].contains("hooks.start_helper(helper_port).await?"));
+        assert!(body[helper_status..launch].contains("HelperStatus::Incompatible(reason)"));
+        assert!(body.contains("helper_required_for_settings(&settings)"));
+        assert!(body.contains("helper_port_for_settings"));
+        assert!(body.contains("activation_result.is_err() && helper_started"));
+    }
+
+    #[test]
     fn pending_remote_control_finalization_requires_an_idle_desktop() {
         assert!(should_finalize_pending_remote_control_recovery(true, &[]));
         assert!(!should_finalize_pending_remote_control_recovery(false, &[]));
@@ -1200,13 +1349,20 @@ mod tests {
     #[test]
     fn launcher_hooks_forward_runtime_watchdog_and_marketplace_methods() {
         let source = include_str!("main.rs");
+        let hooks = source
+            .split("impl LaunchHooks for LauncherHooks")
+            .nth(1)
+            .and_then(|body| body.split("struct LauncherDataService").next())
+            .expect("launcher hooks implementation");
 
-        assert!(source.contains("async fn start_bridge_watchdog"));
-        assert!(source.contains("self.watchdog_bridge_context()?"));
-        assert!(source.contains("set_bridge_reinjector(reinjector)"));
-        assert!(source.contains("inject_with_context(debug_port, helper_port, ctx, runtime)"));
-        assert!(source.contains("async fn ensure_plugin_marketplace_config"));
-        assert!(source.contains("self.core.ensure_plugin_marketplace_config(settings).await"));
+        assert!(hooks.contains("async fn start_bridge_watchdog"));
+        assert!(hooks.contains("self.watchdog_bridge_context()?"));
+        assert!(hooks.contains("set_bridge_reinjector(reinjector)"));
+        assert!(hooks.contains("inject_with_context(debug_port, helper_port, ctx, runtime)"));
+        assert!(hooks.contains("async fn ensure_plugin_marketplace_config"));
+        assert!(hooks.contains("self.core.ensure_plugin_marketplace_config(settings).await"));
+        assert!(hooks.contains("async fn helper_status"));
+        assert!(hooks.contains("self.core.helper_status(helper_port).await"));
     }
 
     #[tokio::test]

@@ -10,6 +10,18 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+const GLOBAL_STATE_RELATIVE_PATHS: &[&str] = &[
+    ".codex-global-state.json",
+    ".codex-global-state.json.bak",
+    "backups_state/app-state-sync/latest-safe-state.json",
+];
+const THREAD_REFERENCE_TABLES: &[(&str, &str)] = &[
+    ("local_thread_catalog", "thread_id"),
+    ("thread_timeline_ledger", "thread_id"),
+    ("automation_runs", "thread_id"),
+    ("inbox_items", "thread_id"),
+];
+
 pub fn delete_local_from_paths(
     db_paths: impl IntoIterator<Item = PathBuf>,
     backup_store: BackupStore,
@@ -19,6 +31,14 @@ pub fn delete_local_from_paths(
     if let Err(error) = preflight_child_session_markers(&db_paths, &session.session_id) {
         return failed(&session.session_id, error.to_string());
     }
+    let codex_home = infer_codex_home_from_paths(&db_paths);
+    let mut allowed_db_paths = db_paths.clone();
+    if let Some(home) = codex_home.as_deref() {
+        extend_unique_paths(
+            &mut allowed_db_paths,
+            codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(home),
+        );
+    }
     let mut result = failed(
         &session.session_id,
         "Thread not found in local storage".to_string(),
@@ -26,22 +46,32 @@ pub fn delete_local_from_paths(
     let mut deleted_count = 0usize;
     let mut backup_tokens = Vec::new();
     for db_path in db_paths {
-        let adapter = SQLiteStorageAdapter::new(db_path, backup_store.clone());
+        let mut adapter = SQLiteStorageAdapter::new(db_path, backup_store.clone())
+            .with_allowed_db_paths(allowed_db_paths.clone());
+        if let Some(home) = codex_home.as_deref() {
+            adapter = adapter.with_codex_home(home);
+        }
         let candidate_result = adapter.delete_local(session);
         if matches!(candidate_result.status, DeleteStatus::LocalDeleted) {
             deleted_count += 1;
             if let Some(token) = candidate_result.undo_token.as_ref() {
-                backup_tokens.push(token.clone());
+                backup_tokens.extend(parse_undo_tokens(token));
             }
             result = candidate_result;
         } else if deleted_count == 0 {
             result = candidate_result;
         }
     }
-    if deleted_count > 1 {
-        result.message = format!("已从 {deleted_count} 个本地存储删除");
-        result.undo_token = Some(json!(backup_tokens).to_string());
-        result.backup_path = None;
+    if deleted_count > 0 {
+        if deleted_count > 1 {
+            result.message = format!("已从 {deleted_count} 个本地存储删除");
+        }
+        if !backup_tokens.is_empty() {
+            result.undo_token = Some(format_undo_tokens(&backup_tokens));
+            if backup_tokens.len() > 1 {
+                result.backup_path = None;
+            }
+        }
     }
     result
 }
@@ -245,12 +275,7 @@ pub fn cleanup_thread_reference_state_for_home(
             continue;
         }
         let db = Connection::open(&db_path)?;
-        for (table, column) in [
-            ("local_thread_catalog", "thread_id"),
-            ("thread_timeline_ledger", "thread_id"),
-            ("automation_runs", "thread_id"),
-            ("inbox_items", "thread_id"),
-        ] {
+        for (table, column) in THREAD_REFERENCE_TABLES {
             if !has_table(&db, table)? || !has_columns(&db, table, &[column])? {
                 continue;
             }
@@ -294,11 +319,174 @@ fn session_index_line_matches(line: &str, thread_id: &str) -> bool {
         .is_some_and(|id| id == thread_id)
 }
 
+fn session_index_lines_for_thread(home: &Path, thread_id: &str) -> anyhow::Result<Vec<String>> {
+    let path = home.join("session_index.jsonl");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter(|line| session_index_line_matches(line, thread_id))
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn global_state_file_backups(home: &Path, thread_id: &str) -> anyhow::Result<Vec<Value>> {
+    let mut backups = Vec::new();
+    for relative_path in GLOBAL_STATE_RELATIVE_PATHS {
+        let path = home.join(relative_path);
+        if !path.is_file() {
+            continue;
+        }
+        let original = fs::read(&path)?;
+        let mut value: Value = serde_json::from_slice(&original)?;
+        if remove_thread_references_from_value(&mut value, thread_id) == 0 {
+            continue;
+        }
+        let cleaned = serde_json::to_vec_pretty(&value)?;
+        backups.push(json!({
+            "relative_path": relative_path,
+            "original_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                original,
+            ),
+            "cleaned_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                cleaned,
+            ),
+        }));
+    }
+    Ok(backups)
+}
+
+fn reference_database_backups(
+    home: &Path,
+    thread_id: &str,
+    primary_db_path: &Path,
+) -> anyhow::Result<Vec<Value>> {
+    let mut backups = Vec::new();
+    for db_path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(home) {
+        if !db_path.is_file() || paths_refer_to_same_file(&db_path, primary_db_path) {
+            continue;
+        }
+        let db = Connection::open(&db_path)?;
+        let mut tables = Map::new();
+        for (table, column) in THREAD_REFERENCE_TABLES {
+            if !has_table(&db, table)? || !has_columns(&db, table, &[*column])? {
+                continue;
+            }
+            let rows = select_dicts(
+                &db,
+                &format!("SELECT * FROM {table} WHERE {column} = ?1"),
+                &[&thread_id],
+            )?;
+            if !rows.is_empty() {
+                tables.insert((*table).to_string(), Value::Array(rows));
+            }
+        }
+        if !tables.is_empty() {
+            backups.push(json!({
+                "source_db": db_path,
+                "tables": tables,
+            }));
+        }
+    }
+    Ok(backups)
+}
+
+fn remove_thread_references_from_value(value: &mut Value, thread_id: &str) -> usize {
+    match value {
+        Value::Array(items) => {
+            let mut removed = 0;
+            let mut kept = Vec::with_capacity(items.len());
+            for mut item in items.drain(..) {
+                if item.as_str() == Some(thread_id) {
+                    removed += 1;
+                    continue;
+                }
+                removed += remove_thread_references_from_value(&mut item, thread_id);
+                kept.push(item);
+            }
+            *items = kept;
+            removed
+        }
+        Value::Object(object) => {
+            let mut removed = 0;
+            let mut kept = Map::new();
+            for (key, mut item) in std::mem::take(object) {
+                if thread_reference_key_matches(&key, thread_id) {
+                    removed += 1;
+                    continue;
+                }
+                removed += remove_thread_references_from_value(&mut item, thread_id);
+                kept.insert(key, item);
+            }
+            *object = kept;
+            removed
+        }
+        _ => 0,
+    }
+}
+
+fn thread_reference_key_matches(key: &str, thread_id: &str) -> bool {
+    key == thread_id
+        || key.ends_with(&format!(":{thread_id}"))
+        || key.ends_with(&format!("%3A{thread_id}"))
+}
+
+fn infer_codex_home_from_paths(paths: &[PathBuf]) -> Option<PathBuf> {
+    let default_home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let default_paths =
+        codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(&default_home);
+    if paths.iter().any(|path| {
+        default_paths
+            .iter()
+            .any(|candidate| paths_refer_to_same_file(path, candidate))
+    }) {
+        return Some(default_home);
+    }
+    paths
+        .iter()
+        .find_map(|path| infer_structural_codex_home_from_db_path(path))
+}
+
+fn infer_codex_home_from_db_path(path: &Path) -> Option<PathBuf> {
+    infer_codex_home_from_paths(&[path.to_path_buf()])
+}
+
+fn infer_structural_codex_home_from_db_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("sqlite") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    (path.file_name().and_then(|name| name.to_str()) == Some("state_5.sqlite"))
+        .then(|| parent.to_path_buf())
+}
+
+fn extend_unique_paths(paths: &mut Vec<PathBuf>, additions: impl IntoIterator<Item = PathBuf>) {
+    for path in additions {
+        if !paths
+            .iter()
+            .any(|candidate| paths_refer_to_same_file(candidate, &path))
+        {
+            paths.push(path);
+        }
+    }
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SQLiteStorageAdapter {
     db_path: PathBuf,
     backup_store: BackupStore,
     allowed_db_paths: Vec<PathBuf>,
+    codex_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +494,40 @@ enum SchemaKind {
     GenericSessions,
     CodexThreads,
     CodexAutomationRuns,
+}
+
+fn codex_thread_filter(db: &Connection) -> anyhow::Result<String> {
+    let mut subagent_filters = Vec::new();
+    let explicit_user = if has_columns(db, "threads", &["thread_source"])? {
+        Some("LOWER(TRIM(COALESCE(threads.thread_source, ''))) = 'user'")
+    } else {
+        None
+    };
+    if has_table(db, "thread_spawn_edges")?
+        && has_columns(db, "thread_spawn_edges", &["child_thread_id"])?
+    {
+        let relation =
+            "NOT EXISTS (SELECT 1 FROM thread_spawn_edges e WHERE e.child_thread_id = threads.id)";
+        subagent_filters.push(match explicit_user {
+            Some(user) => format!("({user} OR {relation})"),
+            None => relation.to_string(),
+        });
+    }
+    if has_table(db, "agent_job_items")?
+        && has_columns(db, "agent_job_items", &["assigned_thread_id"])?
+    {
+        let relation =
+            "NOT EXISTS (SELECT 1 FROM agent_job_items j WHERE j.assigned_thread_id = threads.id)";
+        subagent_filters.push(match explicit_user {
+            Some(user) => format!("({user} OR {relation})"),
+            None => relation.to_string(),
+        });
+    }
+    Ok(if subagent_filters.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", subagent_filters.join(" AND "))
+    })
 }
 
 fn sqlite_limit(limit: usize) -> i64 {
@@ -337,10 +559,19 @@ impl ToSql for OwnedSqlValue {
 impl SQLiteStorageAdapter {
     pub fn new(db_path: impl Into<PathBuf>, backup_store: BackupStore) -> Self {
         let db_path = db_path.into();
+        let codex_home = infer_codex_home_from_db_path(&db_path);
+        let mut allowed_db_paths = vec![db_path.clone()];
+        if let Some(home) = codex_home.as_deref() {
+            extend_unique_paths(
+                &mut allowed_db_paths,
+                codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(home),
+            );
+        }
         Self {
-            allowed_db_paths: vec![db_path.clone()],
+            allowed_db_paths,
             db_path,
             backup_store,
+            codex_home,
         }
     }
 
@@ -350,6 +581,16 @@ impl SQLiteStorageAdapter {
                 self.allowed_db_paths.push(db_path);
             }
         }
+        self
+    }
+
+    pub fn with_codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
+        let codex_home = codex_home.into();
+        extend_unique_paths(
+            &mut self.allowed_db_paths,
+            codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(&codex_home),
+        );
+        self.codex_home = Some(codex_home);
         self
     }
 
@@ -415,9 +656,11 @@ impl SQLiteStorageAdapter {
             "NULL"
         };
         let rollout_path = optional_column_expression(&columns, "rollout_path", "''");
+        let child_thread_filter = codex_thread_filter(db)?;
         let sql = format!(
             "SELECT id, {title}, {cwd}, {model_provider}, {archived}, {updated_at_ms}, {rollout_path}
              FROM threads
+             {child_thread_filter}
              ORDER BY COALESCE({updated_at_ms}, 0) DESC, id DESC
              LIMIT ?1"
         );
@@ -483,7 +726,12 @@ impl SQLiteStorageAdapter {
         let result = (|| -> anyhow::Result<DeleteResult> {
             let backups = undo_backups(&self.backup_store, token)?;
             let session_id = backups[0]["session_id"].as_str().unwrap_or("").to_string();
-            restore_backups(&backups, &self.db_path, &self.allowed_db_paths)?;
+            restore_backups(
+                &backups,
+                &self.db_path,
+                &self.allowed_db_paths,
+                self.codex_home.as_deref(),
+            )?;
             Ok(DeleteResult {
                 status: DeleteStatus::Undone,
                 session_id,
@@ -578,6 +826,59 @@ impl SQLiteStorageAdapter {
                 "history": []
             })
         })
+    }
+
+    fn prepare_thread_reference_backup(
+        &self,
+        thread_id: &str,
+        primary_tables: &mut Map<String, Value>,
+    ) -> anyhow::Result<()> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Ok(());
+        };
+
+        let session_index_lines = session_index_lines_for_thread(home, thread_id)?;
+        if !session_index_lines.is_empty() {
+            primary_tables.insert(
+                "__session_index".to_string(),
+                Value::Array(session_index_lines.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        let global_state_files = global_state_file_backups(home, thread_id)?;
+        if !global_state_files.is_empty() {
+            primary_tables.insert(
+                "__global_state_files".to_string(),
+                Value::Array(global_state_files),
+            );
+        }
+        let reference_databases = reference_database_backups(home, thread_id, &self.db_path)?;
+        if !reference_databases.is_empty() {
+            primary_tables.insert(
+                "__reference_databases".to_string(),
+                Value::Array(reference_databases),
+            );
+        }
+        Ok(())
+    }
+
+    fn cleanup_thread_references_after_delete(
+        &self,
+        thread_id: &str,
+        undo_token: &str,
+        backup_path: Option<&Path>,
+    ) -> Option<DeleteResult> {
+        let home = self.codex_home.as_deref()?;
+        cleanup_thread_reference_state_for_home(home, thread_id)
+            .err()
+            .map(|error| {
+                failed_with_undo(
+                    thread_id,
+                    format!("本地会话已删除，但引用状态清理失败：{error}"),
+                    undo_token,
+                    backup_path,
+                )
+            })
     }
 
     fn delete_generic_session(
@@ -688,10 +989,13 @@ impl SQLiteStorageAdapter {
         if !file_backups.is_empty() {
             tables.insert("__files".to_string(), Value::Array(file_backups.clone()));
         }
+        self.prepare_thread_reference_backup(&thread_id, &mut tables)?;
         let token =
             self.backup_store
                 .write_backup(&thread_id, &self.db_path, Value::Object(tables))?;
         let backup_path = self.backup_store.path_for(&token);
+        let undo_token = token.clone();
+        let bundled_backup_path = Some(backup_path.as_path());
         let delete_result = (|| -> anyhow::Result<()> {
             let tx = db.transaction()?;
             delete_related_rows(&tx, "thread_dynamic_tools", "thread_id = ?1", &[&thread_id])?;
@@ -719,8 +1023,8 @@ impl SQLiteStorageAdapter {
             return Ok(failed_with_undo(
                 &thread_id,
                 err.to_string(),
-                &token,
-                Some(&backup_path),
+                &undo_token,
+                bundled_backup_path,
             ));
         }
         let mut file_errors = Vec::new();
@@ -741,11 +1045,22 @@ impl SQLiteStorageAdapter {
                     "本地数据库已删除，但文件删除失败：{}",
                     file_errors.join("; ")
                 ),
-                undo_token: Some(token.clone()),
-                backup_path: Some(backup_path.to_string_lossy().to_string()),
+                undo_token: Some(undo_token),
+                backup_path: bundled_backup_path.map(|path| path.to_string_lossy().to_string()),
             });
         }
-        Ok(local_deleted(&thread_id, &token, &backup_path))
+        if let Some(result) = self.cleanup_thread_references_after_delete(
+            &thread_id,
+            &undo_token,
+            bundled_backup_path,
+        ) {
+            return Ok(result);
+        }
+        Ok(local_deleted_with_undo(
+            &thread_id,
+            &undo_token,
+            bundled_backup_path,
+        ))
     }
 
     fn delete_codex_automation_run(
@@ -779,10 +1094,13 @@ impl SQLiteStorageAdapter {
                 "Thread not found in local storage".to_string(),
             ));
         }
+        self.prepare_thread_reference_backup(&thread_id, &mut tables)?;
         let token =
             self.backup_store
                 .write_backup(&thread_id, &self.db_path, Value::Object(tables))?;
         let backup_path = self.backup_store.path_for(&token);
+        let undo_token = token.clone();
+        let bundled_backup_path = Some(backup_path.as_path());
         let delete_result = (|| -> anyhow::Result<()> {
             let tx = db.transaction()?;
             delete_related_rows(&tx, "automation_runs", "thread_id = ?1", &[&thread_id])?;
@@ -794,11 +1112,22 @@ impl SQLiteStorageAdapter {
             return Ok(failed_with_undo(
                 &thread_id,
                 err.to_string(),
-                &token,
-                Some(&backup_path),
+                &undo_token,
+                bundled_backup_path,
             ));
         }
-        Ok(local_deleted(&thread_id, &token, &backup_path))
+        if let Some(result) = self.cleanup_thread_references_after_delete(
+            &thread_id,
+            &undo_token,
+            bundled_backup_path,
+        ) {
+            return Ok(result);
+        }
+        Ok(local_deleted_with_undo(
+            &thread_id,
+            &undo_token,
+            bundled_backup_path,
+        ))
     }
 }
 
@@ -825,12 +1154,20 @@ fn failed(session_id: &str, message: String) -> DeleteResult {
 }
 
 fn local_deleted(session_id: &str, token: &str, backup_path: &Path) -> DeleteResult {
+    local_deleted_with_undo(session_id, token, Some(backup_path))
+}
+
+fn local_deleted_with_undo(
+    session_id: &str,
+    undo_token: &str,
+    backup_path: Option<&Path>,
+) -> DeleteResult {
     DeleteResult {
         status: DeleteStatus::LocalDeleted,
         session_id: session_id.to_string(),
         message: "已从本地存储删除".to_string(),
-        undo_token: Some(token.to_string()),
-        backup_path: Some(backup_path.to_string_lossy().to_string()),
+        undo_token: Some(undo_token.to_string()),
+        backup_path: backup_path.map(|path| path.to_string_lossy().to_string()),
     }
 }
 
@@ -958,8 +1295,7 @@ fn normalize_codex_thread_id(session_id: &str) -> String {
 }
 
 fn undo_backups(backup_store: &BackupStore, token: &str) -> anyhow::Result<Vec<Value>> {
-    let tokens =
-        serde_json::from_str::<Vec<String>>(token).unwrap_or_else(|_| vec![token.to_string()]);
+    let tokens = parse_undo_tokens(token);
     if tokens.is_empty() {
         anyhow::bail!("empty undo token");
     }
@@ -969,10 +1305,23 @@ fn undo_backups(backup_store: &BackupStore, token: &str) -> anyhow::Result<Vec<V
         .collect()
 }
 
+fn parse_undo_tokens(token: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(token).unwrap_or_else(|_| vec![token.to_string()])
+}
+
+fn format_undo_tokens(tokens: &[String]) -> String {
+    if tokens.len() == 1 {
+        tokens[0].clone()
+    } else {
+        json!(tokens).to_string()
+    }
+}
+
 fn restore_backups(
     backups: &[Value],
     fallback_db_path: &Path,
     allowed_db_paths: &[PathBuf],
+    codex_home: Option<&Path>,
 ) -> anyhow::Result<()> {
     for backup in backups {
         let Some(tables) = backup["tables"].as_object() else {
@@ -983,6 +1332,9 @@ fn restore_backups(
         validate_restore_tables(tables)?;
         detect_restore_conflicts(&db, tables)?;
         detect_file_restore_conflicts(tables)?;
+        preflight_session_index_restore(tables, codex_home)?;
+        preflight_global_state_restore(tables, codex_home)?;
+        preflight_reference_database_restore(tables, fallback_db_path, allowed_db_paths)?;
         preflight_restore_rows(&db, tables)?;
     }
 
@@ -1005,6 +1357,13 @@ fn restore_backups(
                 };
                 let bytes =
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)?;
+                if Path::new(path).is_file() {
+                    let current = fs::read(path)?;
+                    if current == bytes {
+                        continue;
+                    }
+                    anyhow::bail!("restore conflict: file changed after preflight: {path}");
+                }
                 if let Some(parent) = Path::new(path).parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -1012,7 +1371,257 @@ fn restore_backups(
             }
         }
     }
+
+    for backup in backups {
+        let Some(tables) = backup["tables"].as_object() else {
+            continue;
+        };
+        restore_session_index(tables, codex_home)?;
+        restore_global_state_files(tables, codex_home)?;
+        restore_reference_databases(tables, fallback_db_path, allowed_db_paths)?;
+    }
     Ok(())
+}
+
+fn preflight_reference_database_restore(
+    tables: &Map<String, Value>,
+    fallback_db_path: &Path,
+    allowed_db_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    let Some(backups) = tables
+        .get("__reference_databases")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for backup in backups {
+        let Some(reference_tables) = backup.get("tables").and_then(Value::as_object) else {
+            anyhow::bail!("invalid reference database backup");
+        };
+        validate_reference_restore_tables(reference_tables)?;
+        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+        let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        detect_restore_conflicts(&db, reference_tables)?;
+        preflight_restore_rows(&db, reference_tables)?;
+    }
+    Ok(())
+}
+
+fn restore_reference_databases(
+    tables: &Map<String, Value>,
+    fallback_db_path: &Path,
+    allowed_db_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    let Some(backups) = tables
+        .get("__reference_databases")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for backup in backups {
+        let Some(reference_tables) = backup.get("tables").and_then(Value::as_object) else {
+            anyhow::bail!("invalid reference database backup");
+        };
+        validate_reference_restore_tables(reference_tables)?;
+        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+        let mut db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let tx = db.transaction()?;
+        restore_rows(&tx, reference_tables)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn validate_reference_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
+    for table in tables.keys() {
+        if !THREAD_REFERENCE_TABLES
+            .iter()
+            .any(|(allowed, _)| table == allowed)
+        {
+            anyhow::bail!("unknown reference restore table: {table}");
+        }
+    }
+    Ok(())
+}
+
+fn preflight_session_index_restore(
+    tables: &Map<String, Value>,
+    codex_home: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(entries) = tables.get("__session_index").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let home = codex_home
+        .ok_or_else(|| anyhow::anyhow!("Codex home is required to restore session_index.jsonl"))?;
+    let path = home.join("session_index.jsonl");
+    if path.exists() && !path.is_file() {
+        anyhow::bail!("session_index.jsonl restore path is not a file");
+    }
+    if path.is_file() {
+        let _ = String::from_utf8(fs::read(&path)?)?;
+    }
+    for entry in entries {
+        let line = entry
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid session_index.jsonl backup entry"))?;
+        if session_index_line_id(line).is_none() {
+            anyhow::bail!("invalid session_index.jsonl backup line");
+        }
+    }
+    Ok(())
+}
+
+fn restore_session_index(
+    tables: &Map<String, Value>,
+    codex_home: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(entries) = tables.get("__session_index").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let home = codex_home
+        .ok_or_else(|| anyhow::anyhow!("Codex home is required to restore session_index.jsonl"))?;
+    let path = home.join("session_index.jsonl");
+    let mut text = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut existing_ids = text
+        .lines()
+        .filter_map(session_index_line_id)
+        .collect::<HashSet<_>>();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let mut expected_ids = Vec::new();
+    let mut changed = false;
+    for entry in entries {
+        let line = entry
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid session_index.jsonl backup entry"))?;
+        let id = session_index_line_id(line)
+            .ok_or_else(|| anyhow::anyhow!("invalid session_index.jsonl backup line"))?;
+        expected_ids.push(id.clone());
+        if existing_ids.insert(id) {
+            text.push_str(line);
+            text.push('\n');
+            changed = true;
+        }
+    }
+    if changed {
+        codex_plus_core::settings::atomic_write(&path, text.as_bytes())?;
+    }
+    let restored = fs::read_to_string(&path)?;
+    let restored_ids = restored
+        .lines()
+        .filter_map(session_index_line_id)
+        .collect::<HashSet<_>>();
+    if expected_ids.iter().any(|id| !restored_ids.contains(id)) {
+        anyhow::bail!("session_index.jsonl restore verification failed");
+    }
+    Ok(())
+}
+
+fn session_index_line_id(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn preflight_global_state_restore(
+    tables: &Map<String, Value>,
+    codex_home: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(entries) = tables.get("__global_state_files").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let home = codex_home
+        .ok_or_else(|| anyhow::anyhow!("Codex home is required to restore global state"))?;
+    for entry in entries {
+        let (path, original, cleaned) = decode_global_state_backup(home, entry)?;
+        let current = fs::read(&path)?;
+        if current != original && current != cleaned {
+            anyhow::bail!(
+                "restore conflict: Codex global state changed after deletion: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn restore_global_state_files(
+    tables: &Map<String, Value>,
+    codex_home: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(entries) = tables.get("__global_state_files").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let home = codex_home
+        .ok_or_else(|| anyhow::anyhow!("Codex home is required to restore global state"))?;
+    for entry in entries {
+        let (path, original, cleaned) = decode_global_state_backup(home, entry)?;
+        let current = fs::read(&path)?;
+        if current == original {
+            continue;
+        }
+        if current != cleaned {
+            anyhow::bail!(
+                "restore conflict: Codex global state changed after deletion: {}",
+                path.display()
+            );
+        }
+        codex_plus_core::settings::atomic_write(&path, &original)?;
+        if fs::read(&path)? != original {
+            anyhow::bail!(
+                "Codex global state restore verification failed: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn decode_global_state_backup(
+    home: &Path,
+    entry: &Value,
+) -> anyhow::Result<(PathBuf, Vec<u8>, Vec<u8>)> {
+    let relative_path = entry
+        .get("relative_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid global state backup path"))?;
+    if !GLOBAL_STATE_RELATIVE_PATHS.contains(&relative_path) {
+        anyhow::bail!("unexpected global state backup path: {relative_path}");
+    }
+    let decode = |key: &str| -> anyhow::Result<Vec<u8>> {
+        let value = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("invalid global state backup content"))?;
+        Ok(base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            value,
+        )?)
+    };
+    Ok((
+        home.join(relative_path),
+        decode("original_b64")?,
+        decode("cleaned_b64")?,
+    ))
 }
 
 fn preflight_restore_rows(db: &Connection, tables: &Map<String, Value>) -> anyhow::Result<()> {
@@ -1038,6 +1647,13 @@ fn restore_rows(db: &Connection, tables: &Map<String, Value>) -> anyhow::Result<
             if let Some(row) = row.as_object() {
                 if table == "agent_job_items" && update_existing_agent_job_item(db, row)? {
                     continue;
+                }
+                match restore_row_state(db, table, row)? {
+                    RestoreRowState::Matching => continue,
+                    RestoreRowState::Conflict => {
+                        anyhow::bail!("restore conflict: {table} row differs from backup")
+                    }
+                    RestoreRowState::Missing => {}
                 }
                 insert_row(db, table, row)?;
             }
@@ -1143,6 +1759,9 @@ fn validate_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
         "automation_runs",
         "inbox_items",
         "__files",
+        "__session_index",
+        "__global_state_files",
+        "__reference_databases",
     ];
     for table in tables.keys() {
         if !allowed.contains(&table.as_str()) {
@@ -1164,22 +1783,44 @@ fn detect_restore_conflicts(db: &Connection, tables: &Map<String, Value>) -> any
             let Some(row) = row.as_object() else {
                 continue;
             };
-            if restore_row_conflicts(db, table, row)? {
-                anyhow::bail!("restore conflict: {table} row already exists");
+            if table == "agent_job_items" {
+                continue;
+            }
+            if matches!(
+                restore_row_state(db, table, row)?,
+                RestoreRowState::Conflict
+            ) {
+                anyhow::bail!("restore conflict: {table} row differs from backup");
             }
         }
     }
     Ok(())
 }
 
-fn restore_row_conflicts(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreRowState {
+    Missing,
+    Matching,
+    Conflict,
+}
+
+fn restore_row_state(
     db: &Connection,
     table: &str,
     row: &Map<String, Value>,
-) -> anyhow::Result<bool> {
-    let key_columns = restore_conflict_key_columns(table, row);
-    if key_columns.is_empty() || !has_table(db, table)? {
-        return Ok(false);
+) -> anyhow::Result<RestoreRowState> {
+    if !has_table(db, table)? {
+        return Ok(RestoreRowState::Missing);
+    }
+    let available_columns = table_columns(db, table)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if row.keys().any(|column| !available_columns.contains(column)) {
+        return Ok(RestoreRowState::Missing);
+    }
+    let key_columns = restore_conflict_key_columns(db, table, row)?;
+    if key_columns.is_empty() {
+        return Ok(RestoreRowState::Missing);
     }
     let where_clause = key_columns
         .iter()
@@ -1189,26 +1830,59 @@ fn restore_row_conflicts(
         .join(" AND ");
     let values = key_columns
         .iter()
-        .map(|column| OwnedSqlValue(json_to_sql_value(&row[*column])))
+        .map(|column| OwnedSqlValue(json_to_sql_value(&row[column])))
         .collect::<Vec<_>>();
     let refs = values
         .iter()
         .map(|value| value as &dyn ToSql)
         .collect::<Vec<_>>();
-    Ok(db
-        .query_row(
-            &format!("SELECT 1 FROM \"{table}\" WHERE {where_clause} LIMIT 1"),
-            refs.as_slice(),
-            |_| Ok(()),
-        )
-        .is_ok())
+    let columns = row.keys().collect::<Vec<_>>();
+    let selected = columns
+        .iter()
+        .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = db.prepare(&format!(
+        "SELECT {selected} FROM \"{table}\" WHERE {where_clause}"
+    ))?;
+    let candidates = statement.query_map(refs.as_slice(), |candidate| {
+        let mut existing = Map::new();
+        for (index, column) in columns.iter().enumerate() {
+            existing.insert(
+                (*column).clone(),
+                sql_value_to_json(candidate.get_ref(index)?),
+            );
+        }
+        Ok(existing)
+    })?;
+    let candidates = candidates.collect::<rusqlite::Result<Vec<_>>>()?;
+    if candidates.is_empty() {
+        Ok(RestoreRowState::Missing)
+    } else if candidates.iter().any(|candidate| candidate == row) {
+        Ok(RestoreRowState::Matching)
+    } else {
+        Ok(RestoreRowState::Conflict)
+    }
 }
 
-fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) -> Vec<&'a String> {
+fn restore_conflict_key_columns(
+    db: &Connection,
+    table: &str,
+    row: &Map<String, Value>,
+) -> anyhow::Result<Vec<String>> {
+    let primary = table_primary_key_columns(db, table)?
+        .into_iter()
+        .filter(|column| row.contains_key(column))
+        .collect::<Vec<_>>();
+    if !primary.is_empty() {
+        return Ok(primary);
+    }
     let wanted: &[&str] = match table {
         "sessions" | "threads" => &["id"],
         "messages" => &["id"],
         "automation_runs" | "inbox_items" => &["thread_id"],
+        "local_thread_catalog" => &["thread_id"],
+        "thread_timeline_ledger" => &["thread_id", "sequence"],
         "thread_dynamic_tools" => &["thread_id", "tool_name"],
         "thread_goals" => &["thread_id", "goal"],
         "thread_spawn_edges" => &["parent_thread_id", "child_thread_id"],
@@ -1217,15 +1891,37 @@ fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) ->
     };
     let keys = wanted
         .iter()
-        .filter_map(|column| row.get_key_value(*column).map(|(key, _)| key))
+        .filter(|column| row.contains_key(**column))
+        .map(|column| (*column).to_string())
         .collect::<Vec<_>>();
     if table == "messages" && keys.is_empty() {
-        row.get_key_value("session_id")
-            .map(|(key, _)| vec![key])
-            .unwrap_or_default()
+        Ok(row
+            .contains_key("session_id")
+            .then(|| vec!["session_id".to_string()])
+            .unwrap_or_default())
     } else {
-        keys
+        Ok(keys)
     }
+}
+
+fn table_primary_key_columns(db: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
+    if !has_table(db, table)? {
+        return Ok(Vec::new());
+    }
+    let mut statement = db.prepare(&format!(
+        "PRAGMA table_info(\"{}\")",
+        table.replace('"', "\"\"")
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+    })?;
+    let mut columns = rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(order, _)| *order > 0)
+        .collect::<Vec<_>>();
+    columns.sort_by_key(|(order, _)| *order);
+    Ok(columns.into_iter().map(|(_, name)| name).collect())
 }
 
 fn detect_file_restore_conflicts(tables: &Map<String, Value>) -> anyhow::Result<()> {
@@ -1239,9 +1935,16 @@ fn detect_file_restore_conflicts(tables: &Map<String, Value>) -> anyhow::Result<
                 anyhow::bail!("unexpected backup file path: {path}");
             }
             if Path::new(path).exists() {
-                anyhow::bail!("restore conflict: file already exists: {path}");
-            }
-            if let Some(content) = file.get("content_b64").and_then(Value::as_str) {
+                let content = file
+                    .get("content_b64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("backup file content is missing: {path}"))?;
+                let expected =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)?;
+                if fs::read(path)? != expected {
+                    anyhow::bail!("restore conflict: file differs from backup: {path}");
+                }
+            } else if let Some(content) = file.get("content_b64").and_then(Value::as_str) {
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)?;
             }
         }
@@ -1311,6 +2014,10 @@ fn update_existing_agent_job_item(
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
         Err(err) => return Err(err.into()),
     };
+    let expected_assignment = row["assigned_thread_id"].as_str().map(ToString::to_string);
+    if current_assignment == expected_assignment {
+        return Ok(true);
+    }
     if current_assignment.is_some() {
         anyhow::bail!("restore conflict: agent_job_items row already assigned");
     }

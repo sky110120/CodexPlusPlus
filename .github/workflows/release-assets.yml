@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to create/update as a draft, e.g. v1.2.48
+        description: Release tag to create/update as a draft, e.g. v1.2.52
         required: true
-        default: v1.2.48
+        default: v1.2.52
       target:
         description: Branch or commit to build and tag
         required: false
@@ -103,7 +103,7 @@ jobs:
   latest-json:
     name: Upload static latest.json
     needs: macos-dmg
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
+    if: ${{ always() && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && needs.macos-dmg.result == 'success')) }}
     runs-on: ubuntu-latest
     steps:
       - name: Generate latest.json

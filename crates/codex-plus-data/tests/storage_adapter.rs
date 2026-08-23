@@ -802,6 +802,108 @@ fn list_local_sessions_reads_codex_threads_ordered_by_update_time() {
 }
 
 #[test]
+fn list_local_sessions_hides_spawned_subagent_threads() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, cwd TEXT, archived INTEGER, updated_at_ms INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'parent.jsonl', 'Parent', '/tmp', 0, 100)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('child', 'child.jsonl', 'Subagent', '/tmp', 0, 200)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES ('parent', 'child')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let sessions = adapter.list_local_sessions().unwrap();
+
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["parent"]
+    );
+}
+
+#[test]
+fn list_local_sessions_keeps_explicit_user_threads_despite_stale_relations() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, cwd TEXT, archived INTEGER, updated_at_ms INTEGER, thread_source TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE agent_job_items (id TEXT PRIMARY KEY, assigned_thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('parent', 'parent.jsonl', 'Parent', '/tmp', 0, 100, 'user')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('user-child', 'user.jsonl', 'User child', '/tmp', 0, 200, 'USER')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('subagent', 'subagent.jsonl', 'Subagent', '/tmp', 0, 300, 'subagent')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_spawn_edges VALUES ('parent', 'user-child'), ('parent', 'subagent')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO agent_job_items VALUES ('job-user', 'user-child'), ('job-subagent', 'subagent')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let sessions = adapter.list_local_sessions().unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["user-child", "parent"]
+    );
+}
+
+#[test]
 fn list_local_sessions_reads_codex_automation_runs_schema() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("codex-dev.db");
@@ -1160,6 +1262,216 @@ fn cleanup_thread_reference_state_removes_catalog_index_and_global_state() {
         state["electron-persisted-atom-state"]["thread-reference-capability:t10"],
         true
     );
+}
+
+#[test]
+fn delete_cleanup_and_undo_restores_session_index_and_global_state() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    let thread_db = sqlite_dir.join("state_5.sqlite");
+    let rollout_path = home.join("rollout.jsonl");
+    fs::write(&rollout_path, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&thread_db, &rollout_path);
+    let catalog_db = sqlite_dir.join("codex-dev.db");
+    let catalog = Connection::open(&catalog_db).unwrap();
+    catalog
+        .execute(
+            "CREATE TABLE local_thread_catalog (thread_id TEXT PRIMARY KEY, display_title TEXT)",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "CREATE TABLE thread_timeline_ledger (thread_id TEXT, sequence INTEGER, payload_json TEXT, PRIMARY KEY(thread_id, sequence))",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO local_thread_catalog VALUES ('t1', 'Codex Thread')",
+            [],
+        )
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO thread_timeline_ledger VALUES ('t1', 1, '{}')",
+            [],
+        )
+        .unwrap();
+    drop(catalog);
+
+    let session_index = home.join("session_index.jsonl");
+    let session_index_before = concat!(
+        "{\"id\":\"t1\",\"thread_name\":\"Codex Thread\"}\n",
+        "{\"id\":\"other\",\"thread_name\":\"Keep\"}\n"
+    );
+    fs::write(&session_index, session_index_before).unwrap();
+
+    let global_state = home.join(".codex-global-state.json");
+    let global_state_before = serde_json::to_string_pretty(&json!({
+        "projectless-thread-ids": ["t1", "other"],
+        "thread-projectless-output-directories": {
+            "t1": "/tmp/t1",
+            "other": "/tmp/other"
+        },
+        "electron-persisted-atom-state": {
+            "thread-reference-capability:t1": true,
+            "thread-reference-capability:t10": true
+        }
+    }))
+    .unwrap();
+    fs::write(&global_state, &global_state_before).unwrap();
+    fs::write(
+        home.join(".codex-global-state.json.bak"),
+        &global_state_before,
+    )
+    .unwrap();
+
+    let backup_store = BackupStore::new(home.join("backups"));
+    let deleted = delete_local_from_paths(
+        vec![thread_db.clone()],
+        backup_store.clone(),
+        &session("local:t1", "Codex Thread"),
+    );
+
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
+    cleanup_thread_reference_state_for_home(home, "local:t1").unwrap();
+    assert_eq!(thread_count(&thread_db, "t1"), 0);
+    assert!(!rollout_path.exists());
+    let catalog = Connection::open(&catalog_db).unwrap();
+    assert_eq!(
+        catalog
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 't1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        catalog
+            .query_row(
+                "SELECT COUNT(*) FROM thread_timeline_ledger WHERE thread_id = 't1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(catalog);
+    assert!(
+        !fs::read_to_string(&session_index)
+            .unwrap()
+            .contains("\"id\":\"t1\"")
+    );
+    let cleaned_state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&global_state).unwrap()).unwrap();
+    assert_eq!(cleaned_state["projectless-thread-ids"], json!(["other"]));
+
+    let restored = SQLiteStorageAdapter::new(&thread_db, backup_store)
+        .undo(deleted.undo_token.as_deref().unwrap());
+
+    assert_eq!(
+        restored.status,
+        DeleteStatus::Undone,
+        "{}",
+        restored.message
+    );
+    assert_eq!(thread_count(&thread_db, "t1"), 1);
+    assert!(rollout_path.exists());
+    let catalog = Connection::open(&catalog_db).unwrap();
+    assert_eq!(
+        catalog
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 't1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .query_row(
+                "SELECT COUNT(*) FROM thread_timeline_ledger WHERE thread_id = 't1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let restored_index = fs::read_to_string(&session_index).unwrap();
+    assert_eq!(restored_index.matches("\"id\":\"t1\"").count(), 1);
+    assert_eq!(restored_index.matches("\"id\":\"other\"").count(), 1);
+    assert_eq!(
+        fs::read_to_string(&global_state).unwrap(),
+        global_state_before
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".codex-global-state.json.bak")).unwrap(),
+        global_state_before
+    );
+
+    let retried = SQLiteStorageAdapter::new(&thread_db, BackupStore::new(home.join("backups")))
+        .with_codex_home(home)
+        .undo(deleted.undo_token.as_deref().unwrap());
+    assert_eq!(retried.status, DeleteStatus::Undone, "{}", retried.message);
+    assert_eq!(thread_count(&thread_db, "t1"), 1);
+    assert_eq!(
+        fs::read_to_string(&session_index)
+            .unwrap()
+            .matches("\"id\":\"t1\"")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn undo_fails_before_restoring_database_when_global_state_changed_after_delete() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    let thread_db = sqlite_dir.join("state_5.sqlite");
+    let rollout_path = home.join("rollout.jsonl");
+    fs::write(&rollout_path, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&thread_db, &rollout_path);
+    let global_state = home.join(".codex-global-state.json");
+    fs::write(
+        &global_state,
+        serde_json::to_string_pretty(&json!({
+            "projectless-thread-ids": ["t1", "other"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let backup_store = BackupStore::new(home.join("backups"));
+    let deleted = delete_local_from_paths(
+        vec![thread_db.clone()],
+        backup_store.clone(),
+        &session("local:t1", "Codex Thread"),
+    );
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
+    fs::write(
+        &global_state,
+        serde_json::to_string_pretty(&json!({
+            "projectless-thread-ids": ["other"],
+            "changed-after-delete": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let restored = SQLiteStorageAdapter::new(&thread_db, backup_store)
+        .undo(deleted.undo_token.as_deref().unwrap());
+
+    assert_eq!(restored.status, DeleteStatus::Failed);
+    assert!(restored.message.contains("global state changed"));
+    assert_eq!(thread_count(&thread_db, "t1"), 0);
+    assert!(!rollout_path.exists());
 }
 
 #[test]

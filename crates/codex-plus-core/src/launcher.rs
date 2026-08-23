@@ -343,12 +343,8 @@ where
                 );
             }
         }
-        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
-            || remote_control_provider_proxy_enabled(&settings);
-        if protocol_proxy_enabled {
-            helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
-        }
-        if settings.enhancements_enabled || protocol_proxy_enabled {
+        helper_port = helper_port_for_settings(&settings, helper_port);
+        if helper_required_for_settings(&settings) {
             match hooks.helper_status(helper_port).await {
                 HelperStatus::Compatible => {}
                 HelperStatus::Missing => {
@@ -439,13 +435,23 @@ where
     }
 }
 
-fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
+fn helper_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
+    let profile = settings.active_relay_profile();
     settings.active_relay_uses_protocol_proxy()
+        || (profile.relay_mode == crate::settings::RelayMode::Official
+            && profile.official_mix_api_key)
 }
 
-fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
-    let profile = settings.active_relay_profile();
-    profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
+pub fn helper_required_for_settings(settings: &BackendSettings) -> bool {
+    settings.enhancements_enabled || helper_protocol_proxy_enabled(settings)
+}
+
+pub fn helper_port_for_settings(settings: &BackendSettings, selected_port: u16) -> u16 {
+    if helper_protocol_proxy_enabled(settings) {
+        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    } else {
+        selected_port
+    }
 }
 
 fn select_native_menu_inspector_port(debug_port: u16) -> u16 {

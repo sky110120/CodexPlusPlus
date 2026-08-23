@@ -1225,14 +1225,15 @@ impl SettingsStore {
         lock.lock_exclusive()
             .with_context(|| format!("failed to lock settings {}", self.path.display()))?;
         let result = action();
-        let unlock_result = FileExt::unlock(&lock)
-            .with_context(|| format!("failed to unlock settings {}", self.path.display()));
-        match (result, unlock_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        finish_locked_action(result, FileExt::unlock(&lock))
     }
+}
+
+fn finish_locked_action<T>(
+    action_result: anyhow::Result<T>,
+    _unlock_result: std::io::Result<()>,
+) -> anyhow::Result<T> {
+    action_result
 }
 
 fn settings_lock_path(path: &Path) -> PathBuf {
@@ -1830,16 +1831,27 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
 fn temp_path_for(path: &Path) -> PathBuf {
     let mut temp_path = path.to_path_buf();
     let extension = path.extension().and_then(|value| value.to_str());
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let suffix = format!("tmp.{}.{}", std::process::id(), id);
     temp_path.set_extension(match extension {
-        Some(extension) => format!("{extension}.tmp"),
-        None => "tmp".to_string(),
+        Some(extension) => format!("{extension}.{suffix}"),
+        None => suffix,
     });
     temp_path
 }
 
+static NEXT_ATOMIC_WRITE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_settings_write_is_not_rejected_by_unlock_failure() {
+        let result = finish_locked_action(Ok(42), Err(std::io::Error::other("unlock failed")));
+
+        assert_eq!(result.unwrap(), 42);
+    }
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1872,6 +1884,18 @@ mod tests {
                 .starts_with("settings.json.tmp.")
         }));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_temp_paths_are_unique_per_process() {
+        let path = Path::new("settings.json");
+
+        let first = temp_path_for(path);
+        let second = temp_path_for(path);
+
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains("settings.json.tmp."));
+        assert!(second.to_string_lossy().contains("settings.json.tmp."));
     }
 
     #[test]

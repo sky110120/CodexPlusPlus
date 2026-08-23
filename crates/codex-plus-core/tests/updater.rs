@@ -1,8 +1,88 @@
 use codex_plus_core::update::{
-    Release, download_asset_to, is_newer_version, parse_version_tag, release_from_github_payload,
-    release_from_latest_json_payload, safe_asset_name, select_update_asset,
+    DEFAULT_LATEST_JSON_URL, Release, UPSTREAM_LATEST_JSON_URL, download_asset_to,
+    fetch_latest_release_with_fallback, is_newer_version, parse_version_tag,
+    release_from_github_payload, release_from_latest_json_payload, safe_asset_name,
+    select_update_asset,
 };
 use serde_json::json;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[test]
+fn updater_prefers_fork_release_metadata_and_keeps_upstream_fallback() {
+    assert_eq!(
+        DEFAULT_LATEST_JSON_URL,
+        "https://github.com/sky110120/CodexPlusPlus/releases/latest/download/latest.json"
+    );
+    assert_eq!(
+        UPSTREAM_LATEST_JSON_URL,
+        "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json"
+    );
+}
+
+#[tokio::test]
+async fn updater_consumes_fork_metadata_without_calling_fallback() {
+    let fork = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/latest.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "version": "v1.2.51",
+            "url": "https://github.com/sky110120/CodexPlusPlus/releases/tag/v1.2.51",
+            "body": "fork release",
+            "assets": []
+        })))
+        .expect(1)
+        .mount(&fork)
+        .await;
+
+    let release = fetch_latest_release_with_fallback(
+        &format!("{}/latest.json", fork.uri()),
+        "http://127.0.0.1:9/latest.json",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(release.version, "v1.2.51");
+    assert_eq!(release.body, "fork release");
+}
+
+#[tokio::test]
+async fn updater_uses_upstream_fallback_as_non_installable_information() {
+    let fork = MockServer::start().await;
+    let upstream = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/latest.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&fork)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/latest.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "version": "v1.2.51",
+            "url": "https://github.com/BigPizzaV3/CodexPlusPlus/releases/tag/v1.2.51",
+            "body": "upstream fallback",
+            "assets": []
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let release = fetch_latest_release_with_fallback(
+        &format!("{}/latest.json", fork.uri()),
+        &format!("{}/latest.json", upstream.uri()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(release.version, "v1.2.51");
+    assert!(release.body.contains("仅显示上游版本信息"));
+    assert!(release.body.contains("upstream fallback"));
+    assert_eq!(release.asset_name, None);
+    assert_eq!(release.asset_url, None);
+}
 
 #[test]
 fn parse_version_tag_accepts_prefix_and_suffix() {
@@ -28,7 +108,7 @@ fn github_payload_selects_platform_installer() {
             {"name": "source.zip", "browser_download_url": "https://example.test/source.zip"},
             {"name": "codex-plus-plus-manager.exe", "browser_download_url": "https://example.test/manager.exe"},
             {"name": "CodexPlusPlus_1.0.9_x64-setup.exe", "browser_download_url": "https://example.test/setup.exe"},
-            {"name": "CodexPlusPlus_1.0.9_x64.dmg", "browser_download_url": "https://example.test/app.dmg"}
+            {"name": "CodexPlusPlus_1.0.9.dmg", "browser_download_url": "https://example.test/app.dmg"}
         ]
     }))
     .unwrap();
@@ -42,7 +122,7 @@ fn github_payload_selects_platform_installer() {
     } else if cfg!(target_os = "macos") {
         assert_eq!(
             release.asset_name.as_deref(),
-            Some("CodexPlusPlus_1.0.9_x64.dmg")
+            Some("CodexPlusPlus_1.0.9.dmg")
         );
     } else {
         assert_eq!(release.asset_name.as_deref(), None);
@@ -58,7 +138,7 @@ fn latest_json_payload_selects_platform_installer_without_github_api_shape() {
         "assets": [
             {"name": "source.zip", "url": "https://example.test/source.zip"},
             {"name": "CodexPlusPlus-1.1.6-windows-x64-setup.exe", "url": "https://example.test/setup.exe"},
-            {"name": "CodexPlusPlus-1.1.6-macos-x64.dmg", "url": "https://example.test/app.dmg"}
+            {"name": "CodexPlusPlus-1.1.6-macos.dmg", "url": "https://example.test/app.dmg"}
         ]
     }))
     .unwrap();
@@ -73,7 +153,7 @@ fn latest_json_payload_selects_platform_installer_without_github_api_shape() {
     } else if cfg!(target_os = "macos") {
         assert_eq!(
             release.asset_name.as_deref(),
-            Some("CodexPlusPlus-1.1.6-macos-x64.dmg")
+            Some("CodexPlusPlus-1.1.6-macos.dmg")
         );
     } else {
         assert_eq!(release.asset_name.as_deref(), None);
@@ -96,7 +176,7 @@ fn asset_selection_prefers_current_platform_artifacts() {
             "https://example.test/setup.exe".to_string(),
         ),
         (
-            "CodexPlusPlus_1.0.9_x64.dmg".to_string(),
+            "CodexPlusPlus_1.0.9.dmg".to_string(),
             "https://example.test/app.dmg".to_string(),
         ),
     ];
@@ -106,7 +186,7 @@ fn asset_selection_prefers_current_platform_artifacts() {
         assert_eq!(selected.name, "CodexPlusPlus_1.0.9_x64-setup.exe");
     } else if cfg!(target_os = "macos") {
         let selected = select_update_asset(&assets).unwrap();
-        assert_eq!(selected.name, "CodexPlusPlus_1.0.9_x64.dmg");
+        assert_eq!(selected.name, "CodexPlusPlus_1.0.9.dmg");
     } else {
         assert!(select_update_asset(&assets).is_none());
     }
@@ -144,6 +224,24 @@ fn asset_selection_distinguishes_x64_and_arm64_macos_dmgs() {
         // Non-macOS platforms should not pick either macOS DMG.
         assert!(select_update_asset(&assets).is_none());
     }
+}
+
+#[test]
+fn asset_selection_rejects_explicit_foreign_macos_architecture() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let foreign_arch = match std::env::consts::ARCH {
+        "x86_64" => "arm64",
+        "aarch64" => "x64",
+        other => panic!("unexpected target arch in test: {other}"),
+    };
+    let assets = vec![(
+        format!("CodexPlusPlus-1.2.52-macos-{foreign_arch}.dmg"),
+        format!("https://example.test/app-{foreign_arch}.dmg"),
+    )];
+
+    assert!(select_update_asset(&assets).is_none());
 }
 
 #[test]
