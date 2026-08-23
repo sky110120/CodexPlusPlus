@@ -110,11 +110,14 @@ import {
   type DreamSkinImageResult,
   type DreamSkinMarketResult,
   type DreamSkinMarketTheme,
+  type DreamSkinRestoreResult,
+  type DreamSkinThemeImportResult,
   type DreamSkinRuntimeResult,
   type DreamSkinThemeActivationResult,
   type DreamSkinThemeConfig,
   type DreamSkinThemeDraft,
   type DreamSkinThemeDraftResult,
+  type DreamSkinThemeSaveResult,
   type DreamSkinThemeLibrary,
   type DreamSkinThemeLibraryResult,
   type DreamSkinThemeSummary,
@@ -140,6 +143,7 @@ type PendingDreamSkinCommunityResult = CommandResult<{ versionId: string }>;
 type PendingDreamSkinRestart = {
   currentThemeKey: string | null;
   currentThemeName: string;
+  currentMayStillBeRunning?: boolean;
   pendingThemeKey: string;
   pendingThemeName: string;
 };
@@ -849,7 +853,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink },
   { id: "userScripts", label: t("脚本市场"), icon: FileCode2 },
-  { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
+  // 推荐内容菜单暂时隐藏，保留代码便于恢复
+  // { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
   { id: "maintenance", label: t("安装维护"), icon: Wrench },
   { id: "about", label: t("关于"), icon: Info },
   { id: "settings", label: t("设置"), icon: Settings },
@@ -867,7 +872,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
   {
     label: t("系统"),
-    routes: ["recommendations", "maintenance", "about", "settings"],
+    routes: [/* "recommendations", */ "maintenance", "about", "settings"],
     placement: "bottom",
   },
 ];
@@ -1010,12 +1015,18 @@ export function App() {
   const [dreamSkinMarket, setDreamSkinMarket] = useState<DreamSkinMarketResult | null>(null);
   const [dreamSkinCommunity, setDreamSkinCommunity] = useState<DreamSkinCommunityResult | null>(null);
   const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
-  const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
+  const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("");
   const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
   const [dreamSkinThemeDraft, setDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
   const [pendingDreamSkinRestart, setPendingDreamSkinRestart] = useState<PendingDreamSkinRestart | null>(null);
   const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
-  const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
+  const dreamSkinDraftGuardResolveRef = useRef<((proceed: boolean) => void) | null>(null);
+  const dreamSkinSelectionInitializedRef = useRef(false);
+  const dreamSkinLibraryRequestRef = useRef(0);
+  const dreamSkinDraftReplacementRequestRef = useRef(0);
+  const dreamSkinSelectedThemeRef = useRef("");
+  const dreamSkinThemeDraftRef = useRef<DreamSkinThemeDraft | null>(null);
+  const [dreamSkinRestoreDecision, setDreamSkinRestoreDecision] = useState<DreamSkinRestoreResult | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
@@ -1063,6 +1074,11 @@ export function App() {
   );
 
   const call = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
+
+  const saveSettingsArgs = (next: BackendSettings) => ({
+    settings: next,
+    baseSettings: settings ? normalizeSettings(settings.settings) : undefined,
+  });
 
   const logDiagnostic = (event: string, detail: Record<string, unknown> = {}) => {
     void invoke("write_diagnostic_event", { event, detail }).catch(() => {});
@@ -1402,28 +1418,99 @@ export function App() {
     key: string,
     draft: DreamSkinThemeDraft,
   ) => {
+    dreamSkinSelectionInitializedRef.current = true;
+    dreamSkinDraftReplacementRequestRef.current += 1;
+    dreamSkinSelectedThemeRef.current = key;
+    dreamSkinThemeDraftRef.current = draft;
     setSelectedDreamSkinTheme(key);
     setSavedDreamSkinThemeDraft(draft);
     setDreamSkinThemeDraft(draft);
   };
 
+  const clearDreamSkinDraftSelection = () => {
+    dreamSkinSelectionInitializedRef.current = true;
+    dreamSkinDraftReplacementRequestRef.current += 1;
+    dreamSkinSelectedThemeRef.current = "";
+    dreamSkinThemeDraftRef.current = null;
+    setSelectedDreamSkinTheme("");
+    setSavedDreamSkinThemeDraft(null);
+    setDreamSkinThemeDraft(null);
+  };
+
+  const updateDreamSkinThemeDraft = (draft: DreamSkinThemeDraft | null) => {
+    dreamSkinDraftReplacementRequestRef.current += 1;
+    dreamSkinThemeDraftRef.current = draft;
+    setDreamSkinThemeDraft(draft);
+  };
+
+  const replaceDreamSkinLibrary = (library: DreamSkinThemeLibrary) => {
+    dreamSkinLibraryRequestRef.current += 1;
+    setDreamSkinLibrary(library);
+  };
+
+  const rebindDreamSkinDraftSelection = (
+    sourceKey: string,
+    sourceDraft: DreamSkinThemeDraft | null,
+    stableThemeKey: string,
+    stableDraft: DreamSkinThemeDraft,
+    preserveEdits: boolean,
+  ) => {
+    if (dreamSkinSelectedThemeRef.current !== sourceKey) return;
+    const current = dreamSkinThemeDraftRef.current;
+    setDreamSkinDraftSelection(stableThemeKey, stableDraft);
+    const activeSource = sourceDraft ?? current;
+    if (!preserveEdits || !current || !activeSource || !isDreamSkinDraftDirty(activeSource, current)) {
+      return;
+    }
+    updateDreamSkinThemeDraft({
+      ...current,
+      builtin: stableDraft.builtin,
+      config: {
+        ...current.config,
+        id: stableDraft.config.id,
+        name: current.config.name === activeSource.config.name
+          ? stableDraft.config.name
+          : current.config.name,
+      },
+      imagePath: current.imagePath.trim() === activeSource.imagePath.trim()
+        ? stableDraft.imagePath
+        : current.imagePath,
+    });
+  };
+
   const refreshDreamSkinLibrary = async (silent = false) => {
+    const requestId = ++dreamSkinLibraryRequestRef.current;
     const result = await run(() => call<DreamSkinThemeLibraryResult>("list_dream_skin_themes"));
-    if (!result) return null;
+    if (!result || requestId !== dreamSkinLibraryRequestRef.current) return null;
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("主题库"), result);
+      return null;
+    }
     const library: DreamSkinThemeLibrary = {
       themes: result.themes,
       activeDraft: result.activeDraft,
+      warnings: result.warnings,
     };
     setDreamSkinLibrary(library);
-    const active = library.themes.find((item) => item.active) ?? library.themes[0];
-    if (active) {
+    if (!dreamSkinThemeDraftRef.current && !dreamSkinSelectionInitializedRef.current) {
+      dreamSkinSelectionInitializedRef.current = true;
+      const replacementRequest = dreamSkinDraftReplacementRequestRef.current;
+      const active = library.themes.find((item) => item.active);
+      if (!active) return library;
       const draft = active.builtin
         ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
-        : library.activeDraft;
+        : active.kind === "stored"
+          ? await loadDreamSkinThemeDraft(active.id)
+          : library.activeDraft;
+      if (
+        requestId !== dreamSkinLibraryRequestRef.current
+        || replacementRequest !== dreamSkinDraftReplacementRequestRef.current
+        || dreamSkinThemeDraftRef.current
+      ) {
+        return library;
+      }
+      if (!draft) return library;
       setDreamSkinDraftSelection(active.key, draft);
-    }
-    if (!silent && !isSuccessStatus(result.status)) {
-      showResultNotice(t("主题库"), result);
     }
     return library;
   };
@@ -1451,6 +1538,8 @@ export function App() {
   };
 
   const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
+    if (!await confirmDreamSkinDraftReplacement()) return false;
+    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     const result = await run(() => call<DreamSkinCommunityResult>(
       "install_dream_skin_community_theme",
       { id: theme.id },
@@ -1459,9 +1548,12 @@ export function App() {
     setDreamSkinCommunity(result);
     showResultNotice(t("DreamSkin 社区"), result);
     if (!isSuccessStatus(result.status)) return false;
+    dreamSkinSelectionInitializedRef.current = true;
     await refreshDreamSkinLibrary(true);
     const draft = await loadDreamSkinThemeDraft(theme.themeId);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
+    if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+      setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
+    }
     return true;
   };
 
@@ -1472,19 +1564,21 @@ export function App() {
   };
 
   const confirmPendingDreamSkinCommunity = async () => {
+    if (!await confirmDreamSkinDraftReplacement()) return;
+    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
     if (!result) return;
     setDreamSkinCommunity(result);
     showResultNotice(t("DreamSkin 社区"), result);
     if (!isSuccessStatus(result.status)) return;
     setPendingDreamSkinCommunity("");
+    dreamSkinSelectionInitializedRef.current = true;
     setRoute("dreamSkin");
     await refreshDreamSkinLibrary(true);
     if (result.installedThemeId) {
       const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
-      if (draft) {
+      if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
         setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
-        await activateDreamSkinDraft(draft);
       }
     }
   };
@@ -1497,6 +1591,8 @@ export function App() {
   };
 
   const importDreamSkinThemePackage = async () => {
+    if (!await confirmDreamSkinDraftReplacement()) return;
+    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     let selected: string | string[] | null;
     try {
       selected = await open({
@@ -1511,43 +1607,58 @@ export function App() {
     }
     const path = Array.isArray(selected) ? selected[0] : selected;
     if (!path) return;
-    const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
-    const result = await run(() => call<DreamSkinThemeLibraryResult>(
+    const result = await run(() => call<DreamSkinThemeImportResult>(
       "import_dream_skin_theme_package",
       { path },
     ));
     if (!result) return;
     showResultNotice(t("主题库"), result);
     if (!isSuccessStatus(result.status)) return;
-    const library = { themes: result.themes, activeDraft: result.activeDraft };
-    setDreamSkinLibrary(library);
-    const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
+    dreamSkinSelectionInitializedRef.current = true;
+    const library = {
+      themes: result.themes,
+      activeDraft: result.activeDraft,
+      warnings: result.warnings,
+    };
+    replaceDreamSkinLibrary(library);
+    const imported = result.themes.find((item) => (
+      item.kind === "stored"
+      && !item.damaged
+      && item.id === result.installedThemeId
+    ));
     if (imported) {
       const draft = await loadDreamSkinThemeDraft(imported.id);
-      if (draft) setDreamSkinDraftSelection(imported.key, draft);
+      if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+        setDreamSkinDraftSelection(imported.key, draft);
+      }
     }
     await refreshDreamSkinCommunity(true);
   };
 
   const installDreamSkinMarketTheme = async (theme: DreamSkinMarketTheme) => {
+    if (!await confirmDreamSkinDraftReplacement()) return false;
+    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
     if (!result) return false;
     setDreamSkinMarket(result);
     showResultNotice(t("主题市场"), result);
     if (!isSuccessStatus(result.status)) return false;
+    dreamSkinSelectionInitializedRef.current = true;
     await refreshDreamSkinLibrary(true);
     const draft = await loadDreamSkinThemeDraft(theme.id);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
+    if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+      setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
+    }
     return true;
   };
 
-  const runAfterDreamSkinDraftGuard = (action: () => void) => {
-    if (!dreamSkinDraftDirty) {
-      action();
-      return;
-    }
-    dreamSkinPendingActionRef.current = action;
-    setDreamSkinUnsavedDialog(true);
+  const confirmDreamSkinDraftReplacement = () => {
+    if (!dreamSkinDraftDirty) return Promise.resolve(true);
+    if (dreamSkinDraftGuardResolveRef.current) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      dreamSkinDraftGuardResolveRef.current = resolve;
+      setDreamSkinUnsavedDialog(true);
+    });
   };
 
   const loadDreamSkinThemeDraft = async (id: string) => {
@@ -1563,26 +1674,67 @@ export function App() {
     } satisfies DreamSkinThemeDraft;
   };
 
-  const selectDreamSkinTheme = (item: DreamSkinThemeSummary) => {
-    if (item.key === selectedDreamSkinTheme) return;
-    runAfterDreamSkinDraftGuard(() => {
-      void (async () => {
-        if (item.builtin) {
-          setDreamSkinDraftSelection(item.key, {
-            config: defaultDreamSkinTheme(),
-            imagePath: "",
-            builtin: true,
-          });
-          return;
-        }
-        if (item.active && dreamSkinLibrary) {
-          setDreamSkinDraftSelection(item.key, dreamSkinLibrary.activeDraft);
-          return;
-        }
-        const draft = await loadDreamSkinThemeDraft(item.id);
-        if (draft) setDreamSkinDraftSelection(item.key, draft);
-      })();
-    });
+  const selectDreamSkinTheme = async (item: DreamSkinThemeSummary) => {
+    if (item.key === selectedDreamSkinTheme || item.damaged) return;
+    if (!await confirmDreamSkinDraftReplacement()) return;
+    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
+    if (item.builtin) {
+      if (replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+        setDreamSkinDraftSelection(item.key, {
+          config: defaultDreamSkinTheme(),
+          imagePath: "",
+          builtin: true,
+        });
+      }
+      return;
+    }
+    if (item.active && item.kind === "activeUnsaved" && dreamSkinLibrary) {
+      if (replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+        setDreamSkinDraftSelection(item.key, dreamSkinLibrary.activeDraft);
+      }
+      return;
+    }
+    const draft = await loadDreamSkinThemeDraft(item.id);
+    if (draft && replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+      setDreamSkinDraftSelection(item.key, draft);
+    }
+  };
+
+  const saveDreamSkinDraftValue = async (
+    draft: DreamSkinThemeDraft,
+    sourceKey: string,
+    selectSaved: boolean,
+  ) => {
+    const result = await run(() => call<DreamSkinThemeSaveResult>("save_dream_skin_theme", {
+      draft,
+      sourceKey,
+    }));
+    if (!result || !isSuccessStatus(result.status)) {
+      if (result) showResultNotice(t("主题库"), result);
+      return null;
+    }
+    const library: DreamSkinThemeLibrary = {
+      themes: result.themes,
+      activeDraft: result.activeDraft,
+      warnings: result.warnings,
+    };
+    const storedSummary = result.themes.find((item) => (
+      item.key === result.savedThemeKey
+      && item.id === result.savedThemeId
+      && !item.damaged
+    ));
+    if (!storedSummary) {
+      replaceDreamSkinLibrary(library);
+      showNotice(t("主题库"), t("主题已保存，但无法确定新主题位置，请刷新后重试。"), "failed");
+      return null;
+    }
+    const stored = await loadDreamSkinThemeDraft(storedSummary.id);
+    if (!stored) return null;
+    replaceDreamSkinLibrary(library);
+    if (selectSaved) {
+      rebindDreamSkinDraftSelection(sourceKey, draft, storedSummary.key, stored, true);
+    }
+    return { draft: stored, key: storedSummary.key, library };
   };
 
   const saveDreamSkinThemeDraft = async (): Promise<DreamSkinThemeDraft | null> => {
@@ -1611,12 +1763,14 @@ export function App() {
     }
     const stored = await loadDreamSkinThemeDraft(draft.config.id);
     if (!stored) return null;
-    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
+    replaceDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft, warnings: result.warnings });
     setDreamSkinDraftSelection(`stored:${draft.config.id}`, stored);
     return stored;
   };
 
   const createDreamSkinTheme = async () => {
+    if (!await confirmDreamSkinDraftReplacement()) return;
+    const replacementRequest = ++dreamSkinDraftReplacementRequestRef.current;
     let selected: unknown;
     try {
       selected = await open({
@@ -1645,8 +1799,11 @@ export function App() {
       imagePath: result.imagePath,
       builtin: result.builtin,
     };
+    dreamSkinSelectionInitializedRef.current = true;
     await refreshDreamSkinLibrary(true);
-    setDreamSkinDraftSelection(`stored:${draft.config.id}`, draft);
+    if (replacementRequest === dreamSkinDraftReplacementRequestRef.current) {
+      setDreamSkinDraftSelection(`stored:${draft.config.id}`, draft);
+    }
   };
 
   const chooseDreamSkinDraftImage = async () => {
@@ -1668,52 +1825,74 @@ export function App() {
       return;
     }
     if (typeof selected === "string" && selected.trim()) {
-      setDreamSkinThemeDraft((current) => current ? { ...current, imagePath: selected.trim() } : current);
+      const current = dreamSkinThemeDraftRef.current;
+      updateDreamSkinThemeDraft(current ? { ...current, imagePath: selected.trim() } : current);
     }
   };
 
   const activateDreamSkinDraft = async (initialDraft: DreamSkinThemeDraft) => {
+    if (!selectedDreamSkinTheme) {
+      showNotice(t("皮肤管理"), t("请先选择主题。"), "failed");
+      return false;
+    }
+    const activationSelectionKey = selectedDreamSkinTheme;
     const currentTheme = pendingDreamSkinRestart
       ? {
           key: pendingDreamSkinRestart.currentThemeKey,
           name: pendingDreamSkinRestart.currentThemeName,
         }
-      : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
-    let draft = initialDraft;
-    if (draft.builtin && dreamSkinDraftDirty) {
-      const stored = await saveDreamSkinThemeDraft();
-      if (!stored) return false;
-      draft = stored;
-    }
-    const saved = await persistDreamSkinSettings({
-      ...settingsForm,
-      codexAppDreamSkinEnabled: true,
-      codexAppDreamSkinPaused: false,
-    });
-    if (!saved) return false;
+      : dreamSkinLibrary?.themes.find((item) => item.active) ?? {
+          key: null,
+          name: t("Codex 原始外观"),
+        };
     const ports = dreamSkinRequest().request;
     const result = await run(() => call<DreamSkinThemeActivationResult>("activate_dream_skin_theme", {
       request: {
-        draft,
+        draft: initialDraft,
+        sourceThemeKey: selectedDreamSkinTheme,
         debugPort: ports.debugPort,
         helperPort: ports.helperPort,
       },
     }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
+    if (!result) return false;
+    replaceDreamSkinLibrary(result.library);
+    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
+    await refreshSettings(true);
+    if (isSuccessStatus(result.status) || result.sourceThemeSaved) {
+      const source = result.library.themes.find((item) => item.key === result.sourceThemeKey && !item.damaged);
+      let stableDraft: DreamSkinThemeDraft | null = null;
+      if (source?.builtin) {
+        stableDraft = {
+          config: defaultDreamSkinTheme(),
+          imagePath: "",
+          builtin: true,
+        };
+      } else if (source?.kind === "stored") {
+        stableDraft = await loadDreamSkinThemeDraft(source.id);
+      } else if (source?.kind === "activeUnsaved") {
+        stableDraft = result.library.activeDraft;
+      }
+      if (source && stableDraft) {
+        rebindDreamSkinDraftSelection(
+          activationSelectionKey,
+          initialDraft,
+          source.key,
+          stableDraft,
+          true,
+        );
+      }
+    }
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("主题库"), result);
       return false;
     }
-    setDreamSkinLibrary(result.library);
-    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
-    const active = result.library.themes.find((item) => item.active);
-    if (active) setDreamSkinDraftSelection(active.key, result.library.activeDraft);
-    await refreshSettings(true);
     if (result.savedForNextLaunch) {
       setPendingDreamSkinRestart({
         currentThemeKey: currentTheme?.key ?? null,
         currentThemeName: currentTheme?.name ?? t("当前皮肤"),
-        pendingThemeKey: active?.key ?? selectedDreamSkinTheme,
-        pendingThemeName: active?.name ?? draft.config.name,
+        currentMayStillBeRunning: true,
+        pendingThemeKey: result.appliedThemeKey,
+        pendingThemeName: result.appliedThemeName,
       });
       showNotice(t("主题库"), t("主题已保存并设为待应用，不会自动重启 Codex。"), "not_checked");
     } else {
@@ -1723,7 +1902,10 @@ export function App() {
   };
 
   const activateDreamSkinTheme = async () => {
-    if (!dreamSkinThemeDraft) return;
+    if (!dreamSkinThemeDraft) {
+      showNotice(t("皮肤管理"), t("请先选择主题。"), "failed");
+      return;
+    }
     await activateDreamSkinDraft(dreamSkinThemeDraft);
   };
 
@@ -1735,11 +1917,16 @@ export function App() {
       if (result) showResultNotice(t("主题库"), result);
       return;
     }
-    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
+    replaceDreamSkinLibrary({
+      themes: result.themes,
+      activeDraft: result.activeDraft,
+      warnings: result.warnings,
+    });
     if (selectedDreamSkinTheme === item.key) {
-      setDreamSkinThemeDraft((current) => current
-        ? { ...current, config: { ...current.config, name } }
-        : current);
+      const currentDraft = dreamSkinThemeDraftRef.current;
+      updateDreamSkinThemeDraft(currentDraft
+        ? { ...currentDraft, config: { ...currentDraft.config, name } }
+        : currentDraft);
       setSavedDreamSkinThemeDraft((current) => current
         ? { ...current, config: { ...current.config, name } }
         : current);
@@ -1752,19 +1939,20 @@ export function App() {
       tf("删除主题“{0}”？此操作无法撤销。", [item.name]),
     );
     if (!confirmed) return;
-    const result = await run(() => call<DreamSkinThemeLibraryResult>("delete_dream_skin_theme", { id: item.id }));
+    const result = await run(() => call<DreamSkinThemeLibraryResult>("delete_dream_skin_theme", {
+      id: item.id,
+      allowDamaged: item.damaged,
+    }));
     if (!result || !isSuccessStatus(result.status)) {
       if (result) showResultNotice(t("主题库"), result);
       return;
     }
-    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
-    const active = result.themes.find((candidate) => candidate.active) ?? result.themes[0];
-    if (active) {
-      const draft = active.builtin
-        ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
-        : result.activeDraft;
-      setDreamSkinDraftSelection(active.key, draft);
-    }
+    replaceDreamSkinLibrary({
+      themes: result.themes,
+      activeDraft: result.activeDraft,
+      warnings: result.warnings,
+    });
+    if (selectedDreamSkinTheme === item.key) clearDreamSkinDraftSelection();
   };
 
   const selectSessionIndexCleanupCandidates = (candidates: SessionIndexCleanupCandidate[]) =>
@@ -1876,11 +2064,7 @@ export function App() {
     }
   };
 
-  const navigate = async (next: Route, skipDreamSkinDraftGuard = false) => {
-    if (!skipDreamSkinDraftGuard && route === "dreamSkin" && next !== "dreamSkin" && dreamSkinDraftDirty) {
-      runAfterDreamSkinDraftGuard(() => void navigate(next, true));
-      return;
-    }
+  const navigate = async (next: Route) => {
     setRoute(next);
     if (next === "overview") await refreshOverview(true);
     if (next === "relay") {
@@ -1925,7 +2109,8 @@ export function App() {
       await refreshScriptMarket(true);
       await refreshUserScriptInventory();
     }
-    if (next === "recommendations") await refreshAds(true);
+    // 推荐页面已隐藏，暂不触发推荐内容拉取
+    // if (next === "recommendations") await refreshAds(true);
     if (next === "about") {
       await refreshOverview(true);
       await refreshLogs(true);
@@ -2224,7 +2409,7 @@ export function App() {
 
   const saveSettings = async () => {
     const next = normalizeSettings(settingsForm);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2234,7 +2419,7 @@ export function App() {
 
   const saveSettingsValue = async (next: BackendSettings, silent = true) => {
     const normalized = normalizeSettings(next);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
     if (result && isSuccessStatus(result.status)) {
       const saved = normalizeSettings(result.settings);
       setSettings(result);
@@ -2389,7 +2574,7 @@ export function App() {
           if (!preview) {
             cleanupFailure = {
               status: "failed",
-              message: t("幽灵任务索引处理失败，请查看错误提示后重试。"),
+              message: t("任务索引处理失败，请查看错误提示后重试。"),
             };
           } else if (isSuccessStatus(preview.status) && preview.candidates.length > 0) {
             const selectedIds = await selectSessionIndexCleanupCandidates(preview.candidates);
@@ -2408,7 +2593,7 @@ export function App() {
               } else {
                 cleanupFailure = cleanup ?? {
                   status: "failed",
-                  message: t("幽灵任务索引处理失败，请查看错误提示后重试。"),
+                  message: t("任务索引处理失败，请查看错误提示后重试。"),
                 };
               }
             }
@@ -2439,7 +2624,7 @@ export function App() {
         }
         await refreshProviderSyncTargets(true);
         const noticeTitle =
-          completion.noticeKind === "cleanup" ? t("清理幽灵任务索引") : t("历史会话修复");
+          completion.noticeKind === "cleanup" ? t("清理任务索引") : t("历史会话修复");
         showNotice(
           noticeTitle,
           completion.result.message,
@@ -2459,7 +2644,7 @@ export function App() {
   };
 
   const applyRelayInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
+    const settingsResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(settingsForm)));
     if (settingsResult) {
       setSettings(settingsResult);
       setSettingsForm(normalizeSettings(settingsResult.settings));
@@ -2482,7 +2667,7 @@ export function App() {
   const saveLaunchMode = async (launchMode: LaunchMode, silent = false, baseSettings: BackendSettings = settingsForm) => {
     const next = { ...baseSettings, launchMode };
     setSettingsForm(next);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2492,7 +2677,7 @@ export function App() {
   };
 
   const applyPureApiInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
+    const settingsResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(settingsForm)));
     if (settingsResult) {
       setSettings(settingsResult);
       setSettingsForm(normalizeSettings(settingsResult.settings));
@@ -2541,7 +2726,7 @@ export function App() {
     );
     if (!result) return null;
     let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
     if (saveResult) {
       setSettings(saveResult);
       normalized = normalizeSettings(saveResult.settings);
@@ -2559,7 +2744,7 @@ export function App() {
     );
     if (!result) return null;
     let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
     if (saveResult) {
       setSettings(saveResult);
       normalized = normalizeSettings(saveResult.settings);
@@ -2779,7 +2964,6 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
-      await refreshPendingSessionShare(true);
       await refreshPendingDreamSkinCommunity();
       await refreshRemotePluginMarketplace(true);
     })();
@@ -2799,7 +2983,6 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void refreshPendingProviderImport(true);
-      void refreshPendingSessionShare(true);
       void refreshPendingDreamSkinCommunity();
     }, 1200);
     return () => window.clearInterval(timer);
@@ -2850,7 +3033,7 @@ export function App() {
 
   const saveCodexAppPath = async (appPath: string) => {
     const next = { ...settingsForm, codexAppPath: appPath };
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
+    const result = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(next)));
     if (result) {
       setSettings(result);
       const normalized = normalizeSettings(result.settings);
@@ -2861,39 +3044,85 @@ export function App() {
     return result;
   };
 
-  const persistDreamSkinSettings = async (next: BackendSettings) => {
-    const normalized = normalizeSettings(next);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
-    if (!result) return null;
-    setSettings(result);
-    setSettingsForm(normalizeSettings(result.settings));
-    if (!isSuccessStatus(result.status)) {
-      showNotice(t("皮肤管理"), result.message, result.status);
-      return null;
+  const loadStableDreamSkinDraft = async (key: string) => {
+    if (key === "builtin") {
+      return {
+        config: defaultDreamSkinTheme(),
+        imagePath: "",
+        builtin: true,
+      } satisfies DreamSkinThemeDraft;
     }
-    return result;
+    const id = key.startsWith("stored:") ? key.slice("stored:".length) : "";
+    return id ? loadDreamSkinThemeDraft(id) : null;
   };
 
-  const restoreDreamSkin = async () => {
+  const restoreDreamSkin = async (discardUnrecoverableActive = false) => {
     const currentTheme = pendingDreamSkinRestart
       ? {
           key: pendingDreamSkinRestart.currentThemeKey,
           name: pendingDreamSkinRestart.currentThemeName,
         }
       : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
-    const result = await run(() => call<DreamSkinRuntimeResult>("restore_dream_skin", dreamSkinRequest()));
+    const request = dreamSkinRequest().request;
+    const result = await run(() => call<DreamSkinRestoreResult>("restore_dream_skin", {
+      request: {
+        ...request,
+        discardUnrecoverableActive,
+      },
+    }));
     if (!result) return;
-    setDreamSkinStatus(result);
-    await refreshSettings(true);
-    showResultNotice(t("皮肤管理"), result);
-    if (isSuccessStatus(result.status)) {
-      setPendingDreamSkinRestart({
-        currentThemeKey: currentTheme?.key ?? null,
-        currentThemeName: currentTheme?.name ?? t("当前皮肤"),
-        pendingThemeKey: "codex-original-appearance",
-        pendingThemeName: t("Codex 原始外观"),
-      });
+    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
+    if (result.status === "decision_required" && result.requiresDecision) {
+      setDreamSkinRestoreDecision(result);
+      return;
     }
+    setDreamSkinRestoreDecision(null);
+    await refreshSettings(true);
+    const library = await refreshDreamSkinLibrary(true);
+    showResultNotice(t("皮肤管理"), result);
+    if (!isSuccessStatus(result.status)) return;
+    if (dreamSkinSelectedThemeRef.current === "active-unsaved") {
+      const stableSummary = library?.themes.find((item) => (
+        item.key === result.stableThemeKey && !item.damaged
+      ));
+      const stableDraft = stableSummary
+        ? await loadStableDreamSkinDraft(stableSummary.key)
+        : null;
+      if (stableDraft && stableSummary) {
+        rebindDreamSkinDraftSelection(
+          "active-unsaved",
+          result.activeDraft,
+          stableSummary.key,
+          stableDraft,
+          !discardUnrecoverableActive,
+        );
+      } else if (discardUnrecoverableActive) {
+        clearDreamSkinDraftSelection();
+      }
+    }
+    setPendingDreamSkinRestart({
+      currentThemeKey: result.liveCleared ? null : currentTheme?.key ?? null,
+      currentThemeName: result.liveCleared
+        ? t("实时皮肤已清理")
+        : currentTheme?.name ?? t("当前皮肤"),
+      currentMayStillBeRunning: !result.liveCleared,
+      pendingThemeKey: "codex-original-appearance",
+      pendingThemeName: t("Codex 原始外观"),
+    });
+  };
+
+  const saveActiveDreamSkinBeforeRestore = async () => {
+    const activeDraft = dreamSkinRestoreDecision?.activeDraft;
+    if (!activeDraft) return;
+    const saved = await saveDreamSkinDraftValue(
+      activeDraft,
+      "active-unsaved",
+      false,
+    );
+    if (!saved) return;
+    rebindDreamSkinDraftSelection("active-unsaved", activeDraft, saved.key, saved.draft, true);
+    setDreamSkinRestoreDecision(null);
+    await restoreDreamSkin(false);
   };
 
   const verifyDreamSkin = async (withScreenshot: boolean) => {
@@ -3000,10 +3229,12 @@ export function App() {
         }
       },
       chooseDreamSkinImagePath: chooseDreamSkinDraftImage,
-      resetDreamSkinImage: async () => runAfterDreamSkinDraftGuard(() => {
+      resetDreamSkinImage: async () => {
+        if (!await confirmDreamSkinDraftReplacement()) return;
         setDreamSkinThemeDraft((current) => current ? { ...current, imagePath: "" } : current);
-      }),
-      resetDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => {
+      },
+      resetDreamSkinTheme: async () => {
+        if (!await confirmDreamSkinDraftReplacement()) return;
         setDreamSkinThemeDraft((current) => {
           if (!current) return current;
           if (isWindowsPlatform) {
@@ -3021,22 +3252,22 @@ export function App() {
             imagePath: "",
           };
         });
-      }),
+      },
       refreshDreamSkinLibrary,
       refreshDreamSkinMarket,
       refreshDreamSkinCommunity,
       installDreamSkinMarketTheme,
       installDreamSkinCommunityTheme,
       importDreamSkinThemePackage,
-      createDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => void createDreamSkinTheme()),
+      createDreamSkinTheme: async () => {
+        if (!await confirmDreamSkinDraftReplacement()) return;
+        await createDreamSkinTheme();
+      },
       saveDreamSkinTheme: saveDreamSkinThemeDraft,
       selectDreamSkinTheme,
       renameDreamSkinTheme,
       deleteDreamSkinTheme: async (item: DreamSkinThemeSummary) => {
-        if (item.key === selectedDreamSkinTheme && dreamSkinDraftDirty) {
-          runAfterDreamSkinDraftGuard(() => void deleteDreamSkinTheme(item));
-          return;
-        }
+        if (!await confirmDreamSkinDraftReplacement()) return;
         await deleteDreamSkinTheme(item);
       },
       activateDreamSkinTheme,
@@ -3376,24 +3607,44 @@ export function App() {
       {dreamSkinUnsavedDialog ? (
         <DreamSkinUnsavedDialog
           onCancel={() => {
-            dreamSkinPendingActionRef.current = null;
+            const resolve = dreamSkinDraftGuardResolveRef.current;
+            dreamSkinDraftGuardResolveRef.current = null;
             setDreamSkinUnsavedDialog(false);
+            resolve?.(false);
           }}
           onDiscard={() => {
-            const pending = dreamSkinPendingActionRef.current;
-            dreamSkinPendingActionRef.current = null;
-            setDreamSkinThemeDraft(savedDreamSkinThemeDraft);
+            const resolve = dreamSkinDraftGuardResolveRef.current;
+            dreamSkinDraftGuardResolveRef.current = null;
+            updateDreamSkinThemeDraft(savedDreamSkinThemeDraft);
             setDreamSkinUnsavedDialog(false);
-            pending?.();
+            resolve?.(true);
           }}
           onSave={() => void (async () => {
             const saved = await saveDreamSkinThemeDraft();
             if (!saved) return;
-            const pending = dreamSkinPendingActionRef.current;
-            dreamSkinPendingActionRef.current = null;
+            const resolve = dreamSkinDraftGuardResolveRef.current;
+            dreamSkinDraftGuardResolveRef.current = null;
             setDreamSkinUnsavedDialog(false);
-            pending?.();
+            resolve?.(true);
           })()}
+        />
+      ) : null}
+      {dreamSkinRestoreDecision ? (
+        <DreamSkinRestoreDecisionDialog
+          canSave={dreamSkinRestoreDecision.canSaveActive && Boolean(dreamSkinRestoreDecision.activeDraft)}
+          onCancel={() => setDreamSkinRestoreDecision(null)}
+          onDiscard={() => void (async () => {
+            setDreamSkinRestoreDecision(null);
+            await restoreDreamSkin(true);
+          })()}
+          onSave={() => void saveActiveDreamSkinBeforeRestore()}
+        />
+      ) : null}
+      {pendingProviderImport ? (
+        <PendingProviderImportDialog
+          request={pendingProviderImport}
+          onConfirm={() => void confirmPendingProviderImport()}
+          onDismiss={() => void dismissPendingProviderImport()}
         />
       ) : null}
       {pendingProviderImport ? (
@@ -3445,12 +3696,12 @@ type Actions = {
   importDreamSkinThemePackage: () => Promise<void>;
   createDreamSkinTheme: () => Promise<void>;
   saveDreamSkinTheme: () => Promise<DreamSkinThemeDraft | null>;
-  selectDreamSkinTheme: (item: DreamSkinThemeSummary) => void;
+  selectDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
   renameDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
   deleteDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
   activateDreamSkinTheme: () => Promise<void>;
   refreshDreamSkinStatus: (silent?: boolean) => Promise<DreamSkinRuntimeResult | null>;
-  restoreDreamSkin: () => Promise<void>;
+  restoreDreamSkin: (discardUnrecoverableActive?: boolean) => Promise<void>;
   verifyDreamSkin: () => Promise<void>;
   saveDreamSkinScreenshot: () => Promise<void>;
   saveManualCodexAppPath: () => Promise<void>;
@@ -8210,6 +8461,45 @@ function DreamSkinUnsavedDialog({
     </div>
   );
 }
+
+function DreamSkinRestoreDecisionDialog({
+  canSave,
+  onSave,
+  onDiscard,
+  onCancel,
+}: {
+  canSave: boolean;
+  onSave: () => void;
+  onDiscard: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal-card">
+        <div className="modal-head">
+          <div>
+            <h2>{t("活动主题尚未保存")}</h2>
+            <p className="modal-message">
+              {canSave
+                ? t("当前活动副本无法从内置或已安装主题重建，请先保存，或明确放弃后恢复 Codex 外观。")
+                : t("当前活动副本已缺失或损坏，无法保存；可以明确放弃后恢复 Codex 外观。")}
+            </p>
+          </div>
+          <button className="toast-close" onClick={onCancel} type="button">×</button>
+        </div>
+        <Toolbar>
+          <Button disabled={!canSave} onClick={onSave}>
+            <Save className="h-4 w-4" />
+            {t("保存为主题")}
+          </Button>
+          <Button onClick={onDiscard} variant="secondary">{t("放弃并恢复")}</Button>
+          <Button onClick={onCancel} variant="outline">{t("取消")}</Button>
+        </Toolbar>
+      </div>
+    </div>
+  );
+}
+
 
 function NoticeDialog({
   notice,
