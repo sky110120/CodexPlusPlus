@@ -2022,6 +2022,7 @@ fn run_service_tier_contract_harness() -> serde_json::Value {
         harness,
         r#"
 const scriptPath = {script_path};
+globalThis.fetch = async () => ({{ ok: true, json: async () => ({{}}) }});
 const store = new Map();
 store.set("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
 function node() {{
