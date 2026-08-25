@@ -27,6 +27,13 @@ const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 const CODEX_EXIT_EMPTY_STREAK_LIMIT: u32 = 5;
 pub const HELPER_SERVICE_ID: &str = "codex-plus-helper";
 pub const HELPER_API_VERSION: &str = "1";
+/// 协议代理的端口写死在 `config.toml` 的 `base_url = "http://127.0.0.1:57321/v1"` 里，
+/// 不能像普通 helper 端口那样临时换一个空闲的，否则 Codex CLI 会连到没人监听的地址。
+/// 而管理器的「重启」是先强杀旧 launcher 再拉新的，旧 helper 交还监听要一小会儿；
+/// 过去这里一次 bind 失败就整个启动中止，用户侧就是重启必失败、直接双击 exe 反而正常（issue #1933）。
+/// 所以固定端口下给前任一个让位的窗口，只对「端口被占用」重试。
+const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
+const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
@@ -271,6 +278,53 @@ pub async fn launch_and_inject(options: LaunchOptions) -> anyhow::Result<LaunchH
     launch_and_inject_with_hooks(options, DefaultLaunchHooks::shared()).await
 }
 
+/// 判断错误链里是不是「端口已被占用」。只有这一种失败值得等前任让位重试，
+/// 其余（权限不足、地址非法等）重试多少次都一样，直接冒泡更快也更好排查。
+fn error_is_address_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// 端口被占用时按 `interval_ms` 重试启动 helper，直到成功或超过 `timeout_ms`。
+async fn start_helper_waiting_for_busy_port<F, Fut>(
+    mut start: F,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let mut waited_ms = 0;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let error = match start().await {
+            Ok(()) => {
+                if attempts > 1 {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "helper.bind_recovered_after_busy_port",
+                        serde_json::json!({
+                            "attempts": attempts,
+                            "waited_ms": waited_ms,
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        if !error_is_address_in_use(&error) || waited_ms >= timeout_ms {
+            return Err(error);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        waited_ms += interval_ms;
+    }
+}
+
 pub async fn launch_and_inject_with_hooks<H>(
     options: LaunchOptions,
     hooks: H,
@@ -344,11 +398,44 @@ where
             }
         }
         helper_port = helper_port_for_settings(&settings, helper_port);
-        if helper_required_for_settings(&settings) {
+        let protocol_proxy_enabled = helper_protocol_proxy_enabled(&settings);
+        if protocol_proxy_enabled {
+            helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+        }
+        if helper_required_for_settings(&settings) || protocol_proxy_enabled {
             match hooks.helper_status(helper_port).await {
                 HelperStatus::Compatible => {}
                 HelperStatus::Missing => {
-                    hooks.start_helper(helper_port).await?;
+                    // 普通 helper 端口不会等待；固定协议代理端口需要给旧进程释放监听的时间。
+                    let bind_retry_timeout_ms = if protocol_proxy_enabled {
+                        HELPER_BIND_RETRY_TIMEOUT_MS
+                    } else {
+                        0
+                    };
+                    start_helper_waiting_for_busy_port(
+                        || hooks.start_helper(helper_port),
+                        bind_retry_timeout_ms,
+                        HELPER_BIND_RETRY_INTERVAL_MS,
+                    )
+                    .await
+                    .map_err(|error| {
+                        if protocol_proxy_enabled && error_is_address_in_use(&error) {
+                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                "helper.bind_gave_up_on_busy_port",
+                                serde_json::json!({
+                                    "helper_port": helper_port,
+                                    "waited_ms": bind_retry_timeout_ms,
+                                }),
+                            );
+                            return error.context(format!(
+                                "协议代理端口 {helper_port} 被其他进程占用，等待 {} 秒后仍未释放。\
+                                 该端口写在 config.toml 的 base_url 里，不能自动改用其他端口；\
+                                 请退出仍在运行的 Codex++ 或占用该端口的程序后重试。",
+                                bind_retry_timeout_ms / 1000
+                            ));
+                        }
+                        error
+                    })?;
                     helper_started = true;
                 }
                 HelperStatus::Incompatible(reason) => {

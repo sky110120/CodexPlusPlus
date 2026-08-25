@@ -70,6 +70,8 @@ pub fn run() {
             commands::restart_codex_plus,
             commands::load_settings,
             commands::save_settings,
+            commands::load_grok_config,
+            commands::save_grok_config,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
             commands::weixin_connect_status,
@@ -105,8 +107,9 @@ pub fn run() {
             commands::dismiss_pending_provider_import,
             commands::list_local_sessions,
             commands::import_local_session,
-            commands::load_pending_session_share,
-            commands::import_session_url,
+            // 分享会话功能暂时停用，保留命令实现以便后续恢复。
+            // commands::load_pending_session_share,
+            // commands::import_session_url,
             commands::list_zed_remote_projects,
             commands::open_zed_remote,
             commands::forget_zed_remote_project,
@@ -174,8 +177,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event {
                 for url in urls {
-                    if handle_session_share_url(url.as_str())
-                        || handle_provider_import_url(url.as_str())
+                    if handle_provider_import_url(url.as_str())
                         || handle_dream_skin_url(url.as_str())
                     {
                         show_main_window(app_handle);

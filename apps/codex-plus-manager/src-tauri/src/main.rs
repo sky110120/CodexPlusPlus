@@ -6,10 +6,12 @@ fn main() {
             if codex_plus_manager_lib::handle_dream_skin_url(&arg) {
                 codex_plus_manager_lib::focus_existing_manager_window();
             }
+        /* 分享会话协议入口暂时停用，保留处理实现以便后续恢复。
         } else if arg.starts_with("codexplusplus://session") {
             if codex_plus_manager_lib::handle_session_share_url(&arg) {
                 codex_plus_manager_lib::focus_existing_manager_window();
             }
+        */
         } else if arg.starts_with("codexplusplus://") {
             if codex_plus_manager_lib::handle_provider_import_url(&arg) {
                 codex_plus_manager_lib::focus_existing_manager_window();

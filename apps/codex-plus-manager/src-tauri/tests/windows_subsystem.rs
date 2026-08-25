@@ -335,11 +335,18 @@ fn manager_window_and_relay_detail_header_stay_usable() {
     let tauri_conf =
         std::fs::read_to_string(manifest_dir.join("tauri.conf.json")).expect("read tauri config");
 
-    assert!(app_tsx.contains("relay-detail-sticky"));
+    assert!(app_tsx.contains("relay-detail-page"));
+    assert!(app_tsx.contains("relay-detail-header"));
+    assert!(app_tsx.contains("relay-detail-body"));
+    assert!(app_tsx.contains("relay-detail-footer"));
+    assert!(!app_tsx.contains("relay-detail-sticky"));
     assert!(!app_tsx.contains("CardHead title=\"供应商详情\""));
-    assert!(styles.contains(".relay-detail-sticky"));
-    assert!(styles.contains("position: sticky"));
-    assert!(styles.contains("top: 0"));
+    assert!(styles.contains(".relay-detail-page {\n  position: absolute;"));
+    assert!(styles.contains(".relay-detail-page {\n  position: absolute;\n  inset: 0;\n  display: flex;\n  flex-direction: column;"));
+    assert!(
+        styles.contains(".relay-detail-body {\n  flex: 1;\n  min-height: 0;\n  overflow-y: auto;")
+    );
+    assert!(styles.contains(".relay-detail-footer {\n  display: flex;\n  flex-shrink: 0;"));
     assert!(styles.contains("margin: 0"));
     assert!(lib_rs.contains(".inner_size(1180.0, 820.0)"));
     assert!(lib_rs.contains(".min_inner_size(960.0, 720.0)"));

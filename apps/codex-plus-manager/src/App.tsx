@@ -21,6 +21,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Bell,
+  Bot,
   CheckCircle2,
   ChevronDown,
   Camera,
@@ -80,6 +81,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { tokenizeCode, type CodeLanguage } from "./code-highlight";
+import { filterModelGroups } from "./model-groups";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
 import { isGitHubRepositoryHomepage } from "./github-repository";
 import {
@@ -97,6 +100,7 @@ import {
   type ModelWindowRow,
 } from "./model-windows";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
 import {
@@ -388,6 +392,53 @@ type SettingsResult = CommandResult<{
   settings_path: string;
   user_scripts: UserScriptInventory;
 }>;
+
+type GrokApiBackend = "responses" | "chat_completions" | "messages";
+
+type GrokModelConfig = {
+  alias: string;
+  model: string;
+  name: string;
+  baseUrl: string;
+  apiBackend: GrokApiBackend;
+  contextWindow: number | null;
+  apiKeyConfigured: boolean;
+};
+
+type GrokConfigResult = CommandResult<{
+  grokHome: string;
+  configPath: string;
+  configExists: boolean;
+  cliPath: string | null;
+  cliInstalled: boolean;
+  revision: string;
+  defaultModel: string;
+  modelsBaseUrl: string;
+  models: GrokModelConfig[];
+}>;
+
+type GrokModelInput = {
+  sourceAlias: string;
+  alias: string;
+  model: string;
+  name: string;
+  baseUrl: string;
+  apiBackend: GrokApiBackend;
+  contextWindow: number | null;
+  apiKeyUpdate: string;
+  removeApiKey: boolean;
+};
+
+type SaveGrokConfigRequest = {
+  revision: string;
+  defaultModel: string;
+  modelsBaseUrl: string;
+  models: GrokModelInput[];
+};
+
+type SaveGrokConfigResult = GrokConfigResult & {
+  backupPath: string | null;
+};
 
 type WeixinConnectStatusResult = CommandResult<{
   state: string;
@@ -842,12 +893,13 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "grok" | "relayEnvironment" | "sessions" | "context" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
   { id: "overview", label: t("概览"), icon: LayoutDashboard },
   { id: "relay", label: t("供应商配置"), icon: KeyRound },
+  { id: "grok", label: t("Grok 配置"), icon: Bot },
   { id: "sessions", label: t("会话管理"), icon: MessageCircle },
   { id: "context", label: t("工具与插件"), icon: Network },
   { id: "weixin", label: t("微信连接"), icon: ScanLine },
@@ -866,7 +918,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     label: t("工作区"),
-    routes: ["overview", "relay", "sessions", "context"],
+    routes: ["overview", "relay", "grok", "sessions", "context"],
   },
   {
     label: t("扩展"),
@@ -1003,6 +1055,7 @@ export function App() {
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
+  const [grokConfig, setGrokConfig] = useState<GrokConfigResult | null>(null);
   const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
   const [sessionShareUrl, setSessionShareUrl] = useState("");
@@ -1220,6 +1273,29 @@ export function App() {
       if (!silent) showResultNotice(t("配置文件"), result, { silentSuccess: true });
     }
     return result;
+  };
+
+  const refreshGrokConfig = async (silent = false) => {
+    const result = await run(() => call<GrokConfigResult>("load_grok_config"));
+    if (!result) return null;
+    if (isSuccessStatus(result.status)) {
+      setGrokConfig(result);
+      if (!silent) showResultNotice(t("Grok 配置"), result, { silentSuccess: true });
+    } else {
+      showResultNotice(t("Grok 配置"), result);
+    }
+    return result;
+  };
+
+  const saveGrokConfig = async (request: SaveGrokConfigRequest) => {
+    const result = await run(() => call<SaveGrokConfigResult>("save_grok_config", { request }));
+    if (!result) return null;
+    showResultNotice(t("Grok 配置"), result);
+    if (isSuccessStatus(result.status)) {
+      setGrokConfig(result);
+      return result;
+    }
+    return null;
   };
 
   const refreshEnvConflicts = async (silent = false) => {
@@ -2058,6 +2134,7 @@ export function App() {
       await refreshCcsProviders(true);
     }
     if (next === "relayEnvironment") await refreshRelayEnvironment(true);
+    if (next === "grok") await refreshGrokConfig(true);
     if (next === "sessions") {
       await refreshSettings(true);
       await refreshLocalSessions(true);
@@ -2946,7 +3023,8 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
-      await refreshPendingSessionShare(true);
+      // 分享会话功能暂时停用，保留实现以便后续恢复。
+      // await refreshPendingSessionShare(true);
       await refreshPendingDreamSkinCommunity();
       await refreshRemotePluginMarketplace(true);
     })();
@@ -2966,7 +3044,8 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void refreshPendingProviderImport(true);
-      void refreshPendingSessionShare(true);
+      // 分享会话功能暂时停用，保留实现以便后续恢复。
+      // void refreshPendingSessionShare(true);
       void refreshPendingDreamSkinCommunity();
     }, 1200);
     return () => window.clearInterval(timer);
@@ -3461,6 +3540,13 @@ export function App() {
           ) : null}
           {route === "relayEnvironment" ? (
             <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
+          ) : null}
+          {route === "grok" ? (
+            <GrokConfigScreen
+              config={grokConfig}
+              onRefresh={() => refreshGrokConfig(false)}
+              onSave={saveGrokConfig}
+            />
           ) : null}
           {route === "sessions" ? (
             <SessionsScreen
@@ -4315,6 +4401,378 @@ function OverviewScreen({
         </CardContent>
       </Panel>
     </>
+  );
+}
+
+type GrokModelDraft = GrokModelInput & {
+  clientId: string;
+  apiKeyConfigured: boolean;
+  contextWindowText: string;
+};
+
+type GrokConfigDraft = {
+  revision: string;
+  defaultModel: string;
+  modelsBaseUrl: string;
+  models: GrokModelDraft[];
+};
+
+let grokDraftSequence = 0;
+
+function nextGrokDraftId() {
+  grokDraftSequence += 1;
+  return `grok-model-${Date.now()}-${grokDraftSequence}`;
+}
+
+function grokDraftFromConfig(config: GrokConfigResult): GrokConfigDraft {
+  return {
+    revision: config.revision,
+    defaultModel: config.defaultModel,
+    modelsBaseUrl: config.modelsBaseUrl,
+    models: config.models.map((model) => ({
+      clientId: nextGrokDraftId(),
+      sourceAlias: model.alias,
+      alias: model.alias,
+      model: model.model,
+      name: model.name,
+      baseUrl: model.baseUrl,
+      apiBackend: model.apiBackend,
+      contextWindow: model.contextWindow,
+      contextWindowText: model.contextWindow?.toString() ?? "",
+      apiKeyConfigured: model.apiKeyConfigured,
+      apiKeyUpdate: "",
+      removeApiKey: false,
+    })),
+  };
+}
+
+function grokRequestFromDraft(draft: GrokConfigDraft): SaveGrokConfigRequest {
+  return {
+    revision: draft.revision,
+    defaultModel: draft.defaultModel.trim(),
+    modelsBaseUrl: draft.modelsBaseUrl.trim(),
+    models: draft.models.map((model) => ({
+      sourceAlias: model.sourceAlias,
+      alias: model.alias.trim(),
+      model: model.model.trim(),
+      name: model.name.trim(),
+      baseUrl: model.baseUrl.trim(),
+      apiBackend: model.apiBackend,
+      contextWindow: model.contextWindowText.trim() ? Number.parseInt(model.contextWindowText, 10) : null,
+      apiKeyUpdate: model.apiKeyUpdate.trim(),
+      removeApiKey: model.removeApiKey,
+    })),
+  };
+}
+
+function grokDraftValidation(draft: GrokConfigDraft) {
+  const aliases = draft.models.map((model) => model.alias.trim());
+  if (aliases.some((alias) => !alias)) return t("模型别名不能为空。");
+  if (new Set(aliases).size !== aliases.length) return t("模型别名不能重复。");
+  for (const model of draft.models) {
+    const value = model.contextWindowText.trim();
+    if (value && (!/^\d+$/.test(value) || Number(value) <= 0 || !Number.isSafeInteger(Number(value)))) {
+      return tf("模型「{0}」的上下文窗口必须是大于 0 的整数。", [model.alias || t("未命名")]);
+    }
+  }
+  return "";
+}
+
+function GrokConfigScreen({
+  config,
+  onRefresh,
+  onSave,
+}: {
+  config: GrokConfigResult | null;
+  onRefresh: () => Promise<GrokConfigResult | null>;
+  onSave: (request: SaveGrokConfigRequest) => Promise<SaveGrokConfigResult | null>;
+}) {
+  const [draft, setDraft] = useState<GrokConfigDraft | null>(null);
+  const [selectedId, setSelectedId] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!config) return;
+    const next = grokDraftFromConfig(config);
+    setDraft(next);
+    setSelectedId((current) => next.models.some((model) => model.clientId === current) ? current : next.models[0]?.clientId ?? "");
+  }, [config]);
+
+  const savedRequest = useMemo(
+    () => config ? grokRequestFromDraft(grokDraftFromConfig(config)) : null,
+    [config],
+  );
+  const currentRequest = useMemo(() => draft ? grokRequestFromDraft(draft) : null, [draft]);
+  const dirty = Boolean(savedRequest && currentRequest && JSON.stringify(savedRequest) !== JSON.stringify(currentRequest));
+  const validationError = draft ? grokDraftValidation(draft) : "";
+  const selected = draft?.models.find((model) => model.clientId === selectedId) ?? null;
+
+  const updateSelected = (patch: Partial<GrokModelDraft>) => {
+    if (!draft || !selected) return;
+    setDraft((current) => {
+      if (!current) return current;
+      const nextDefault = patch.alias !== undefined && current.defaultModel === selected.alias
+        ? patch.alias
+        : current.defaultModel;
+      return {
+        ...current,
+        defaultModel: nextDefault,
+        models: current.models.map((model) => model.clientId === selected.clientId ? { ...model, ...patch } : model),
+      };
+    });
+  };
+
+  const addModel = () => {
+    if (!draft) return;
+    const aliases = new Set(draft.models.map((model) => model.alias));
+    let index = draft.models.length + 1;
+    while (aliases.has(`grok-model-${index}`)) index += 1;
+    const model: GrokModelDraft = {
+      clientId: nextGrokDraftId(),
+      sourceAlias: "",
+      alias: `grok-model-${index}`,
+      model: "",
+      name: "",
+      baseUrl: "",
+      apiBackend: "responses",
+      contextWindow: null,
+      contextWindowText: "",
+      apiKeyConfigured: false,
+      apiKeyUpdate: "",
+      removeApiKey: false,
+    };
+    setDraft({
+      ...draft,
+      defaultModel: draft.defaultModel || model.alias,
+      models: [...draft.models, model],
+    });
+    setSelectedId(model.clientId);
+  };
+
+  const deleteSelected = () => {
+    if (!draft || !selected) return;
+    if (!window.confirm(tf("删除 Grok 模型「{0}」？", [selected.alias || t("未命名")]))) return;
+    const remaining = draft.models.filter((model) => model.clientId !== selected.clientId);
+    setDraft({
+      ...draft,
+      defaultModel: draft.defaultModel === selected.alias ? remaining[0]?.alias ?? "" : draft.defaultModel,
+      models: remaining,
+    });
+    setSelectedId(remaining[0]?.clientId ?? "");
+  };
+
+  const discard = () => {
+    if (!config) return;
+    const next = grokDraftFromConfig(config);
+    setDraft(next);
+    setSelectedId(next.models[0]?.clientId ?? "");
+  };
+
+  const saveDraft = async () => {
+    if (!draft || validationError) return;
+    setSaving(true);
+    try {
+      await onSave(grokRequestFromDraft(draft));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!config || !draft) {
+    return (
+      <Panel>
+        <CardHead title={t("Grok 配置")} detail={t("正在读取本机 Grok 配置")} />
+        <CardContent>
+          <Button onClick={() => void onRefresh()} variant="outline">
+            <RefreshCw className="h-4 w-4" />
+            {t("重新读取")}
+          </Button>
+        </CardContent>
+      </Panel>
+    );
+  }
+
+  return (
+    <div className="grok-page">
+      <Panel className="grok-overview-panel">
+        <CardHead title={t("本机配置")} detail={config.configPath} />
+        <CardContent className="grok-overview-content">
+          <div className="grok-status-strip">
+            <div>
+              <span>Grok CLI</span>
+              <strong data-status={config.cliInstalled ? "ok" : "missing"}>
+                {config.cliInstalled ? t("已检测") : t("未检测")}
+              </strong>
+              <code>{config.cliPath || t("未找到可执行文件")}</code>
+            </div>
+            <div>
+              <span>config.toml</span>
+              <strong data-status={config.configExists ? "ok" : "missing"}>
+                {config.configExists ? t("已存在") : t("保存时创建")}
+              </strong>
+              <code>{config.grokHome}</code>
+            </div>
+          </div>
+          <div className="grok-global-fields">
+            <Label className="grok-form-row">
+              <span>{t("默认模型")}</span>
+              <Input
+                list="grok-model-aliases"
+                onChange={(event) => setDraft({ ...draft, defaultModel: event.currentTarget.value })}
+                placeholder="grok-build"
+                value={draft.defaultModel}
+              />
+            </Label>
+            <datalist id="grok-model-aliases">
+              {draft.models.map((model) => <option key={model.clientId} value={model.alias} />)}
+            </datalist>
+            <Label className="grok-form-row">
+              <span>{t("模型发现端点")}</span>
+              <Input
+                onChange={(event) => setDraft({ ...draft, modelsBaseUrl: event.currentTarget.value })}
+                placeholder="https://api.example.com/v1"
+                value={draft.modelsBaseUrl}
+              />
+            </Label>
+          </div>
+        </CardContent>
+      </Panel>
+
+      <div className="grok-manager-grid">
+        <Panel className="grok-model-list-panel">
+          <div className="grok-panel-title">
+            <div>
+              <strong>{t("模型配置")}</strong>
+              <span>{tf("{0} 个模型", [draft.models.length])}</span>
+            </div>
+            <Button onClick={addModel} size="sm">
+              <Plus className="h-4 w-4" />
+              {t("新增")}
+            </Button>
+          </div>
+          <div className="grok-model-list">
+            {draft.models.map((model) => (
+              <button
+                className={`grok-model-item ${model.clientId === selectedId ? "active" : ""}`}
+                key={model.clientId}
+                onClick={() => setSelectedId(model.clientId)}
+                type="button"
+              >
+                <span className="grok-model-mark"><Bot className="h-4 w-4" /></span>
+                <span className="grok-model-copy">
+                  <strong>{model.alias || t("未命名")}</strong>
+                  <small>{model.name || model.model || t("未填写模型")}</small>
+                </span>
+                {draft.defaultModel === model.alias ? <UiBadge>{t("默认")}</UiBadge> : null}
+              </button>
+            ))}
+            {!draft.models.length ? <div className="empty">{t("暂无 Grok 模型配置")}</div> : null}
+          </div>
+        </Panel>
+
+        <Panel className="grok-editor-panel">
+          {selected ? (
+            <>
+              <div className="grok-panel-title grok-editor-title">
+                <div>
+                  <strong>{selected.alias || t("未命名模型")}</strong>
+                  <span>{selected.sourceAlias ? t("本机模型配置") : t("新模型配置")}</span>
+                </div>
+                <Button onClick={deleteSelected} size="icon" title={t("删除模型")} variant="outline">
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+              <div className="grok-editor-fields">
+                <Label className="grok-form-row">
+                  <span>{t("模型别名")}</span>
+                  <Input value={selected.alias} onChange={(event) => updateSelected({ alias: event.currentTarget.value })} />
+                </Label>
+                <Label className="grok-form-row">
+                  <span>{t("显示名称")}</span>
+                  <Input value={selected.name} onChange={(event) => updateSelected({ name: event.currentTarget.value })} />
+                </Label>
+                <Label className="grok-form-row">
+                  <span>{t("实际模型 ID")}</span>
+                  <Input placeholder={selected.alias} value={selected.model} onChange={(event) => updateSelected({ model: event.currentTarget.value })} />
+                </Label>
+                <Label className="grok-form-row">
+                  <span>Base URL</span>
+                  <Input placeholder={draft.modelsBaseUrl || "https://api.example.com/v1"} value={selected.baseUrl} onChange={(event) => updateSelected({ baseUrl: event.currentTarget.value })} />
+                </Label>
+                <div className="grok-form-row">
+                  <span>{t("API 协议")}</span>
+                  <div className="grok-protocol-options">
+                    {([
+                      ["responses", "Responses"],
+                      ["chat_completions", "Chat Completions"],
+                      ["messages", "Messages"],
+                    ] as Array<[GrokApiBackend, string]>).map(([value, label]) => (
+                      <button
+                        className={selected.apiBackend === value ? "active" : ""}
+                        key={value}
+                        onClick={() => updateSelected({ apiBackend: value })}
+                        type="button"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <Label className="grok-form-row">
+                  <span>{t("上下文窗口")}</span>
+                  <Input
+                    inputMode="numeric"
+                    placeholder={t("留空使用 Grok 默认值")}
+                    value={selected.contextWindowText}
+                    onChange={(event) => updateSelected({ contextWindowText: event.currentTarget.value.replace(/[^\d]/g, "") })}
+                  />
+                </Label>
+                <div className="grok-form-row">
+                  <span>API Key</span>
+                  <div className="grok-key-control">
+                    <Input
+                      autoComplete="off"
+                      disabled={selected.removeApiKey}
+                      onChange={(event) => updateSelected({ apiKeyUpdate: event.currentTarget.value, removeApiKey: false })}
+                      placeholder={selected.apiKeyConfigured ? t("已配置；留空保持不变") : t("输入 API Key")}
+                      type="password"
+                      value={selected.apiKeyUpdate}
+                    />
+                    <Button
+                      disabled={!selected.apiKeyConfigured && !selected.apiKeyUpdate}
+                      onClick={() => updateSelected({ removeApiKey: !selected.removeApiKey, apiKeyUpdate: "" })}
+                      size="sm"
+                      variant="outline"
+                    >
+                      {selected.removeApiKey ? <RotateCcw className="h-4 w-4" /> : <Trash2 className="h-4 w-4" />}
+                      {selected.removeApiKey ? t("撤销移除") : t("移除 Key")}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="grok-empty-editor">
+              <Bot className="h-5 w-5" />
+              <span>{t("选择或新增一个 Grok 模型")}</span>
+            </div>
+          )}
+        </Panel>
+      </div>
+
+      {dirty ? (
+        <div className="settings-save-bar grok-save-bar">
+          <span className={validationError ? "is-error" : ""}>{validationError || t("Grok 配置有未保存修改")}</span>
+          <Toolbar>
+            <Button disabled={saving} onClick={discard} variant="secondary">{t("放弃修改")}</Button>
+            <Button disabled={saving || Boolean(validationError)} onClick={() => void saveDraft()}>
+              <Save className="h-4 w-4" />
+              {saving ? t("保存中") : t("保存配置")}
+            </Button>
+          </Toolbar>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -6200,6 +6658,7 @@ function SessionsScreen({
                 {t("保存设置")}
               </Button>
             </div>
+            {/* 分享会话导入入口暂时停用，保留实现以便后续恢复。
             <div className="session-share-import">
               <Input
                 aria-label={t("会话分享链接")}
@@ -6212,6 +6671,7 @@ function SessionsScreen({
                 {t("导入链接")}
               </Button>
             </div>
+            */}
           </div>
 
           {providerSyncProgress.active || providerSyncProgress.percent > 0 ? (
@@ -6706,6 +7166,8 @@ function SettingsScreen({
                 min={1}
                 max={100}
                 type="range"
+                // WebKit 没有 ::-moz-range-progress，已填充部分靠这个变量画渐变
+                style={{ "--range-progress": `${form.codexAppImageOverlayOpacity}%` } as CSSProperties}
                 value={form.codexAppImageOverlayOpacity}
                 onChange={(event) =>
                   onFormChange({
@@ -7083,6 +7545,9 @@ function RelayProfileDetail({
   );
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
+  // 通用配置弹窗的开关放在这一层：.relay-profile-editor 有 will-change，
+  // 会给 position:fixed 造包含块，弹窗渲染在卡片里就会被裁进卡片。
+  const [commonConfigOpen, setCommonConfigOpen] = useState(false);
   const [doctorRunning, setDoctorRunning] = useState(false);
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
@@ -7180,62 +7645,60 @@ function RelayProfileDetail({
     : relayProfileEditorStatus(draft, form, isNew);
   return (
     <div className="relay-detail-page" key={profile.id}>
-      <div className="relay-detail-sticky">
-        <div className="relay-editor-heading">
-          <Button aria-label={t("返回列表")} onClick={onBack} size="icon" title={t("返回列表")} type="button" variant="ghost">
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div className="relay-editor-heading-copy">
-            <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
-            <span>{detailStatus}</span>
-          </div>
+      {/* 标题栏 / 滚动区 / 底部操作栏三段式：保存按钮常驻可见，不随表单滚走 */}
+      <div className="relay-detail-header">
+        <Button aria-label={t("返回列表")} onClick={onBack} size="icon" title={t("返回列表")} type="button" variant="outline">
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <div className="relay-editor-heading-copy">
+          <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
+          <span>{detailStatus}</span>
         </div>
-        <div className="relay-editor-actions">
-          {showDoctor ? (
-            <Button disabled={doctorRunning} onClick={() => void runProviderDoctor()} type="button" variant="secondary">
-              <Stethoscope className="h-4 w-4" />
-              {doctorRunning ? t("诊断中") : t("诊断供应商")}
-            </Button>
-          ) : null}
-          {aggregateProfile ? (
-            <UiBadge variant="secondary">{t("聚合")}</UiBadge>
-          ) : isNew ? null : (
-            <Button
-              disabled={!form.relayProfilesEnabled || actions.relaySwitching}
-              onClick={switchDraft}
-              title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
-              variant={draft.id === form.activeRelayId ? "secondary" : "default"}
-            >
-              {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
-            </Button>
-          )}
-          <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")} type="button">
-            <Save className="h-4 w-4" />
-            {t("保存")}
-          </Button>
-        </div>
+        {aggregateProfile ? <UiBadge variant="secondary">{t("聚合")}</UiBadge> : null}
       </div>
-      <RelayProfileEditor
-        profile={draft}
-        form={form}
-        isNew={isNew}
-        onProfileChange={setDraft}
-        actions={actions}
-        modelWindowRows={modelWindowRows}
-        setModelWindowRows={setModelWindowRows}
-      />
-      {isAggregateRelayProfile(draft) ? null : (
-      <RelayFileEditors
-        contextProfile={profile}
-        profile={draft}
-        form={form}
-        isActive={isActive}
-        profileId={profile.id}
-        onFormChange={onFormChange}
-        onProfileChange={setDraft}
-        actions={actions}
-      />
-      )}
+      <div className="relay-detail-body">
+        <RelayProfileEditor
+          profile={draft}
+          form={form}
+          isNew={isNew}
+          onEditCommonConfig={() => setCommonConfigOpen(true)}
+          onProfileChange={setDraft}
+          actions={actions}
+          modelWindowRows={modelWindowRows}
+          setModelWindowRows={setModelWindowRows}
+        />
+        {isAggregateRelayProfile(draft) ? null : (
+        <RelayFileEditors
+          contextProfile={profile}
+          profile={draft}
+          form={form}
+          isActive={isActive}
+          onProfileChange={setDraft}
+        />
+        )}
+      </div>
+      <div className="relay-detail-footer">
+        {showDoctor ? (
+          <Button disabled={doctorRunning} onClick={() => void runProviderDoctor()} type="button" variant="outline">
+            <Stethoscope className="h-4 w-4" />
+            {doctorRunning ? t("诊断中") : t("诊断供应商")}
+          </Button>
+        ) : null}
+        {aggregateProfile || isNew ? null : (
+          <Button
+            disabled={!form.relayProfilesEnabled || actions.relaySwitching}
+            onClick={switchDraft}
+            title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
+            variant={draft.id === form.activeRelayId ? "secondary" : "default"}
+          >
+            {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
+          </Button>
+        )}
+        <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")} type="button">
+          <Save className="h-4 w-4" />
+          {t("保存")}
+        </Button>
+      </div>
       {doctorOpen ? (
         <ProviderDoctorModal
           result={doctorResult}
@@ -7243,6 +7706,17 @@ function RelayProfileDetail({
           onClose={() => {
             if (!doctorRunning) setDoctorOpen(false);
           }}
+        />
+      ) : null}
+      {commonConfigOpen ? (
+        <RelayCommonConfigModal
+          actions={actions}
+          form={form}
+          onClose={() => setCommonConfigOpen(false)}
+          onFormChange={onFormChange}
+          onProfileChange={setDraft}
+          profile={draft}
+          profileId={profile.id}
         />
       ) : null}
     </div>
@@ -7278,10 +7752,149 @@ function ContextScreen({
   );
 }
 
+/**
+ * 「默认模型」字段：可直接输入，也可从上游拉一份模型列表后在下拉里挑。
+ *
+ * 容器故意用 div 而不是 Field 的 label：label 里点按钮会把焦点抢给输入框，
+ * 下拉里的搜索框就拿不到焦点了。
+ */
+function DefaultModelField({
+  value,
+  knownModels,
+  onChange,
+  onFetchModels,
+}: {
+  value: string;
+  knownModels: string[];
+  onChange: (value: string) => void;
+  onFetchModels: () => Promise<string[] | null>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const models = useMemo(
+    () => [...knownModels, ...fetchedModels],
+    [fetchedModels, knownModels],
+  );
+  const groups = useMemo(() => filterModelGroups(models, query), [models, query]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) searchRef.current?.focus();
+    else setQuery("");
+  }, [open]);
+
+  const fetchModels = async () => {
+    setFetching(true);
+    try {
+      const fetched = await onFetchModels();
+      if (fetched?.length) {
+        setFetchedModels(fetched);
+        setOpen(true);
+      }
+    } finally {
+      setFetching(false);
+    }
+  };
+
+  return (
+    <div className="field relay-field-config-model" ref={rootRef}>
+      <span>{t("默认模型")}</span>
+      <div className="default-model-control">
+        <Input
+          onChange={(event) => onChange(event.currentTarget.value)}
+          placeholder={t("例如 deepseek-v4-pro")}
+          value={value}
+        />
+        <Button
+          aria-expanded={open}
+          className={open ? "is-open" : ""}
+          onClick={() => setOpen((previous) => !previous)}
+          size="icon"
+          title={t("选择模型")}
+          type="button"
+          variant="outline"
+        >
+          <ChevronDown className="h-4 w-4" />
+        </Button>
+        <Button
+          disabled={fetching}
+          onClick={() => void fetchModels()}
+          size="icon"
+          title={t("从上游获取")}
+          type="button"
+          variant="outline"
+        >
+          <Download className="h-4 w-4" />
+        </Button>
+        {open ? (
+          <div className="default-model-menu">
+            <div className="default-model-search">
+              <Search className="h-4 w-4" />
+              <input
+                aria-label={t("搜索模型…")}
+                onChange={(event) => setQuery(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") setOpen(false);
+                }}
+                placeholder={t("搜索模型…")}
+                ref={searchRef}
+                value={query}
+              />
+            </div>
+            <div className="default-model-options" role="listbox">
+              {groups.length ? groups.map((group) => (
+                <div className="default-model-group" key={group.label}>
+                  <div className="default-model-group-label">{group.label}</div>
+                  {group.models.map((model) => (
+                    <button
+                      aria-selected={model === value}
+                      className="default-model-option"
+                      key={model}
+                      onClick={() => {
+                        onChange(model);
+                        setOpen(false);
+                      }}
+                      role="option"
+                      type="button"
+                    >
+                      {model}
+                    </button>
+                  ))}
+                </div>
+              )) : (
+                <div className="default-model-empty">
+                  {models.length ? t("没有匹配的模型。") : t("还没有模型列表，先点左边的按钮从上游获取。")}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </div>
+      <p className="field-hint">
+        {t("默认启动 Codex 时使用的模型名，请勿带后缀；上下文窗口请在下方「模型列表」中按模型单独配置。")}
+      </p>
+    </div>
+  );
+}
+
 function RelayProfileEditor({
   profile,
   form,
   isNew = false,
+  onEditCommonConfig,
   onProfileChange,
   actions,
   modelWindowRows,
@@ -7290,12 +7903,14 @@ function RelayProfileEditor({
   profile: RelayProfile;
   form: BackendSettings;
   isNew?: boolean;
+  onEditCommonConfig: () => void;
   onProfileChange: (value: RelayProfile) => void;
   actions: Actions;
   modelWindowRows: ModelWindowRow[];
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const useCommonConfig = profile.useCommonConfig !== false;
   // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
   const vlmUnsupportedProtocol = false;
   if (isAggregateRelayProfile(profile)) {
@@ -7378,98 +7993,33 @@ function RelayProfileEditor({
             ]}
           />
         </Field>
-        <Field className="relay-field-config-model" label={t("配置模型")}>
-          <Input
-            value={profile.model}
-            onChange={(event) => updateDraft({ model: event.currentTarget.value })}
-            placeholder={t("例如 deepseek-v4-pro")}
-          />
-          <p className="field-hint">
-            {t("默认启动 Codex 时使用的模型名，请勿带后缀；上下文窗口请在下方「模型列表」中按模型单独配置。")}
-          </p>
-        </Field>
-        <Field className="relay-field-goals" label={t("Codex 目标")}>
-          <label className="inline-check">
+        {profile.relayMode === "official" ? (
+          <label className="switch-row compact relay-switch-row relay-field-official-usage-alert">
             <input
-              checked={goalsFeatureState.enabled}
-              onChange={(event) =>
-                updateDraft({
-                  configContents: setCodexGoalsFeatureInConfig(profile.configContents, event.currentTarget.checked),
-                })
-              }
+              checked={profile.hideOfficialUsageAlert}
+              onChange={(event) => updateDraft({ hideOfficialUsageAlert: event.currentTarget.checked })}
               type="checkbox"
             />
-            <span>{t("启用目标功能")}</span>
+            <span>
+              <strong>{t("关闭官方低额度提示")}</strong>
+              <small>{t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}</small>
+            </span>
+            <ToggleVisual />
           </label>
-          {goalsFeatureState.inherited ? (
-            <p className="field-hint">{t("当前继承公共配置；修改后将为该供应商保存独立设置。")}</p>
-          ) : null}
-        </Field>
-        {profile.relayMode === "official" ? (
-          <Field className="relay-field-official-usage-alert" label={t("官方登录")}>
-            <label className="inline-check">
-              <input
-                checked={profile.hideOfficialUsageAlert}
-                onChange={(event) => updateDraft({ hideOfficialUsageAlert: event.currentTarget.checked })}
-                type="checkbox"
-              />
-              <span>{t("关闭官方低额度提示")}</span>
-            </label>
-            <p className="field-hint">
-              {t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}
-            </p>
-          </Field>
-        ) : null}
-        <div className="relay-advanced-toggle">
-          <Button
-            aria-expanded={showAdvanced}
-            onClick={() => setShowAdvanced((current) => !current)}
-            size="sm"
-            type="button"
-            variant="secondary"
-          >
-            <Settings className="h-4 w-4" />
-            {t("更多选项")}
-          </Button>
-        </div>
-        {showAdvanced ? (
-          <div className="relay-advanced-fields">
-            <Field className="relay-field-test-model" label={t("测试模型")}>
-              <Input
-                value={profile.testModel}
-                onChange={(event) => updateDraft({ testModel: event.currentTarget.value })}
-                placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
-              />
-            </Field>
-            <Field className="relay-field-context-window" label={t("上下文大小")}>
-              <Input
-                inputMode="numeric"
-                value={profile.contextWindow}
-                onChange={(event) => updateDraft({ contextWindow: event.currentTarget.value.replace(/[^\d]/g, "") })}
-                placeholder={t("留空不改写，例如 200000")}
-              />
-            </Field>
-            <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
-              <Input
-                inputMode="numeric"
-                value={profile.autoCompactLimit}
-                onChange={(event) => updateDraft({ autoCompactLimit: event.currentTarget.value.replace(/[^\d]/g, "") })}
-                placeholder={t("留空不改写，例如 160000")}
-              />
-            </Field>
-          </div>
         ) : null}
         {profile.relayMode === "official" ? (
-          <Field className="relay-field-official-key" label="API Key">
-            <label className="inline-check">
-              <input
-                checked={profile.officialMixApiKey}
-                onChange={(event) => updateDraft({ officialMixApiKey: event.currentTarget.checked })}
-                type="checkbox"
-              />
-              <span>{t("混入 API KEY")}</span>
-            </label>
-          </Field>
+          <label className="switch-row compact relay-switch-row relay-field-official-key">
+            <input
+              checked={profile.officialMixApiKey}
+              onChange={(event) => updateDraft({ officialMixApiKey: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("混入 API KEY")}</strong>
+              <small>{t("官方登录之外再挂一份 API Key，用于额度耗尽时兜底。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
         ) : null}
         {showApiFields ? (
           <div className="relay-api-fields">
@@ -7527,46 +8077,21 @@ function RelayProfileEditor({
                     : t("官方登录未混入 API 时不写入会话 provider")}
               </p>
             </Field>
-            <Field className="relay-field-sub2api" label="Sub2API">
-              <div className="sub2api-field">
-                <label className="inline-check">
-                  <input
-                    checked={profile.sub2apiEnabled}
-                    onChange={(event) => {
-                      const checked = event.currentTarget.checked;
-                      updateDraft({
-                        sub2apiEnabled: checked,
-                        sub2apiMultiplier: checked ? profile.sub2apiMultiplier || "" : "",
-                      });
-                      if (checked && sub2apiBaseUrl && profile.apiKey.trim()) {
-                        void fetchSub2ApiRate();
-                      }
-                    }}
-                    type="checkbox"
-                  />
-                  <span>{t("尝试从sub2api获取倍率显示")}</span>
-                </label>
-                <Button
-                  disabled={!canFetchSub2ApiRate}
-                  onClick={() => void fetchSub2ApiRate()}
-                  size="sm"
-                  type="button"
-                  variant="secondary"
-                >
-                  <Download className="h-4 w-4" />
-                  {t("获取倍率")}
-                </Button>
-              </div>
-              <p className="field-hint">
-                {profile.sub2apiEnabled
-                  ? profile.sub2apiMultiplier.trim()
-                    ? tf("当前缓存倍率：{0}x", [profile.sub2apiMultiplier.trim()])
-                    : t("保存前可先尝试从 /v1/sub2api/billing 获取上游倍率。")
-                  : t("非 Sub2API 供应商不会请求或显示倍率。")}
-              </p>
-            </Field>
           </div>
         ) : null}
+        <DefaultModelField
+          knownModels={modelWindowRows.map((row) => row.model)}
+          onChange={(model) => updateDraft({ model })}
+          onFetchModels={async () => {
+            const serializedRows = serializeModelWindowRows(modelWindowRows);
+            return actions.fetchRelayProfileModels({
+              ...profile,
+              modelList: serializedRows.modelList,
+              modelWindows: serializedRows.modelWindows,
+            });
+          }}
+          value={profile.model}
+        />
         {showApiFields ? (
           <section className="relay-config-section relay-field-model-list">
             <div className="relay-config-section-head">
@@ -7663,6 +8188,70 @@ function RelayProfileEditor({
               ))}
             </div>
           </section>
+        ) : null}
+        <label className="switch-row compact relay-switch-row relay-field-goals">
+          <input
+            checked={goalsFeatureState.enabled}
+            onChange={(event) =>
+              updateDraft({
+                configContents: setCodexGoalsFeatureInConfig(profile.configContents, event.currentTarget.checked),
+              })
+            }
+            type="checkbox"
+          />
+          <span>
+            <strong>{t("启用目标功能")}</strong>
+            <small>
+              {goalsFeatureState.inherited
+                ? t("当前继承公共配置；修改后将为该供应商保存独立设置。")
+                : t("为该供应商单独开启 Codex 目标功能。")}
+            </small>
+          </span>
+          <ToggleVisual />
+        </label>
+        {/* 开关旁边还挂着一个按钮，所以整行用 div：button 套在 label 里点了会误触开关 */}
+        {showApiFields ? (
+          <div className="relay-switch-row relay-field-sub2api">
+            <div className="relay-switch-copy">
+              <strong>{t("尝试从sub2api获取倍率显示")}</strong>
+              <small>
+                {profile.sub2apiEnabled
+                  ? profile.sub2apiMultiplier.trim()
+                    ? tf("当前缓存倍率：{0}x", [profile.sub2apiMultiplier.trim()])
+                    : t("保存前可先尝试从 /v1/sub2api/billing 获取上游倍率。")
+                  : t("非 Sub2API 供应商不会请求或显示倍率。")}
+              </small>
+            </div>
+            <div className="relay-switch-actions">
+              <Button
+                disabled={!canFetchSub2ApiRate}
+                onClick={() => void fetchSub2ApiRate()}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                <Download className="h-4 w-4" />
+                {t("获取倍率")}
+              </Button>
+              <label className="relay-bare-switch" title={t("尝试从sub2api获取倍率显示")}>
+                <input
+                  checked={profile.sub2apiEnabled}
+                  onChange={(event) => {
+                    const checked = event.currentTarget.checked;
+                    updateDraft({
+                      sub2apiEnabled: checked,
+                      sub2apiMultiplier: checked ? profile.sub2apiMultiplier || "" : "",
+                    });
+                    if (checked && sub2apiBaseUrl && profile.apiKey.trim()) {
+                      void fetchSub2ApiRate();
+                    }
+                  }}
+                  type="checkbox"
+                />
+                <ToggleVisual />
+              </label>
+            </div>
+          </div>
         ) : null}
         {showApiFields ? (
           <section className="relay-config-section relay-field-model-routes">
@@ -7772,6 +8361,82 @@ function RelayProfileEditor({
             />
           </Field>
         ) : null}
+        {/* 收起时整个盒子就是这个 button（提示文案也在里面），所以点哪儿都能展开；
+            展开后 button 只剩标题行，下面的输入框才不会被裹进按钮里。 */}
+        <div className="relay-advanced-block">
+          <button
+            aria-expanded={showAdvanced}
+            className="relay-advanced-trigger"
+            onClick={() => setShowAdvanced((current) => !current)}
+            type="button"
+          >
+            <span className="relay-advanced-trigger-head">
+              <ChevronDown className={`relay-advanced-chevron h-4 w-4${showAdvanced ? " is-open" : ""}`} />
+              <Settings className="h-4 w-4" />
+              {t("更多选项")}
+            </span>
+            {showAdvanced ? null : (
+              <span className="relay-advanced-hint">{t("包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。")}</span>
+            )}
+          </button>
+          {showAdvanced ? (
+            <div className="relay-advanced-fields">
+              <Field className="relay-field-test-model" label={t("测试模型")}>
+                <Input
+                  value={profile.testModel}
+                  onChange={(event) => updateDraft({ testModel: event.currentTarget.value })}
+                  placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
+                />
+              </Field>
+              <Field className="relay-field-context-window" label={t("上下文大小")}>
+                <Input
+                  inputMode="numeric"
+                  value={profile.contextWindow}
+                  onChange={(event) => updateDraft({ contextWindow: event.currentTarget.value.replace(/[^\d]/g, "") })}
+                  placeholder={t("留空不改写，例如 200000")}
+                />
+              </Field>
+              <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
+                <Input
+                  inputMode="numeric"
+                  value={profile.autoCompactLimit}
+                  onChange={(event) => updateDraft({ autoCompactLimit: event.currentTarget.value.replace(/[^\d]/g, "") })}
+                  placeholder={t("留空不改写，例如 160000")}
+                />
+              </Field>
+            </div>
+          ) : null}
+        </div>
+        {/* 整行是 label，点盒子任意处都能切开关；里面的「编辑通用配置」按钮自己
+            preventDefault，否则会连带触发 label 的开关。ToggleVisual 必须是
+            input 的直接同级，:checked ~ 才选得到。 */}
+        <label className="switch-row compact relay-switch-row relay-field-common-config">
+          <input
+            checked={useCommonConfig}
+            onChange={(event) => updateDraft({ useCommonConfig: event.currentTarget.checked })}
+            type="checkbox"
+          />
+          <span className="relay-switch-copy">
+            <strong>{t("应用通用配置")}</strong>
+            <small>
+              {useCommonConfig
+                ? t("切换到此供应商时，会把通用配置合并进 config.toml。")
+                : t("此供应商只写入自己的 config.toml，不合并通用配置。")}
+            </small>
+          </span>
+          <button
+            className="relay-link-button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onEditCommonConfig();
+            }}
+            type="button"
+          >
+            {t("编辑通用配置")}
+          </button>
+          <ToggleVisual />
+        </label>
       </div>
       {showApiFields && profile.protocol === "chatCompletions" ? (
         <div className="hint-line relay-protocol-hint">
@@ -8111,14 +8776,24 @@ function ContextEntryEditor({
   );
 }
 
-function SyncedTextarea({
+/**
+ * 带语法着色和行号的编辑器：透明 textarea 叠在着色后的 <pre> 上。
+ * 两层共用同一套字体与内边距，所以字形位置天然对齐；不换行，横向溢出交给外层滚动。
+ */
+function SyncedCodeEditor({
   value,
   onValueChange,
+  language,
   className,
+  readOnly,
+  ariaLabel,
 }: {
   value: string;
   onValueChange: (value: string) => void;
+  language: CodeLanguage;
   className?: string;
+  readOnly?: boolean;
+  ariaLabel?: string;
 }) {
   const [localValue, setLocalValue] = useState(value);
   const isFocusedRef = useRef(false);
@@ -8131,24 +8806,50 @@ function SyncedTextarea({
     }
   }, [value]);
 
+  const lines = useMemo(() => tokenizeCode(localValue, language), [localValue, language]);
+
   return (
-    <Textarea
-      className={className}
-      value={localValue}
-      onBlur={() => {
-        isFocusedRef.current = false;
-        setLocalValue(latestExternalValueRef.current);
-      }}
-      onChange={(event) => {
-        const next = event.currentTarget.value;
-        setLocalValue(next);
-        onValueChange(next);
-      }}
-      onFocus={() => {
-        isFocusedRef.current = true;
-      }}
-      spellCheck={false}
-    />
+    <div className={`code-editor${className ? ` ${className}` : ""}`}>
+      <div aria-hidden="true" className="code-editor-gutter">
+        {lines.map((_line, index) => (
+          <span key={index}>{index + 1}</span>
+        ))}
+      </div>
+      <div className="code-editor-scroll">
+        <pre aria-hidden="true" className="code-editor-highlight">
+          {lines.map((line, index) => (
+            <span className="code-editor-line" key={index}>
+              {line.map((token, tokenIndex) => (
+                <span className={`tok-${token.kind}`} key={tokenIndex}>{token.text}</span>
+              ))}
+              {"\n"}
+            </span>
+          ))}
+        </pre>
+        <textarea
+          aria-label={ariaLabel}
+          autoCapitalize="off"
+          autoCorrect="off"
+          className="code-editor-input"
+          onBlur={() => {
+            isFocusedRef.current = false;
+            setLocalValue(latestExternalValueRef.current);
+          }}
+          onChange={(event) => {
+            const next = event.currentTarget.value;
+            setLocalValue(next);
+            onValueChange(next);
+          }}
+          onFocus={() => {
+            isFocusedRef.current = true;
+          }}
+          readOnly={readOnly}
+          spellCheck={false}
+          value={localValue}
+          wrap="off"
+        />
+      </div>
+    </div>
   );
 }
 
@@ -8157,24 +8858,20 @@ function RelayFileEditors({
   profile,
   form,
   isActive,
-  profileId,
-  onFormChange,
   onProfileChange,
-  actions,
 }: {
   contextProfile: RelayProfile;
   profile: RelayProfile;
   form: BackendSettings;
   isActive: boolean;
-  profileId: string;
-  onFormChange: (value: BackendSettings) => void;
   onProfileChange: (value: RelayProfile) => void;
-  actions: Actions;
 }) {
+  // 「应用通用配置」开关在上面的 RelayProfileEditor 里；这里只读它来决定预览剥离什么
+  const useCommonConfig = profile.useCommonConfig !== false;
   const configPreview = effectiveRelayConfigPreview(profile, form, contextProfile);
   const entries = contextEntriesForProfile(form, contextProfile);
   return (
-    <div className="relay-file-grid">
+      <div className="relay-file-grid">
       <div className="relay-file-panel">
         <div className="relay-file-head">
           <div>
@@ -8182,13 +8879,18 @@ function RelayFileEditors({
             <span>{isActive ? t("当前供应商切换后会写入的预览；上下文开关变化会立即反映") : t("切换到此供应商时会写入的预览；上下文开关变化会立即反映")}</span>
           </div>
         </div>
-        <SyncedTextarea
+        <SyncedCodeEditor
+          ariaLabel="config.toml"
           className="relay-file-textarea"
+          language="toml"
           value={configPreview}
           onValueChange={(value) => {
+            // 预览里合并了什么就剥掉什么：关掉开关时通用配置没进来，只剥上下文部分
             const withoutCommon = stripCommonConfigTextFallback(
               value,
-              relayCombinedCommonConfig(form),
+              useCommonConfig
+                ? relayCombinedCommonConfig(form)
+                : form.relayContextConfigContents || "",
             );
             const configContents = stripContextEntriesFromConfig(withoutCommon, entries);
             onProfileChange(deriveRelayProfileFromFiles({
@@ -8201,9 +8903,63 @@ function RelayFileEditors({
       <div className="relay-file-panel">
         <div className="relay-file-head">
           <div>
-            <strong>{t("通用配置文件")}</strong>
-            <span>{t("只保留非 MCP、Skills、Plugins 的跨供应商配置；工具与插件在独立页面管理。")}</span>
+            <strong>auth.json</strong>
+            <span>{isActive
+              ? profile.relayMode === "pureApi"
+                ? t("当前使用中：保留此供应商的 auth 存档，避免 Codex 登录密钥覆盖供应商密钥")
+                : t("当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档")
+              : t("切换到此供应商时会写入 ~/.codex/auth.json")}</span>
           </div>
+        </div>
+        <SyncedCodeEditor
+          ariaLabel="auth.json"
+          className="relay-file-textarea"
+          language="json"
+          value={profile.authContents}
+          onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }))}
+        />
+      </div>
+      </div>
+  );
+}
+
+function RelayCommonConfigModal({
+  profile,
+  profileId,
+  form,
+  onClose,
+  onFormChange,
+  onProfileChange,
+  actions,
+}: {
+  profile: RelayProfile;
+  profileId: string;
+  form: BackendSettings;
+  onClose: () => void;
+  onFormChange: (value: BackendSettings) => void;
+  onProfileChange: (value: RelayProfile) => void;
+  actions: Actions;
+}) {
+  return (
+    <div aria-modal="true" className="modal-backdrop" role="dialog">
+      <div className="modal-card relay-common-config">
+        <div className="modal-head">
+          <div>
+            <h2>{t("通用配置文件")}</h2>
+            <p className="modal-message">
+              {t("只保留非 MCP、Skills、Plugins 的跨供应商配置；工具与插件在独立页面管理。")}
+            </p>
+          </div>
+          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onClose} type="button">×</button>
+        </div>
+        <SyncedCodeEditor
+          ariaLabel={t("通用配置文件")}
+          className="relay-file-textarea"
+          language="toml"
+          value={form.relayCommonConfigContents}
+          onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
+        />
+        <Toolbar>
           <Button
             onClick={async () => {
               const extracted = await actions.extractRelayCommonConfig(profile.configContents || "");
@@ -8234,29 +8990,8 @@ function RelayFileEditors({
             <Download className="h-4 w-4" />
             {t("提取当前供应商配置")}
           </Button>
-        </div>
-        <SyncedTextarea
-          className="relay-file-textarea"
-          value={form.relayCommonConfigContents}
-          onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
-        />
-      </div>
-      <div className="relay-file-panel">
-        <div className="relay-file-head">
-          <div>
-            <strong>auth.json</strong>
-            <span>{isActive
-              ? profile.relayMode === "pureApi"
-                ? t("当前使用中：保留此供应商的 auth 存档，避免 Codex 登录密钥覆盖供应商密钥")
-                : t("当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档")
-              : t("切换到此供应商时会写入 ~/.codex/auth.json")}</span>
-          </div>
-        </div>
-        <SyncedTextarea
-          className="relay-file-textarea"
-          value={profile.authContents}
-          onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }))}
-        />
+          <Button onClick={onClose} size="sm" type="button" variant="secondary">{t("关闭窗口")}</Button>
+        </Toolbar>
       </div>
     </div>
   );
@@ -9011,6 +9746,7 @@ function routeSubtitle(route: Route) {
   const subtitles: Record<Route, string> = {
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
+    grok: t("管理 Grok CLI 的模型与 API 端点"),
     relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP、Skills、Plugins"),
@@ -9261,7 +9997,9 @@ function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSet
   const entries = contextEntriesForProfile(settings, contextProfile);
   const isolatedConfig = stripContextEntriesFromConfig(profile.configContents, entries);
   const configWithLimits = applyContextLimitPreview(isolatedConfig, profile);
-  const profileAndCommon = mergeFeaturesTableForPreview(configWithLimits, settings.relayCommonConfigContents || "");
+  // 与后端 relay_config.rs 保持一致：关掉「应用通用配置」的供应商不合并通用配置
+  const commonConfig = profile.useCommonConfig !== false ? settings.relayCommonConfigContents || "" : "";
+  const profileAndCommon = mergeFeaturesTableForPreview(configWithLimits, commonConfig);
   return joinTomlSectionsRootFirst([profileAndCommon, selectedContextConfigToml(entries)]);
 }
 
@@ -10391,7 +11129,8 @@ function ensureCodexProviderDefaults(
 ): string {
   let next = contents;
   const section = `model_providers.${provider}`;
-  next = setTomlSectionStringKey(next, section, "name", provider);
+  // name 只是展示用标签，允许与表名不同；用户改过就沿用，别覆盖回表名。
+  next = setTomlSectionStringKey(next, section, "name", resolveProviderName(next, provider));
   next = setTomlSectionStringKey(next, section, "wire_api", "responses");
   return options.requiresOpenAiAuth === false ? next : setTomlSectionBoolKey(next, section, "requires_openai_auth", true);
 }

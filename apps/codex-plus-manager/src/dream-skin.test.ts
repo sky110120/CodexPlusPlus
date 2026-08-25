@@ -285,11 +285,28 @@ describe("dream skin theme helpers", () => {
     assert.match(handler, /setDreamSkinVerification\(null\)/);
   });
 
-  it("loads pending shared sessions on startup and while the manager is open", async () => {
-    const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+  it("keeps session sharing entry points disabled while preserving recovery code", async () => {
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    const manager = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+    const commands = await readFile(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
+    const main = await readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8");
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const activeSource = (source: string) => source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .map((line) => line.replace(/\/\/.*$/, ""))
+      .join("\n");
 
-    assert.ok((source.match(/refreshPendingSessionShare\(true\)/g) ?? []).length >= 2);
-    assert.equal((source.match(/<PendingProviderImportDialog/g) ?? []).length, 1);
+    assert.match(app, /const refreshPendingSessionShare = async/);
+    assert.match(commands, /pub fn load_pending_session_share/);
+    assert.match(main, /分享会话协议入口暂时停用/);
+    assert.match(renderer, /function installSessionShareButton\(\)/);
+    assert.doesNotMatch(activeSource(app), /\b(?:await|void)\s+refreshPendingSessionShare\(true\);/);
+    assert.doesNotMatch(activeSource(manager), /\bcommands::(?:load_pending_session_share|import_session_url),/);
+    assert.doesNotMatch(activeSource(main), /\bhandle_session_share_url\(/);
+    assert.doesNotMatch(activeSource(renderer), /\binstallSessionShareImportListener\(\);/);
+    assert.doesNotMatch(activeSource(renderer), /\brunScanStep\(installSessionShareButton\);/);
+    assert.equal((app.match(/<PendingProviderImportDialog/g) ?? []).length, 1);
   });
 
   it("restores the original appearance as pending without reloading or restarting Codex", async () => {

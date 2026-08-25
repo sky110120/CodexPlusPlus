@@ -27,7 +27,6 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex 应用路径": "Codex app path",
   "Codex 意外停止": "Codex stopped unexpectedly",
   "Codex 版本": "Codex version",
-  "Codex 目标": "Codex goals",
   "Codex CLI 路径": "Codex CLI path",
   "JOJO Code 提供稳定、价格合理的 API 中转服务，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力。":
     "JOJO Code provides a stable, competitively priced API relay supporting the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2 and other models plus image capabilities.",
@@ -443,6 +442,11 @@ export const EN_PLAIN: Record<string, string> = {
   "启用此扩展项": "Enable this entry",
   "启用目标功能": "Enable goals feature",
   "当前继承公共配置；修改后将为该供应商保存独立设置。": "Currently inherited from the common configuration; changing it saves a provider-specific override.",
+  "为该供应商单独开启 Codex 目标功能。": "Enable the Codex goals feature for this provider only.",
+  "包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。":
+    "Covers the test model, context size and compaction threshold; leave blank to keep the global defaults.",
+  "官方登录之外再挂一份 API Key，用于额度耗尽时兜底。":
+    "Keep an extra API key alongside the official login as a fallback when the quota runs out.",
   "图片": "Image",
   "图片覆盖层": "Image overlay",
   "在会话列表悬停显示删除按钮，并支持撤销。": "Show a delete button on hover in the session list, with undo support.",
@@ -888,9 +892,20 @@ export const EN_PLAIN: Record<string, string> = {
   "选择应用目录": "Select app directory",
   "选择覆盖图片": "Select overlay image",
   "通用配置文件": "Common config file",
+  "关闭窗口": "Close",
+  "选择模型": "Pick a model",
+  "搜索模型…": "Search models…",
+  "没有匹配的模型。": "No matching models.",
+  "还没有模型列表，先点左边的按钮从上游获取。":
+    "No model list yet — use the button on the left to fetch from upstream.",
+  "应用通用配置": "Apply common config",
+  "编辑通用配置": "Edit common config",
+  "切换到此供应商时，会把通用配置合并进 config.toml。":
+    "Switching to this provider merges the common config into config.toml.",
+  "此供应商只写入自己的 config.toml，不合并通用配置。":
+    "This provider writes only its own config.toml and skips the common config.",
   "配置": "Config",
   "配置文件": "Config file",
-  "配置模型": "Config model",
   "重启 Codex++": "Restart Codex++",
   "重新安装": "Reinstall",
   "重新生成": "Regenerate",
@@ -941,10 +956,47 @@ export const EN_PLAIN: Record<string, string> = {
   "单模型路由需要填写模型名称和目标供应商。": "Each model route requires a model name and target provider.",
   "仅在当前供应商启用时生效；精确匹配模型名并使用目标供应商的 URL 与 Key。目标必须是 Responses API，且需要从 Codex++ 启动。":
     "Applies only while this provider is active. It exactly matches the model name and uses the target provider's URL and key. The target must use the Responses API, and Codex must be launched through Codex++.",
+  "Grok 配置": "Grok configuration",
+  "正在读取本机 Grok 配置": "Reading local Grok configuration",
+  "重新读取": "Reload",
+  "本机配置": "Local configuration",
+  "未检测": "Not detected",
+  "未找到可执行文件": "Executable not found",
+  "已存在": "Exists",
+  "保存时创建": "Created on save",
+  "默认模型": "Default model",
+  "模型发现端点": "Model discovery endpoint",
+  "模型配置": "Model configurations",
+  "未填写模型": "Model not set",
+  "未命名": "Unnamed",
+  "默认": "Default",
+  "暂无 Grok 模型配置": "No Grok model configurations",
+  "未命名模型": "Unnamed model",
+  "本机模型配置": "Local model configuration",
+  "新模型配置": "New model configuration",
+  "模型别名": "Model alias",
+  "显示名称": "Display name",
+  "实际模型 ID": "Model ID",
+  "API 协议": "API protocol",
+  "留空使用 Grok 默认值": "Leave empty to use the Grok default",
+  "已配置；留空保持不变": "Configured; leave empty to keep it",
+  "输入 API Key": "Enter API key",
+  "撤销移除": "Undo removal",
+  "移除 Key": "Remove key",
+  "选择或新增一个 Grok 模型": "Select or add a Grok model",
+  "Grok 配置有未保存修改": "Grok configuration has unsaved changes",
+  "保存中": "Saving",
+  "保存配置": "Save configuration",
+  "模型别名不能为空。": "Model alias cannot be empty.",
+  "模型别名不能重复。": "Model aliases must be unique.",
+  "管理 Grok CLI 的模型与 API 端点": "Manage Grok CLI models and API endpoints",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 个模型": "{0} model(s)",
+  "删除 Grok 模型「{0}」？": "Delete Grok model \"{0}\"?",
+  "模型「{0}」的上下文窗口必须是大于 0 的整数。": "The context window for model \"{0}\" must be a positive integer.",
   "作者：{0} · {1}": "Author: {0} · {1}",
   "清单更新于 {0}，安装后会保存到“我的主题”。": "Manifest updated {0}. Installed themes are saved under My themes.",
   "，补齐 {0} 条侧边栏索引": ", added {0} missing sidebar index entry/entries",
@@ -1026,6 +1078,8 @@ export const EN_TEMPLATE: Record<string, string> = {
 // at the display layer (showNotice wraps message with t()). Exact-match first,
 // then pattern-based for messages that embed dynamic values.
 export const EN_BACKEND: Record<string, string> = {
+  "Grok 配置已加载。": "Grok configuration loaded.",
+  "Grok 配置已保存。": "Grok configuration saved.",
   "主题市场已刷新。": "Theme marketplace refreshed.",
   "已加载主题市场缓存。": "Loaded the cached theme marketplace.",
   "主题 ID 不能为空。": "Theme ID cannot be empty.",
@@ -1113,6 +1167,8 @@ export const EN_BACKEND: Record<string, string> = {
 // Pattern-based backend translations: [regex, replacement template].
 // Checked when EN_BACKEND exact match fails — covers messages with dynamic values.
 export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
+  [/^读取 Grok 配置失败：(.+)$/, "Failed to read Grok configuration: $1"],
+  [/^保存 Grok 配置失败：(.+)$/, "Failed to save Grok configuration: $1"],
   [/^主题市场加载失败：(.+)$/, "Failed to load theme marketplace: $1"],
   [/^安装市场主题失败：(.+)$/, "Failed to install marketplace theme: $1"],
   [/^启动静默入口失败：(.+)$/, "Failed to launch silent entrypoint: $1"],

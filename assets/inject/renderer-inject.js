@@ -2824,6 +2824,10 @@
   const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
   const codexServiceTierFallbackFastValue = "priority";
   const codexServiceTierModulePromises = new Map();
+  // namePart -> { at, attempts, error }，见 loadCodexAppModule 里的说明。
+  const codexAppModuleFailures = new Map();
+  const codexAppModuleRetryCooldownMs = 30000;
+  const codexAppModuleMaxAttempts = 8;
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
@@ -2870,14 +2874,37 @@
     return "";
   }
 
+  // issue #1960：失败必须被记住。之前失败只是把 promise 从 map 里删掉，
+  // 于是任何调用方下一次重试都会重新走 codexAppAssetUrlFromScriptText()，
+  // 把全部 app asset（实测 121 个）重新 fetch 一遍再跑三条正则。
+  // 这个 loader 有四个调用方，其中 installCodexServiceTierDispatcherPatch()
+  // 挂在 scanLightweight() 里、每轮 scan 都试三个前缀，Codex 侧改名后就成了永不停止的重扫：
+  // 实测空闲时 301 次请求/秒，主线程 TaskOtherDuration 占满一半 CPU，JS 堆每秒涨约 1MB，
+  // Sentry 又给每个请求记一条 breadcrumb 并回同步一次 scope，把量再翻一倍推给 browser 进程。
+  // 记住失败 + 冷却重试，让下游即便还在轮询也只会周期性地试一次。
   async function loadCodexAppModule(namePart) {
     if (!codexServiceTierModulePromises.has(namePart)) {
+      const failure = codexAppModuleFailures.get(namePart);
+      if (failure
+          && (failure.attempts >= codexAppModuleMaxAttempts
+            || Date.now() - failure.at < codexAppModuleRetryCooldownMs)) {
+        throw failure.error;
+      }
       const promise = Promise.resolve().then(async () => {
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
         if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
         return await import(url);
+      }).then((module) => {
+        // Codex 更新后 asset 可能又出现，成功时把失败记录清掉，冷却计数重新开始。
+        codexAppModuleFailures.delete(namePart);
+        return module;
       }).catch((error) => {
         codexServiceTierModulePromises.delete(namePart);
+        codexAppModuleFailures.set(namePart, {
+          at: Date.now(),
+          attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
+          error,
+        });
         throw error;
       });
       codexServiceTierModulePromises.set(namePart, promise);
@@ -4063,8 +4090,21 @@
     return dispatcherClass?.getInstance?.() || null;
   }
 
+  const serviceTierDispatcherPatchMaxMisses = 8;
+  let serviceTierDispatcherPatchMissCount = 0;
+  let serviceTierDispatcherPatchDisabled = false;
+  let serviceTierDispatcherPatchPromise = null;
+
+  // issue #1960：这是 installAppServerModelRequestPatch（#1324）和插件市场那两层的同一个缺陷。
+  // 补丁挂在 scanLightweight() 里每轮都跑，而早退守卫只在装上之后才写入，
+  // Codex 侧 asset 改名后就永远装不上，于是每轮 scan 重新拉一遍全部 app asset，
+  // 而且每轮都发一条相同的诊断。首次失败仍上报以便定位，之后噤声，连续失败够多次就停掉这一层。
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
+    if (serviceTierDispatcherPatchDisabled) return;
+    // 上一轮没跑完就不要再起一轮：loadDispatcher() 会依次试三个前缀，
+    // 没有这道去重时 scan 的频率就直接变成并发全量扫描的频率。
+    if (serviceTierDispatcherPatchPromise) return;
     const loadDispatcher = async () => {
       const errors = [];
       for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-"]) {
@@ -4090,15 +4130,28 @@
         };
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
+        serviceTierDispatcherPatchMissCount = 0;
         sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
       } catch (error) {
-        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
-          errorName: error?.name || "",
-          errorMessage: error?.message || String(error),
-        });
+        serviceTierDispatcherPatchMissCount += 1;
+        if (serviceTierDispatcherPatchMissCount === 1) {
+          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
+            errorName: error?.name || "",
+            errorMessage: error?.message || String(error),
+          });
+        }
+        if (serviceTierDispatcherPatchMissCount >= serviceTierDispatcherPatchMaxMisses
+            && !serviceTierDispatcherPatchDisabled) {
+          serviceTierDispatcherPatchDisabled = true;
+          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_skipped", {
+            misses: serviceTierDispatcherPatchMissCount,
+          });
+        }
+      } finally {
+        serviceTierDispatcherPatchPromise = null;
       }
     };
-    void patch();
+    serviceTierDispatcherPatchPromise = patch();
   }
 
   async function loadBackendSettingsState() {
@@ -5823,9 +5876,44 @@
     window.__codexPluginMarketplaceWindowEventPatch = codexPluginMarketplaceUnlockVersion;
   }
 
+  const pluginMarketplaceRequestPatchMaxMisses = 8;
+  let pluginMarketplaceRequestPatchMissCount = 0;
+  let pluginMarketplaceRequestPatchDisabled = false;
+  let pluginMarketplaceRequestPatchPromise = null;
+
+  function notePluginMarketplaceRequestPatchMiss(event, detail) {
+    pluginMarketplaceRequestPatchMissCount += 1;
+    // 和 installAppServerModelRequestPatch 里那段(issue #1324)是同一类问题,当时只修了 model 那一层。
+    // 这个补丁在 scanDeferred() 里每轮都会跑,而早退守卫 __codexPluginMarketplaceUnlockInstalled
+    // 只在 patchedCount > 0 时才写入。Codex 侧改名/移除对应 asset 后这层永远成功不了,
+    // 守卫就永远不设,于是每轮 scan 都重新把全部 app asset fetch 一遍再跑正则匹配,
+    // 而且没有 in-flight 去重,尝试之间还会并发堆叠。
+    // 实测空闲状态下 530 次 fetch/秒(单个 asset 最高 265 次/秒),渲染进程 CPU 40%~60% 且持续爬升(issue #1960)。
+    // 首次 miss 仍然上报,保证 telemetry 能定位原因,之后噤声;连续失败够多次就停掉这一层。
+    // 这是优雅降级:插件市场解锁还有 bridge / window-event 两层补丁各自独立工作。
+    if (pluginMarketplaceRequestPatchMissCount === 1) {
+      sendCodexPlusDiagnostic(event, detail);
+    }
+    if (
+      pluginMarketplaceRequestPatchMissCount >= pluginMarketplaceRequestPatchMaxMisses
+      && !pluginMarketplaceRequestPatchDisabled
+    ) {
+      pluginMarketplaceRequestPatchDisabled = true;
+      sendCodexPlusDiagnostic("plugin_marketplace_request_patch_skipped", {
+        misses: pluginMarketplaceRequestPatchMissCount,
+        lastEvent: event,
+      });
+    }
+  }
+
   function installPluginMarketplaceRequestPatch() {
     if (window.__codexPluginMarketplaceUnlockInstalled === codexPluginMarketplaceUnlockVersion) return;
-    if (!pluginMarketplaceUnlockActive()) return;
+    if (pluginPatchDisabledInRelayMode()) return;
+    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (pluginMarketplaceRequestPatchDisabled) return;
+    // 上一轮还没跑完就不要再起一轮:loadAppServerRequestCandidates() 会把所有 app asset 拉一遍,
+    // 没有这道去重时 scan 的频率直接变成并发 fetch 的频率。
+    if (pluginMarketplaceRequestPatchPromise) return;
     const patch = async () => {
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
@@ -5835,6 +5923,7 @@
         }
         if (patchedCount > 0) {
           window.__codexPluginMarketplaceUnlockInstalled = codexPluginMarketplaceUnlockVersion;
+          pluginMarketplaceRequestPatchMissCount = 0;
           sendCodexPlusDiagnostic("plugin_marketplace_request_patch_installed", {
             moduleCount: modules.length,
             candidateCount: candidates.length,
@@ -5843,7 +5932,7 @@
             discovery,
           });
         } else {
-          sendCodexPlusDiagnostic("plugin_marketplace_request_patch_not_found", {
+          notePluginMarketplaceRequestPatchMiss("plugin_marketplace_request_patch_not_found", {
             moduleCount: modules.length,
             candidateCount: candidates.length,
             sources,
@@ -5851,13 +5940,15 @@
           });
         }
       } catch (error) {
-        sendCodexPlusDiagnostic("plugin_marketplace_request_patch_failed", {
+        notePluginMarketplaceRequestPatchMiss("plugin_marketplace_request_patch_failed", {
           errorName: error?.name || "",
           errorMessage: error?.message || String(error),
         });
+      } finally {
+        pluginMarketplaceRequestPatchPromise = null;
       }
     };
-    void patch();
+    pluginMarketplaceRequestPatchPromise = patch();
   }
 
   function pluginPatchDisabledInRelayMode() {
@@ -7817,6 +7908,298 @@
     document.body.appendChild(toast);
     setTimeout(() => toast.remove(), 10000);
   }
+
+  /* 上游合并时重复带入的会话分享实现暂时注释保留；前面的本地实现作为唯一实现。
+  function shareBase64Url(bytes) {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function shareTextFromElement(element) {
+    const clone = element.cloneNode(true);
+    clone.querySelectorAll?.("button, textarea, input, select, [contenteditable='true'], .codex-delete-toast, .codex-plus-modal-overlay, .codex-plus-page-overlay, .codex-session-share-button").forEach((node) => node.remove());
+    return String(clone.innerText || clone.textContent || "").replace(/\u00a0/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function sessionShareMarkdown() {
+    const ref = currentSessionRef();
+    if (!ref.session_id) return { ref, markdown: "" };
+    const root = conversationRoot();
+    if (!root) return { ref, markdown: "" };
+    const authored = Array.from(root.querySelectorAll("[data-message-author-role]"));
+    const knownTurns = Array.from(root.querySelectorAll([
+      '[data-testid="conversation-turn"]',
+      '[data-testid*="message"]',
+      '[data-message-content]',
+      'main .prose',
+      '[class*="message-bubble"]',
+      '[class*="MessageBubble"]',
+      '[class*="user-message"]',
+      '[class*="UserMessage"]',
+    ].join(",")));
+    const turns = authored.length ? authored : knownTurns;
+    const seen = new Set();
+    const messages = turns.map((node) => {
+      if (!(node instanceof HTMLElement) || seen.has(node)) return "";
+      if (node.parentElement?.closest?.('[data-message-author-role], [data-testid="conversation-turn"]')) return "";
+      seen.add(node);
+      const text = shareTextFromElement(node);
+      if (!text) return "";
+      const role = String(node.getAttribute("data-message-author-role") || "").toLowerCase();
+      const label = role === "user" ? "用户" : role === "assistant" ? "助手" : "消息";
+      return { role: role === "user" || role === "assistant" ? role : "message", label, text };
+    }).filter(Boolean);
+    const title = String(ref.title || document.querySelector(selectors.threadTitle)?.textContent || "未命名会话").replace(/\s+/g, " ").trim();
+    let content = messages.map((message) => `### ${message.label}\n\n${message.text}`).join("\n\n");
+    if (!content) {
+      const fallback = root.cloneNode(true);
+      fallback.querySelectorAll?.([
+        ".composer-footer", ".composer-surface-chrome", "form", "header", "nav", "aside",
+        "button", "textarea", "input", "select", "[contenteditable='true']",
+        ".codex-delete-toast", ".codex-plus-modal-overlay", ".codex-plus-page-overlay",
+        ".codex-session-share-button",
+      ].join(",")).forEach((node) => node.remove());
+      content = String(fallback.innerText || fallback.textContent || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      if (content) messages.push({ role: "message", label: "会话", text: content });
+    }
+    const markdown = `# ${title || "未命名会话"}\n\n- 会话 ID：\`${ref.session_id}\`\n\n${content}`.slice(0, codexPlusShareMaxCharacters);
+    return {
+      ref,
+      markdown: content ? markdown : "",
+      session: content ? {
+        version: 1,
+        kind: "codex-session",
+        session_id: ref.session_id,
+        title: title || "未命名会话",
+        messages: messages.map(({ role, text }) => ({ role, text })),
+      } : null,
+    };
+  }
+
+  async function encryptSessionShare(value) {
+    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(value));
+    const exportedKey = await crypto.subtle.exportKey("raw", key);
+    return {
+      key: shareBase64Url(new Uint8Array(exportedKey)),
+      encrypted: {
+        v: 1,
+        iv: shareBase64Url(iv),
+        ciphertext: shareBase64Url(new Uint8Array(ciphertext)),
+      },
+    };
+  }
+
+  async function createSessionShare() {
+    const { ref, markdown, session } = sessionShareMarkdown();
+    if (!ref.session_id) {
+      showToast("当前页面还没有可分享的会话", null);
+      return;
+    }
+    if (!markdown || !session) {
+      showToast("当前会话还没有可分享的消息", null);
+      return;
+    }
+    const shareWindow = window.open("about:blank", "_blank");
+    const button = document.querySelector(`.${sessionShareButtonClass}`);
+    if (button) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = "正在创建…";
+    }
+    try {
+      let shareDocument = session;
+      const nativeSession = await postJson("/session/export", {
+        session_id: ref.session_id,
+        title: session.title,
+      });
+      if (nativeSession?.status !== "ok" || nativeSession.kind !== "codex-rollout" || typeof nativeSession.content !== "string") {
+        throw new Error(nativeSession?.message || "无法读取完整 Codex 会话文件");
+      }
+      shareDocument = { ...nativeSession, title: session.title };
+      const encrypted = await encryptSessionShare(JSON.stringify(shareDocument));
+      const payload = { ttl: 604800, encrypted: encrypted.encrypted };
+      let result;
+      let baseUrl = codexPlusShareBaseUrl;
+      try {
+        result = await postJson("/share/create", payload);
+        if (result?.id) {
+          baseUrl = codexPlusShareBaseUrl;
+        } else if (result?.status !== "failed") {
+          throw new Error(result?.message || "创建分享失败");
+        }
+      } catch (_) {
+        result = null;
+      }
+      if (!result?.id) {
+        let response;
+        try {
+          response = await fetch(`${baseUrl}/api/shares`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        } catch (_) {
+          baseUrl = codexPlusShareFallbackBaseUrl;
+          response = await fetch(`${baseUrl}/api/shares`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        }
+        result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.id) throw new Error(result.error || `创建分享失败（HTTP ${response.status}）`);
+      }
+      const shareUrl = `${baseUrl}/?s=${encodeURIComponent(result.id)}#k=${encrypted.key}`;
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+      } catch (_) {
+        const input = document.createElement("input");
+        input.value = shareUrl;
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand("copy");
+        input.remove();
+      }
+      showToast("会话分享链接已复制", null);
+      if (shareWindow && !shareWindow.closed) shareWindow.location.href = shareUrl;
+    } catch (error) {
+      if (shareWindow && !shareWindow.closed) shareWindow.close();
+      showToast(error?.message || "创建分享失败，请稍后重试", null);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+        button.textContent = "分享会话";
+      }
+    }
+  }
+
+  function installSessionShareButton() {
+    const existing = document.querySelectorAll(`.${sessionShareButtonClass}`);
+    const ref = currentSessionRef();
+    if (!ref.session_id) {
+      existing.forEach((button) => button.remove());
+      return;
+    }
+    let button = existing[0];
+    existing.forEach((node) => { if (node !== button) node.remove(); });
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = `${sessionShareButtonClass} ${headerContextButtonClass}`;
+      button.textContent = "分享会话";
+      button.setAttribute("aria-label", "分享当前会话");
+      button.dataset.codexSessionShareVersion = sessionShareButtonVersion;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void createSessionShare();
+      }, true);
+    }
+    const nativeShare = Array.from(document.querySelectorAll('header button[aria-label="Share"], header button[aria-label="分享"], header button[aria-label*="Share"], header button[aria-label*="分享"]')).find(visibleElement);
+    const actionGroup = nativeShare?.closest?.(".ms-auto")
+      || document.querySelector("header .ms-auto")
+      || nativeShare?.parentElement?.parentElement?.parentElement;
+    if (actionGroup instanceof HTMLElement) {
+      button.style.position = "static";
+      button.style.pointerEvents = "auto";
+      button.style.webkitAppRegion = "no-drag";
+      // 只在按钮还不在操作栏里时才搬动它。过去还要求它必须排在最后，
+      // 一旦 Codex 在它后面挂了别的节点，这个条件就永远成立，
+      // 于是每轮 scan 都 appendChild 一次，反过来又触发下一轮 scan（issue #1960）。
+      if (button.parentElement !== actionGroup) {
+        actionGroup.appendChild(button);
+      }
+      return;
+    }
+    const header = document.querySelector('[data-testid="app-shell-header-context-menu-surface"]')?.closest?.("header")
+      || document.querySelector(`header`)
+      || document.querySelector(selectors.appHeader);
+    if (header instanceof HTMLElement) {
+      // 没有明确操作栏时也保持文档流，避免遮挡原生按钮。
+      button.style.position = "static";
+      button.style.pointerEvents = "auto";
+      button.style.webkitAppRegion = "no-drag";
+      button.style.marginLeft = "8px";
+      if (button.parentElement !== header) header.appendChild(button);
+    } else if (!button.isConnected) {
+      document.body.appendChild(button);
+    }
+  }
+
+  function sessionImportMarkdown(session) {
+    const title = String(session?.title || "未命名会话").trim() || "未命名会话";
+    const messages = Array.isArray(session?.messages) ? session.messages : [];
+    const body = messages.map((message) => {
+      const role = message?.role === "user" ? "用户" : message?.role === "assistant" ? "助手" : "消息";
+      const text = String(message?.text || "").trim();
+      return text ? `### ${role}\n\n${text}` : "";
+    }).filter(Boolean).join("\n\n");
+    return `# ${title}\n\n${body}`.trim();
+  }
+
+  function importSharedSessionIntoNewChat(session) {
+    if (session?.kind === "codex-rollout" && typeof session.content === "string") {
+      void postJson("/session/import", session).then((result) => {
+        if (result?.status !== "ok") {
+          showToast(result?.message || "原生会话导入失败", null);
+          return;
+        }
+        void refreshRecentConversationsForHost();
+        showToast("已导入完整 Codex 会话", null);
+      }).catch((error) => showToast(error?.message || "原生会话导入失败", null));
+      return;
+    }
+    const markdown = sessionImportMarkdown(session);
+    if (!markdown) {
+      showToast("分享内容为空，无法导入", null);
+      return;
+    }
+    const newChat = Array.from(document.querySelectorAll("button")).find((button) => {
+      if (!visibleElement(button) || isExtensionUiNode(button)) return false;
+      const text = String(button.textContent || "").replace(/\s+/g, " ").trim();
+      const label = button.getAttribute("aria-label") || "";
+      return /^(新对话|New chat)$/i.test(text) || /^(新对话|New chat)$/i.test(label);
+    });
+    if (newChat instanceof HTMLElement) newChat.click();
+    const deadline = Date.now() + 5000;
+    const fill = () => {
+      const editor = Array.from(document.querySelectorAll("textarea, [contenteditable='true']"))
+        .filter((node) => visibleElement(node))
+        .at(-1);
+      if (!(editor instanceof HTMLElement)) {
+        if (Date.now() < deadline) window.setTimeout(fill, 100);
+        else showToast("无法找到 Codex 输入框，请手动打开新对话后重试", null);
+        return;
+      }
+      editor.focus();
+      if (editor instanceof HTMLTextAreaElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        setter?.call(editor, markdown);
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        document.execCommand("insertText", false, markdown);
+        editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: markdown }));
+      }
+      showToast("已导入完整会话内容，请发送以继续", null);
+    };
+    window.setTimeout(fill, newChat ? 350 : 0);
+  }
+
+  function installSessionShareImportListener() {
+    window.removeEventListener("message", window.__codexSessionShareImportHandler);
+    window.__codexSessionShareImportHandler = (event) => {
+      if (!/^(https:\/\/share\.codexpp\.cc|https:\/\/codexpp-share\.pages\.dev)$/.test(event.origin || "") || event.data?.type !== "codexpp-import-session") return;
+      const session = event.data?.session;
+      if (!session || !["codex-session", "codex-rollout"].includes(session.kind)) return;
+      if (session.kind === "codex-session" && !Array.isArray(session.messages)) return;
+      if (session.kind === "codex-rollout" && typeof session.content !== "string") return;
+      importSharedSessionIntoNewChat(session);
+    };
+    window.addEventListener("message", window.__codexSessionShareImportHandler);
+  }
+  */
 
   function upstreamWorktreeField(dialog, name) {
     return dialog.querySelector(`[data-codex-upstream-worktree-field="${name}"]`);
@@ -9905,7 +10288,8 @@
       );
     }
     installCodexPlusMenu();
-    installSessionShareImportListener();
+    // 分享会话功能暂时停用，保留实现以便后续恢复。
+    // installSessionShareImportListener();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
     installDeleteButtonEventDelegation();
@@ -10861,7 +11245,8 @@
     runScanStep(() => archivedPageRows().forEach(attachArchivedPageDeleteButton));
     runScanStep(refreshConversationView);
     runScanStep(installCodexServiceTierBadge);
-    runScanStep(installSessionShareButton);
+    // 分享会话功能暂时停用，保留实现以便后续恢复。
+    // runScanStep(installSessionShareButton);
     runScanStep(scheduleThreadScrollSync);
     runScanStep(() => refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations));
     runScanStep(() => {
@@ -10966,9 +11351,15 @@
       if (isChatContentMutation(mutation)) return false;
       const target = mutation.target;
       if (isExtensionUiNode(target)) return false;
-      if (target?.nodeType === 1 && nodeSelfOrAncestorMatchesScanRelevance(target)) return true;
       const changedNodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
-      return changedNodes.some((node) => node.nodeType === 1 && isScanRelevantNode(node));
+      const changedElements = changedNodes.filter((node) => node.nodeType === 1);
+      // 我们自己插入的节点挂在 Codex 的容器里，而容器本身是 scan-relevant，
+      // 于是「写入 → 观察到自己的写入 → 200ms 后再 scan → 再写入」形成自喂循环，
+      // 空闲时也每秒全量扫描五次，macOS 上足以吃满一个核（issue #1960）。
+      // 一次变更如果只动了我们自己的 UI，就不该再排一次 scan。
+      if (changedElements.length && changedElements.every(isExtensionUiNode)) return false;
+      if (target?.nodeType === 1 && nodeSelfOrAncestorMatchesScanRelevance(target)) return true;
+      return changedElements.some((node) => isScanRelevantNode(node));
     });
   }
 
