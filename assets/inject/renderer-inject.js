@@ -2607,6 +2607,8 @@
   }
 
   function disableCodexPlusRuntimeFeatures() {
+    codexDictationSupportInstallGeneration += 1;
+    cleanupCodexDictationDomPatch();
     [
       "threadScrollRestore",
       "serviceTierControls",
@@ -2831,6 +2833,10 @@
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
+  // 这里只放确认支持 priority service tier 的官方模型——这个集合同时用于生成
+  // 「Fast 仅支持 …」的提示文案，塞进没验证过的模型等于对用户做出错误承诺。
+  // 第三方模型（deepseek 等）走下面 codexServiceTierFastSupportedForModel 里的
+  // 模型元数据判定：上游自己声明了 priority 才认。
   ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
 
   function uniqueCodexAppAssetUrls(urls) {
@@ -3114,7 +3120,17 @@
   }
 
   function codexServiceTierFastSupportedForModel(modelName) {
-    return codexServiceTierSupportedFastModels.has(normalizeCodexServiceTierModelName(modelName));
+    const normalized = normalizeCodexServiceTierModelName(modelName);
+    if (!normalized) return false;
+    if (codexServiceTierSupportedFastModels.has(normalized)) return true;
+    // 不按名字猜：模型叫 deepseek 不代表它的中转站支持 priority tier。
+    // 只认上游模型元数据里明确声明的 priority。
+    try {
+      const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(modelName) : null;
+      if (metadata && Array.isArray(metadata.serviceTiers) && metadata.serviceTiers.some((t) => String(t.id || t).toLowerCase() === "priority")) return true;
+    } catch {}
+    // removed blanket apikey fallback to keep test contract (FAST only for known models)
+    return false;
   }
 
   function codexServiceTierFastUnsupportedMessage(modelName = codexServiceTierCurrentModelName()) {
@@ -3724,10 +3740,27 @@
     return codexRemoteSessionProviderNormalizationEnabled();
   }
 
+  function codexRelayConfigModelProvider(configContents) {
+    const text = String(configContents || "");
+    const match = /(?:^|\n)\s*model_provider\s*=\s*["']([^"'\n]+)["']/m.exec(text);
+    return match ? String(match[1]).trim() : "";
+  }
 
   function codexRemoteSessionTargetProvider() {
     const profile = codexRemoteSessionActiveProfile();
-    if (String(profile?.relayMode || "") === "pureApi") return "custom";
+    const relayMode = String(profile?.relayMode || "");
+    // 解析中继实际写进 config.toml 的 model_provider（比如
+    // `model_provider = "deepseek"` 配 [model_providers.deepseek]），而不是
+    // 假定每个 pureApi 中继都叫 "custom"——那会让恢复会话报
+    // "Model provider `custom` not found"。
+    //
+    // 顺序上先看 profile.configContents 再看 activeRelayCodexProvider：后者是
+    // 全局缓存，切换供应商后可能还是上一个的值；profile 是当前这次调用现取的，
+    // 更可信。反过来会让 pureApi 恢复会话拿到陈旧 provider。
+    const fromConfig = codexRelayConfigModelProvider(profile?.configContents || "");
+    if (fromConfig) return fromConfig;
+    // pureApi 且 profile 自己没声明供应方时回到 "custom"，不去读可能陈旧的全局缓存。
+    if (relayMode === "pureApi") return "custom";
     return String(
       codexPlusBackendSettings.activeRelayCodexProvider
       || codexModelCatalog?.codex_model_provider
@@ -4152,6 +4185,113 @@
       }
     };
     serviceTierDispatcherPatchPromise = patch();
+  }
+
+  // --- Dictation / Voice patch for apikey (ported from v1.2.34 preload) ---
+  const codexDictationSupportVersion = "1";
+  let codexDictationSupportInstallPromise = null;
+  let codexDictationSupportInstallGeneration = 0;
+  function codexDictationSupportModuleCandidates() {
+    const prefixes = ["use-is-dictation-supported-", "use-dictation-", "app-initial-", "setting-storage-", "vscode-api-"];
+    return prefixes;
+  }
+
+  function cleanupCodexDictationDomPatch() {
+    if (window.__codexDictationDomTimer) {
+      clearInterval(window.__codexDictationDomTimer);
+      window.__codexDictationDomTimer = null;
+    }
+    window.__codexDictationDomPatched = false;
+  }
+
+  async function installDictationSupportPatch() {
+    if (window.__codexDictationSupportPatched === codexDictationSupportVersion) return;
+    if (codexDictationSupportInstallPromise) return codexDictationSupportInstallPromise;
+
+    const installGeneration = codexDictationSupportInstallGeneration;
+    const install = (async () => {
+      for (const prefix of codexDictationSupportModuleCandidates()) {
+        try {
+          const module = await loadOptionalCodexAppModule(prefix);
+          if (installGeneration !== codexDictationSupportInstallGeneration
+              || !isCurrentCodexPlusRendererRuntime()
+              || codexPlusBackendSettings.enhancementsEnabled === false) return false;
+          if (!module) continue;
+          for (const key of Object.keys(module)) {
+            const fn = module[key];
+            if (typeof fn !== "function") continue;
+            let src = "";
+            try { src = String(fn); } catch {}
+            if (!src.includes("authMethod") || !src.includes("chatgpt")) continue;
+            if (fn.__codexDictationPatched === codexDictationSupportVersion) continue;
+            const original = fn;
+            const wrapped = function(...args) {
+              try {
+                const result = original.apply(this, args);
+                if (result === false) {
+                  const hasApikey = args.some(arg => arg && typeof arg === "object" && (arg.authMethod === "apikey" || arg.authMethod === "apiKey"));
+                  if (hasApikey) return true;
+                }
+                return result;
+              } catch (e) {
+                return original.apply(this, args);
+              }
+            }
+            wrapped.__codexDictationPatched = codexDictationSupportVersion;
+            let applied = false;
+            try {
+              module[key] = wrapped;
+              applied = module[key] === wrapped;
+            } catch {}
+            if (!applied) continue;
+            if (installGeneration !== codexDictationSupportInstallGeneration
+                || !isCurrentCodexPlusRendererRuntime()
+                || codexPlusBackendSettings.enhancementsEnabled === false) return false;
+            sendCodexPlusDiagnostic("dictation_support_patched", { prefix, key, version: codexDictationSupportVersion });
+            window.__codexDictationSupportPatched = codexDictationSupportVersion;
+            return true;
+          }
+        } catch {}
+      }
+      if (installGeneration !== codexDictationSupportInstallGeneration
+          || !isCurrentCodexPlusRendererRuntime()
+          || codexPlusBackendSettings.enhancementsEnabled === false) return false;
+      // Fallback: DOM enforcement for voice button when module patch not found.
+      try {
+        if (!window.__codexDictationDomPatched) {
+          window.__codexDictationDomPatched = true;
+          const enforceVoice = () => {
+            if (!isCurrentCodexPlusRendererRuntime()
+                || codexPlusBackendSettings.enhancementsEnabled === false) {
+              cleanupCodexDictationDomPatch();
+              return;
+            }
+            document.querySelectorAll("button").forEach((btn) => {
+              const label = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
+              if (label.includes("voice") || label.includes("dictation") || label.includes("microphone") || label.includes("mic")) {
+                if (btn.hasAttribute("disabled")) {
+                  btn.removeAttribute("disabled");
+                  btn.setAttribute("aria-disabled", "false");
+                  btn.style.opacity = "";
+                  btn.style.pointerEvents = "";
+                }
+              }
+            });
+          };
+          window.__codexDictationDomTimer = setInterval(enforceVoice, 1500);
+          enforceVoice();
+        }
+      } catch {}
+      return true;
+    })();
+    codexDictationSupportInstallPromise = install;
+    try {
+      return await install;
+    } finally {
+      if (codexDictationSupportInstallPromise === install) {
+        codexDictationSupportInstallPromise = null;
+      }
+    }
   }
 
   async function loadBackendSettingsState() {
@@ -5253,7 +5393,10 @@
     if (name === "openai-curated") return "OpenAI插件2(Codex++)";
     if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
     if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    if (name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
+    // 内置插件包的注册名。曾经叫 openai-curated-remote，但那是 codex 的保留名，
+    // 注册在它下面会被静默忽略，已改为 codex-plus-curated；旧名保留以兼容
+    // 尚未升级的配置。
+    if (name === "codex-plus-curated" || name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
     return fallback;
   }
 
@@ -7276,9 +7419,17 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      return supported.map((entry) => ({ ...entry }));
+      const efforts = supported.map((entry) => ({ ...entry }));
+      const hasMax = efforts.some((e) => e.reasoningEffort === "max");
+      const hasUltra = efforts.some((e) => e.reasoningEffort === "ultra");
+      if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
+      if (!hasUltra) {
+        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4|deepseek/i.test(String(modelName || ""));
+        if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
+      }
+      return efforts;
     }
-    return ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+    return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
 
   function applyCodexPlusModelMetadata(descriptor, modelName) {
@@ -7779,6 +7930,7 @@
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())) {
       installAppServerModelRequestPatch();
     }
+    void installDictationSupportPatch();
     if (!codexPlusModelUnlockEnabled()) return;
     installModelJsonResponsePatch();
     patchAppServerModelMessages();
@@ -11295,6 +11447,7 @@
 
   function scan() {
     if (!isCurrentCodexPlusRendererRuntime()) return;
+    void installDictationSupportPatch();
     runScanStep(scanLightweight);
     scheduleCodexPlusRendererTimeout(() => runScanStep(scanDeferred), 0);
   }

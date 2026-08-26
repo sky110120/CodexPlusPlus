@@ -71,6 +71,29 @@ fn injection_script_prefixes_helper_url_and_metadata() {
 }
 
 #[test]
+fn injection_script_does_not_schedule_removed_sidebar_nav_retry() {
+    let script = assets::injection_script(57321);
+
+    // 本地业务已停用旧的侧边栏入口重试，合并上游时不能重新引入常驻定时器。
+    assert!(!script.contains("scheduleSidebarNavStartupRetry"));
+    assert!(!script.contains("__codexPlusSidebarNavRetryTimer"));
+    assert!(script.contains("runScanStep(scanLightweight)"));
+}
+
+/// 内置插件包的注册名从 openai-curated-remote 换成了 codex-plus-curated
+/// （前者是 codex 保留名，注册后会被静默忽略）。显示名映射要跟着认新名，
+/// 否则插件市场里会显示原始名而不是友好名。
+#[test]
+fn injection_script_maps_the_renamed_bundled_marketplace_display_name() {
+    let script = assets::injection_script(57321);
+
+    assert!(
+        script.contains(r#"name === "codex-plus-curated" || name === "openai-curated-remote""#)
+    );
+    assert!(script.contains("OpenAI插件5(Codex++)"));
+}
+
+#[test]
 fn injection_script_omits_stepwise_runtime_when_disabled() {
     let script = assets::injection_script_with_settings(57321, &BackendSettings::default());
 
@@ -1140,9 +1163,11 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     );
     assert!(script.contains("restored === \"openai-api-curated\""));
     assert!(script.contains("restored === \"openai-curated-remote\""));
-    assert!(
-        script.contains("if (name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\"")
-    );
+    // 内置包的注册名已从 openai-curated-remote 换成 codex-plus-curated（前者是
+    // codex 保留名会被静默忽略），显示名映射同时认新旧两个名字。
+    assert!(script.contains(
+        "if (name === \"codex-plus-curated\" || name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\""
+    ));
     assert!(script.contains(
         "if (name === \"codex-plus-openai-curated-remote\") return \"openai-curated-remote\""
     ));
@@ -1447,7 +1472,9 @@ fn injection_script_keeps_session_action_buttons_in_pr_style() {
 
     assert!(script.contains("actionButtonClass = \"codex-session-action-button\""));
     assert!(script.contains("background: transparent;"));
-    assert!(script.contains("background: #363839;"));
+    assert!(
+        script.contains("background: var(--codex-session-action-hover-background, transparent);")
+    );
     assert!(script.contains("cursor: default;"));
 }
 

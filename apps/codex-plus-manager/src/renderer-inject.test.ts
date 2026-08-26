@@ -597,6 +597,123 @@ describe("renderer injection codex app module loader", () => {
   });
 });
 
+function dictationPatchRuntime(renderer: string, module: Record<string, unknown> | null) {
+  const start = renderer.indexOf("  // --- Dictation / Voice patch for apikey");
+  const end = renderer.indexOf("\n  async function loadBackendSettingsState", start);
+  assert.ok(start >= 0 && end > start, "dictation patch block not found in renderer-inject.js");
+  const source = renderer.slice(start, end);
+  const fakeWindow: Record<string, unknown> = {};
+  const backendSettings = { enhancementsEnabled: true };
+  const timers = new Map<number, unknown>();
+  const cleared: number[] = [];
+  let nextTimer = 1;
+  const fakeDocument = {
+    querySelectorAll(selector: string) {
+      assert.equal(selector, "button");
+      return [];
+    },
+  };
+  const factory = new Function(
+    "window",
+    "document",
+    "isCurrentCodexPlusRendererRuntime",
+    "codexPlusBackendSettings",
+    "loadOptionalCodexAppModule",
+    "sendCodexPlusDiagnostic",
+    "setInterval",
+    "clearInterval",
+    `${source}\nreturn { installDictationSupportPatch, cleanupCodexDictationDomPatch };`,
+  ) as (
+    windowValue: Record<string, unknown>,
+    documentValue: typeof fakeDocument,
+    isCurrent: () => boolean,
+    settings: typeof backendSettings,
+    loadModule: (namePart: string) => Promise<Record<string, unknown> | null>,
+    diagnostic: (...args: unknown[]) => void,
+    setTimer: (callback: () => void, delay: number) => number,
+    clearTimer: (timer: number) => void,
+  ) => {
+    installDictationSupportPatch: () => Promise<boolean | undefined>;
+    cleanupCodexDictationDomPatch: () => void;
+  };
+  const runtime = factory(
+    fakeWindow,
+    fakeDocument,
+    () => true,
+    backendSettings,
+    async () => module,
+    () => undefined,
+    (callback, delay) => {
+      const timer = nextTimer++;
+      timers.set(timer, { callback, delay });
+      return timer;
+    },
+    (timer) => {
+      cleared.push(timer);
+      timers.delete(timer);
+    },
+  );
+  return { ...runtime, backendSettings, fakeWindow, timers, cleared };
+}
+
+describe("renderer injection dictation support", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  it("only overrides a failed support check for API-key authentication", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const module = {
+      supported: function checkSupport(args: { authMethod?: string }) {
+        return args?.authMethod === "chatgpt" ? false : false;
+      },
+    };
+    const runtime = dictationPatchRuntime(renderer, module);
+
+    await runtime.installDictationSupportPatch();
+
+    assert.equal(module.supported({ authMethod: "chatgpt" }), false);
+    assert.equal(module.supported({ authMethod: "apikey" }), true);
+    assert.equal(runtime.fakeWindow.__codexDictationSupportPatched, "1");
+    assert.equal(runtime.timers.size, 0);
+  });
+
+  it("clears the DOM fallback timer when the dictation patch is cleaned up", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const runtime = dictationPatchRuntime(renderer, null);
+
+    await runtime.installDictationSupportPatch();
+    assert.equal(runtime.timers.size, 1);
+    assert.equal(runtime.fakeWindow.__codexDictationDomPatched, true);
+
+    runtime.cleanupCodexDictationDomPatch();
+
+    assert.deepEqual(runtime.cleared, [1]);
+    assert.equal(runtime.timers.size, 0);
+    assert.equal(runtime.fakeWindow.__codexDictationDomTimer, null);
+    assert.equal(runtime.fakeWindow.__codexDictationDomPatched, false);
+  });
+
+  it("does not claim success when the module export cannot be replaced", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const original = function checkSupport(args: { authMethod?: string }) {
+      return args?.authMethod === "chatgpt" ? false : true;
+    };
+    const module: Record<string, unknown> = {};
+    Object.defineProperty(module, "supported", {
+      configurable: false,
+      enumerable: true,
+      value: original,
+      writable: false,
+    });
+    const runtime = dictationPatchRuntime(renderer, module);
+
+    await runtime.installDictationSupportPatch();
+
+    assert.equal(module.supported, original);
+    assert.notEqual(runtime.fakeWindow.__codexDictationSupportPatched, "1");
+    assert.equal(runtime.timers.size, 1);
+  });
+});
+
 interface DispatcherPatchHarness {
   install: () => void;
   attempts: () => number;
@@ -742,5 +859,108 @@ describe("renderer injection plugin marketplace patch", () => {
 
     assert.equal(harness.sweeps(), 1);
     assert.deepEqual(harness.diagnostics(), ["plugin_marketplace_request_patch_installed"]);
+  });
+});
+
+describe("relay pureApi provider resolution", () => {
+  function providerRuntime(
+    renderer: string,
+    backendSettings: Record<string, unknown>,
+    catalog: Record<string, unknown>,
+    profile: Record<string, unknown>,
+  ) {
+    const start = renderer.indexOf("function codexRelayConfigModelProvider(");
+    const codeStart = renderer.indexOf("function codexRemoteSessionTargetProvider(");
+    const end = renderer.indexOf("\n  function codexRemoteSessionProviderRequestMethod", codeStart);
+    assert.ok(start >= 0 && codeStart >= 0 && end > codeStart);
+    const source = renderer.slice(start, end);
+    const create = new Function(
+      "codexPlusBackendSettings",
+      "codexModelCatalog",
+      "codexRemoteSessionActiveProfile",
+      `${source}\nreturn { codexRelayConfigModelProvider, codexRemoteSessionTargetProvider };`,
+    ) as (
+      backend: Record<string, unknown>,
+      cat: Record<string, unknown>,
+      activeProfile: () => Record<string, unknown>,
+    ) => {
+      codexRelayConfigModelProvider: (configContents: string) => string;
+      codexRemoteSessionTargetProvider: () => string;
+    };
+    return create(backendSettings, catalog, () => profile);
+  }
+
+  it("resolves the real model_provider from a pureApi relay profile instead of hardcoding custom", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const runtime = providerRuntime(
+      renderer,
+      {},
+      { codex_model_provider: "deepseek" },
+      { relayMode: "pureApi", configContents: 'model = "deepseek-v4-flash-vision-exp"\nmodel_provider = "deepseek"' },
+    );
+
+    assert.equal(runtime.codexRelayConfigModelProvider('model_provider = "deepseek"'), "deepseek");
+    assert.equal(runtime.codexRemoteSessionTargetProvider(), "deepseek");
+  });
+
+  it("still returns custom for pureApi relays that genuinely declare the custom provider", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const runtime = providerRuntime(
+      renderer,
+      {},
+      { codex_model_provider: "custom" },
+      { relayMode: "pureApi", configContents: 'model_provider = "custom"\n[model_providers.custom]' },
+    );
+
+    assert.equal(runtime.codexRemoteSessionTargetProvider(), "custom");
+  });
+
+  it("falls back to custom when a pureApi relay declares no provider", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const runtime = providerRuntime(renderer, {}, { codex_model_provider: "" }, { relayMode: "pureApi", configContents: "" });
+
+    assert.equal(runtime.codexRemoteSessionTargetProvider(), "custom");
+  });
+
+  // activeRelayCodexProvider 是全局缓存，切换供应商后可能还留着上一个的值。
+  // pureApi 时优先信 profile 自己的 configContents；profile 没声明就回到
+  // "custom"，不采信这个缓存——cdp_bridge.rs 的 refreshedPureApiResumeProvider
+  // 正是钉这个：陈旧缓存是 stale_custom_provider 时必须仍解析成 custom。
+  it("ignores a possibly stale activeRelayCodexProvider for pureApi relays", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const runtime = providerRuntime(
+      renderer,
+      { activeRelayCodexProvider: "stale_custom_provider" },
+      { codex_model_provider: "" },
+      { relayMode: "pureApi", configContents: "" },
+    );
+
+    assert.equal(runtime.codexRemoteSessionTargetProvider(), "custom");
+  });
+
+  // 非 pureApi 才拿 activeRelayCodexProvider 兜底。
+  it("still falls back to activeRelayCodexProvider outside pureApi", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const runtime = providerRuntime(
+      renderer,
+      { activeRelayCodexProvider: "deepseek" },
+      { codex_model_provider: "" },
+      { relayMode: "mixedApi", configContents: "" },
+    );
+
+    assert.equal(runtime.codexRemoteSessionTargetProvider(), "deepseek");
+  });
+
+  // profile 自己声明了供应方时，优先级高于全局缓存。
+  it("prefers the profile's own configContents over the cached provider", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const runtime = providerRuntime(
+      renderer,
+      { activeRelayCodexProvider: "stale_custom_provider" },
+      { codex_model_provider: "" },
+      { relayMode: "pureApi", configContents: 'model_provider = "deepseek"' },
+    );
+
+    assert.equal(runtime.codexRemoteSessionTargetProvider(), "deepseek");
   });
 });

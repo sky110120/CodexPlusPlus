@@ -21,6 +21,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Bell,
+  BookOpen,
   Bot,
   CheckCircle2,
   ChevronDown,
@@ -85,6 +86,7 @@ import { tokenizeCode, type CodeLanguage } from "./code-highlight";
 import { filterModelGroups } from "./model-groups";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
 import { isGitHubRepositoryHomepage } from "./github-repository";
+import { MCP_PRESETS, mcpPresetById } from "./mcp-presets";
 import {
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
@@ -297,8 +299,6 @@ export type RelayProfile = {
   configContents: string;
   authContents: string;
   useCommonConfig: boolean;
-  contextSelection: RelayContextSelection;
-  contextSelectionInitialized: boolean;
   contextWindow: string;
   autoCompactLimit: string;
   modelList: string;
@@ -335,13 +335,9 @@ type AggregateRelayProfile = {
   members: AggregateRelayMember[];
 };
 
-type RelayContextSelection = {
-  mcpServers: string[];
-  skills: string[];
-  plugins: string[];
-};
-
-type ContextKind = "mcp" | "skill" | "plugin";
+/// codex 的 config.toml 上下文表。skill 不在这里——它是 `$CODEX_HOME/skills/`
+/// 下的目录约定，`[skills.<id>]` codex 根本不读，由 Skills 面板单独管。
+type ContextKind = "mcp" | "plugin";
 
 type CodexContextEntry = {
   id: string;
@@ -354,21 +350,54 @@ type CodexContextEntry = {
 
 type CodexContextEntries = {
   mcpServers: CodexContextEntry[];
-  skills: CodexContextEntry[];
   plugins: CodexContextEntry[];
 };
+
+type McpTransport = "stdio" | "http";
+type McpKeyValue = { key: string; value: string };
+
+/** 与 Rust 侧 mcp_config::McpServerForm 一一对应。 */
+type McpServerForm = {
+  transport: McpTransport;
+  command: string;
+  args: string[];
+  env: McpKeyValue[];
+  cwd: string;
+  url: string;
+  httpHeaders: McpKeyValue[];
+  bearerToken: string;
+  startupTimeoutSec: string;
+  enabled: boolean;
+  /** 表单不认识的键（oauth、scopes 之类），原样带着，保存时合并回去。 */
+  extraToml: string;
+};
+
+const emptyMcpForm = (): McpServerForm => ({
+  transport: "stdio",
+  command: "",
+  args: [],
+  env: [],
+  cwd: "",
+  url: "",
+  httpHeaders: [],
+  bearerToken: "",
+  startupTimeoutSec: "",
+  enabled: true,
+  extraToml: "",
+});
+
+type McpFormResult = CommandResult<{ form: McpServerForm }>;
+type McpTomlResult = CommandResult<{ tomlBody: string }>;
+type McpImportPreviewResult = CommandResult<{
+  entries: Array<{ id: string; tomlBody: string }>;
+  warnings: string[];
+}>;
 
 type RelayProtocol = "responses" | "chatCompletions";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 type RelaySessionProvider = "custom" | "openai";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
 const SCRIPT_MARKET_REPOSITORY_URL = "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket";
-
-const emptyContextSelection = (): RelayContextSelection => ({
-  mcpServers: [],
-  skills: [],
-  plugins: [],
-});
 
 type UserScriptInventory = {
   enabled?: boolean;
@@ -826,6 +855,50 @@ type ScriptMarketResult = CommandResult<{
   user_scripts: UserScriptInventory;
 }>;
 
+type SkillRepo = {
+  owner: string;
+  name: string;
+  branch: string;
+  subdir: string;
+  enabled: boolean;
+};
+
+type SkillEntry = {
+  id: string;
+  name: string;
+  description: string;
+  repoKey: string;
+  repoPath: string;
+  installed: boolean;
+  enabled: boolean;
+  bundled: boolean;
+  contentHash: string;
+  remoteHash: string;
+  updateAvailable: boolean;
+};
+
+type SkillBackup = {
+  id: string;
+  skillId: string;
+  name: string;
+  backedUpAt: string;
+};
+
+type SkillsResult = CommandResult<{
+  skills: SkillEntry[];
+  repos: SkillRepo[];
+  backups: SkillBackup[];
+  repoErrors: string[];
+  skillsDir: string;
+  codexSkillsDir: string;
+}>;
+
+/** 仓库源的稳定标识，必须和 Rust 侧 `SkillRepo::key()` 生成的一致。 */
+function skillRepoKey(repo: SkillRepo): string {
+  const base = `${repo.owner}/${repo.name}@${repo.branch}`;
+  return repo.subdir ? `${base}:${repo.subdir}` : base;
+}
+
 function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>): string {
   const changed = result.changedSessionFiles ?? 0;
   const rows = result.sqliteRowsUpdated ?? 0;
@@ -893,7 +966,7 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "grok" | "relayEnvironment" | "sessions" | "context" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "grok" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
@@ -901,11 +974,12 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "relay", label: t("供应商配置"), icon: KeyRound },
   { id: "grok", label: t("Grok 配置"), icon: Bot },
   { id: "sessions", label: t("会话管理"), icon: MessageCircle },
-  { id: "context", label: t("工具与插件"), icon: Network },
+  { id: "context", label: t("MCP&插件"), icon: Network },
   { id: "weixin", label: t("微信连接"), icon: ScanLine },
   { id: "enhance", label: t("Codex增强"), icon: Hammer },
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink },
+  { id: "skills", label: t("Skills 技能"), icon: BookOpen },
   { id: "userScripts", label: t("脚本市场"), icon: FileCode2 },
   // 推荐内容菜单暂时隐藏，保留代码便于恢复
   // { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
@@ -922,7 +996,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
   {
     label: t("扩展"),
-    routes: ["weixin", "enhance", "dreamSkin", "zedRemote", "userScripts"],
+    routes: ["skills", "weixin", "enhance", "dreamSkin", "zedRemote", "userScripts"],
   },
   {
     label: t("系统"),
@@ -1008,8 +1082,6 @@ const defaultSettings: BackendSettings = {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
-      contextSelection: emptyContextSelection(),
-      contextSelectionInitialized: true,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",
@@ -1090,6 +1162,8 @@ export function App() {
   });
   const [ads, setAds] = useState<AdsResult | null>(null);
   const [scriptMarket, setScriptMarket] = useState<ScriptMarketResult | null>(null);
+  const [skills, setSkills] = useState<SkillsResult | null>(null);
+  const [skillBusyId, setSkillBusyId] = useState<string | null>(null);
   const [launchForm, setLaunchForm] = useState({
     appPath: "",
     debugPort: "9229",
@@ -1258,6 +1332,81 @@ export function App() {
     }
   };
 
+  // Skills：本地状态随手可读，远端清单要联网，所以进页面先读本地再后台刷新。
+  const listInstalledSkills = async () => {
+    const result = await run(() => call<SkillsResult>("list_installed_skills"));
+    if (result) setSkills(result);
+  };
+
+  const refreshSkillCatalog = async (silent = false) => {
+    const result = await run(() => call<SkillsResult>("refresh_skill_catalog"));
+    if (result) {
+      setSkills(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("Skills"), result, { silentSuccess: true });
+      }
+    }
+  };
+
+  /// 安装/更新/启停都会返回完整的新状态，直接整块替换即可。
+  const runSkillAction = async (
+    busyId: string,
+    command: string,
+    args: Record<string, unknown>,
+    notice = t("Skills"),
+  ) => {
+    setSkillBusyId(busyId);
+    try {
+      const result = await run(() => call<SkillsResult>(command, args));
+      if (result) {
+        setSkills(result);
+        showResultNotice(notice, result);
+      }
+    } finally {
+      setSkillBusyId(null);
+    }
+  };
+
+  const installSkill = (repoKey: string, id: string) =>
+    runSkillAction(id, "install_skill", { repoKey, id });
+
+  const updateSkill = (repoKey: string, id: string) =>
+    runSkillAction(id, "update_skill", { repoKey, id });
+
+  const setSkillEnabled = (id: string, enabled: boolean) =>
+    runSkillAction(id, "set_skill_enabled", { id, enabled });
+
+  const uninstallSkill = async (id: string) => {
+    if (!window.confirm(tf("卸载 Skill「{0}」？源目录会先备份，可以再恢复回来。", [id]))) return;
+    await runSkillAction(id, "uninstall_skill", { id });
+  };
+
+  const restoreSkillBackup = (backupId: string) =>
+    runSkillAction(backupId, "restore_skill_backup", { backupId });
+
+  const deleteSkillBackup = async (backupId: string) => {
+    if (!window.confirm(tf("删除备份「{0}」？此操作不可撤销。", [backupId]))) return;
+    await runSkillAction(backupId, "delete_skill_backup", { backupId });
+  };
+
+  const upsertSkillRepo = async (repo: SkillRepo) => {
+    const result = await run(() => call<SkillsResult>("upsert_skill_repo", { repo }));
+    if (result) {
+      setSkills(result);
+      showResultNotice(t("Skills 仓库源"), result);
+    }
+    return result;
+  };
+
+  const deleteSkillRepo = async (key: string) => {
+    if (!window.confirm(tf("删除仓库源「{0}」？已装的 Skill 不受影响，只是不再更新。", [key]))) return;
+    const result = await run(() => call<SkillsResult>("delete_skill_repo", { key }));
+    if (result) {
+      setSkills(result);
+      showResultNotice(t("Skills 仓库源"), result);
+    }
+  };
+
   const refreshRelay = async (silent = false) => {
     const result = await run(() => call<RelayResult>("relay_status"));
     if (result) {
@@ -1265,7 +1414,6 @@ export function App() {
       if (!silent) showResultNotice(t("登录状态"), result, { silentSuccess: true });
     }
   };
-
   const refreshRelayFiles = async (silent = false) => {
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
     if (result) {
@@ -2076,7 +2224,7 @@ export function App() {
     const result = await run(() => call<LiveContextEntriesResult>("read_live_context_entries"));
     if (result) {
       setLiveContextEntries(result.entries);
-      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result, { silentSuccess: true });
+      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("MCP&插件"), result, { silentSuccess: true });
     }
     return result;
   };
@@ -2085,7 +2233,7 @@ export function App() {
     const result = await run(() => call<LiveContextEntriesResult>("sync_live_context_entries", { request: { settings: next } }));
     if (result) {
       setLiveContextEntries(result.entries);
-      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result, { silentSuccess: true });
+      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("MCP&插件"), result, { silentSuccess: true });
     }
     return result;
   };
@@ -2148,6 +2296,11 @@ export function App() {
       await refreshSettings(true);
       await refreshRelayFiles(true);
       await refreshLiveContextEntries(true);
+    }
+    if (next === "skills") {
+      // 先把本地已装的列出来，远端清单要联网，慢一步再补上
+      await listInstalledSkills();
+      await refreshSkillCatalog(true);
     }
     if (next === "weixin") {
       await refreshSettings(true);
@@ -2791,12 +2944,55 @@ export function App() {
       normalized = normalizeSettings(saveResult.settings);
     }
     setSettingsForm(normalized);
-    if (!isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result);
+    if (!isSuccessStatus(result.status)) showResultNotice(t("MCP&插件"), result);
     return normalized;
   };
 
-  const deleteContextEntry = async (next: BackendSettings, kind: ContextKind, id: string) => {
+  // MCP 的 TOML ↔ 表单转换放在 Rust 侧：前端没有 TOML 解析器，正则切段拼不出
+  // 「保住表单不认识的高级字段」这件事。两个都是纯转换，不碰 settings。
+  const parseMcpEntry = async (tomlBody: string): Promise<McpServerForm | null> => {
+    const result = await run(() => call<McpFormResult>("parse_mcp_entry", { tomlBody }));
+    if (!result) return null;
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("MCP 配置"), result);
+      return null;
+    }
+    return result.form;
+  };
+
+  const buildMcpEntry = async (form: McpServerForm): Promise<string | null> => {
+    const result = await run(() => call<McpTomlResult>("build_mcp_entry", { form }));
+    if (!result) return null;
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("MCP 配置"), result);
+      return null;
+    }
+    return result.tomlBody;
+  };
+
+  const previewMcpServersJson = async (json: string) => {
+    const result = await run(() => call<McpImportPreviewResult>("preview_mcp_servers_json", { json }));
+    if (result && !isSuccessStatus(result.status)) showResultNotice(t("MCP 导入"), result);
+    return result;
+  };
+
+  const importMcpServersJson = async (next: BackendSettings, json: string) => {
     const result = await run(() =>
+      call<ContextEntriesResult>("import_mcp_servers_json", { request: { settings: next, json } }),
+    );
+    if (!result) return null;
+    let normalized = normalizeSettings(result.settings);
+    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    if (saveResult) {
+      setSettings(saveResult);
+      normalized = normalizeSettings(saveResult.settings);
+    }
+    setSettingsForm(normalized);
+    showResultNotice(t("MCP 导入"), result);
+    return isSuccessStatus(result.status) ? normalized : null;
+  };
+
+  const deleteContextEntry = async (next: BackendSettings, kind: ContextKind, id: string) => {    const result = await run(() =>
       call<ContextEntriesResult>("delete_context_entry", {
         request: { settings: next, kind, id },
       }),
@@ -2809,7 +3005,7 @@ export function App() {
       normalized = normalizeSettings(saveResult.settings);
     }
     setSettingsForm(normalized);
-    if (!isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result);
+    if (!isSuccessStatus(result.status)) showResultNotice(t("MCP&插件"), result);
     return normalized;
   };
 
@@ -3386,6 +3582,17 @@ export function App() {
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
+      listInstalledSkills,
+      refreshSkillCatalog,
+      installSkill,
+      updateSkill,
+      setSkillEnabled,
+      uninstallSkill,
+      restoreSkillBackup,
+      deleteSkillBackup,
+      upsertSkillRepo,
+      deleteSkillRepo,
+      skillBusyId,
       refreshLocalSessions,
       importLocalSession,
       importSessionUrl,
@@ -3403,6 +3610,10 @@ export function App() {
       saveRelayFile,
       upsertContextEntry,
       deleteContextEntry,
+      parseMcpEntry,
+      buildMcpEntry,
+      previewMcpServersJson,
+      importMcpServersJson,
       extractRelayCommonConfig,
       testRelayProfile,
       diagnoseRelayProfile,
@@ -3569,6 +3780,7 @@ export function App() {
               actions={actions}
             />
           ) : null}
+          {route === "skills" ? <SkillsScreen skills={skills} actions={actions} /> : null}
           {route === "weixin" ? (
             <WeixinConnectScreen
               form={settingsForm}
@@ -3801,6 +4013,18 @@ type Actions = {
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
+  listInstalledSkills: () => Promise<void>;
+  refreshSkillCatalog: (silent?: boolean) => Promise<void>;
+  installSkill: (repoKey: string, id: string) => Promise<void>;
+  updateSkill: (repoKey: string, id: string) => Promise<void>;
+  setSkillEnabled: (id: string, enabled: boolean) => Promise<void>;
+  uninstallSkill: (id: string) => Promise<void>;
+  restoreSkillBackup: (backupId: string) => Promise<void>;
+  deleteSkillBackup: (backupId: string) => Promise<void>;
+  upsertSkillRepo: (repo: SkillRepo) => Promise<SkillsResult | null>;
+  deleteSkillRepo: (key: string) => Promise<void>;
+  /// 正在执行安装/更新/卸载的那个 id，用来禁用对应卡片的按钮。
+  skillBusyId: string | null;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
   importLocalSession: () => Promise<void>;
   importSessionUrl: (url?: string) => Promise<void>;
@@ -3823,6 +4047,10 @@ type Actions = {
     tomlBody: string,
   ) => Promise<BackendSettings | null>;
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
+  parseMcpEntry: (tomlBody: string) => Promise<McpServerForm | null>;
+  buildMcpEntry: (form: McpServerForm) => Promise<string | null>;
+  previewMcpServersJson: (json: string) => Promise<McpImportPreviewResult | null>;
+  importMcpServersJson: (settings: BackendSettings, json: string) => Promise<BackendSettings | null>;
   extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
   testRelayProfile: (profile: RelayProfile) => Promise<void>;
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
@@ -5139,7 +5367,7 @@ function EnhanceScreen({
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
+              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
                 <div>
                   <strong>{t("官方远端插件缓存")}</strong>
@@ -6382,6 +6610,350 @@ function ZedRemoteProjectSection({
         ) : (
           <div className="empty">{t("暂无项目。")}</div>
         )}
+      </CardContent>
+    </Panel>
+  );
+}
+
+type SkillFilter = "all" | "installed" | "available";
+
+/**
+ * Skills 面板。
+ *
+ * codex 的 skill 是文件系统约定（`$CODEX_HOME/skills/<id>/SKILL.md`），不是配置项，
+ * 所以这里管的是目录：从 GitHub 仓库源装到我们的 SSOT，再软链进 codex home。
+ */
+function SkillsScreen({ skills, actions }: { skills: SkillsResult | null; actions: Actions }) {
+  const entries = skills?.skills ?? [];
+  const repos = skills?.repos ?? [];
+  const backups = skills?.backups ?? [];
+  const repoErrors = skills?.repoErrors ?? [];
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<SkillFilter>("all");
+  const [reposOpen, setReposOpen] = useState(false);
+  const [backupsOpen, setBackupsOpen] = useState(false);
+
+  const visible = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    return entries.filter((entry) => {
+      if (filter === "installed" && !entry.installed) return false;
+      if (filter === "available" && entry.installed) return false;
+      if (!query) return true;
+      return [entry.id, entry.name, entry.description, entry.repoKey]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase()
+        .includes(query);
+    });
+  }, [entries, filter, search]);
+
+  const installedCount = entries.filter((entry) => entry.installed).length;
+  const updatable = entries.filter((entry) => entry.updateAvailable);
+
+  const updateAll = async () => {
+    for (const entry of updatable) {
+      await actions.updateSkill(entry.repoKey, entry.id);
+    }
+  };
+
+  return (
+    <>
+      <Panel>
+        <CardHead
+          title={t("Skills 技能")}
+          detail={t("从 GitHub 仓库安装 Skill 到 Codex。启用后软链到 ~/.codex/skills/，下次对话即可用。")}
+        />
+        <CardContent>
+          <div className="metric-list">
+            <Metric label={t("可安装")} value={tf("{0} 个", [entries.length])} />
+            <Metric label={t("已安装")} value={tf("{0} 个", [installedCount])} />
+            <Metric label={t("有新版本")} value={tf("{0} 个", [updatable.length])} />
+            <Metric label={t("仓库源")} value={tf("{0} 个", [repos.filter((repo) => repo.enabled).length])} />
+          </div>
+          <Toolbar>
+            <Button onClick={() => void actions.refreshSkillCatalog()}>
+              <RefreshCw className="h-4 w-4" />
+              {t("刷新列表")}
+            </Button>
+            {updatable.length ? (
+              <Button onClick={() => void updateAll()} variant="secondary">
+                <CircleArrowUp className="h-4 w-4" />
+                {tf("全部更新（{0}）", [updatable.length])}
+              </Button>
+            ) : null}
+            <Button onClick={() => setReposOpen((open) => !open)} variant="secondary">
+              <Github className="h-4 w-4" />
+              {t("仓库管理")}
+            </Button>
+            <Button onClick={() => setBackupsOpen((open) => !open)} variant="secondary">
+              <Download className="h-4 w-4" />
+              {tf("备份（{0}）", [backups.length])}
+            </Button>
+          </Toolbar>
+          {skills ? (
+            <div className="relay-context-summary">
+              {tf("源目录 {0}；启用后软链到 {1}", [skills.skillsDir, skills.codexSkillsDir])}
+            </div>
+          ) : null}
+          {repoErrors.length ? (
+            <div className="relay-context-summary">
+              {tf("以下仓库拉取失败，显示的是上次的结果：{0}", [repoErrors.join("；")])}
+            </div>
+          ) : null}
+        </CardContent>
+      </Panel>
+      {reposOpen ? <SkillRepoManager repos={repos} actions={actions} /> : null}
+      {backupsOpen ? <SkillBackupManager backups={backups} actions={actions} /> : null}
+      <Panel>
+        <CardHead
+          title={t("技能列表")}
+          detail={tf("当前显示 {0} / {1}", [visible.length, entries.length])}
+        />
+        <CardContent>
+          <div className="script-market-toolbar">
+            <div className="script-market-search">
+              <Search className="h-4 w-4" />
+              <Input
+                aria-label={t("搜索 Skill")}
+                onChange={(event) => setSearch(event.currentTarget.value)}
+                placeholder={t("搜索名称、描述或仓库")}
+                value={search}
+              />
+            </div>
+            <div className="script-market-view-toggle" role="group" aria-label={t("按安装状态筛选")}>
+              {([
+                { value: "all" as const, label: t("全部") },
+                { value: "installed" as const, label: t("已安装") },
+                { value: "available" as const, label: t("未安装") },
+              ]).map((option) => (
+                <Button
+                  aria-pressed={filter === option.value}
+                  key={option.value}
+                  onClick={() => setFilter(option.value)}
+                  size="sm"
+                  variant={filter === option.value ? "secondary" : "ghost"}
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+          {visible.length ? (
+            <div className="script-market-grid">
+              {visible.map((entry) => (
+                <SkillCard actions={actions} entry={entry} key={entry.id} />
+              ))}
+            </div>
+          ) : (
+            <div className="empty">
+              {entries.length ? t("没有匹配的 Skill。") : t("还没有拉到 Skill，点「刷新列表」试试。")}
+            </div>
+          )}
+        </CardContent>
+      </Panel>
+    </>
+  );
+}
+
+function SkillCard({ entry, actions }: { entry: SkillEntry; actions: Actions }) {
+  const busy = actions.skillBusyId === entry.id;
+  const tags = [
+    entry.bundled ? t("内置") : null,
+    entry.installed && !entry.bundled ? (entry.enabled ? t("已启用") : t("已停用")) : null,
+    entry.updateAvailable ? t("有新版本") : null,
+  ].filter((tag): tag is string => tag !== null);
+  return (
+    <div className="skill-card">
+      <div className="skill-card-title">
+        <strong>{entry.name || entry.id}</strong>
+        <span className="skill-card-source" title={entry.repoKey}>
+          {entry.repoKey || (entry.bundled ? t("Codex 内置") : t("本地"))}
+        </span>
+      </div>
+      {/* 卡片里只放得下 3 行，完整描述挂在 title 上供悬停查看 */}
+      <p className="skill-card-description" title={entry.description}>
+        {entry.description || t("暂无描述。")}
+      </p>
+      {tags.length ? (
+        <div className="skill-card-tags">
+          {tags.map((tag) => (
+            <span className="skill-card-tag" key={tag}>{tag}</span>
+          ))}
+        </div>
+      ) : null}
+      <div className="skill-card-actions">
+        {entry.bundled ? (
+          <span className="skill-card-tag">{t("Codex 自带，随版本更新")}</span>
+        ) : entry.installed ? (
+          <>
+            <Button
+              disabled={busy}
+              onClick={() => void actions.setSkillEnabled(entry.id, !entry.enabled)}
+              size="sm"
+              variant="secondary"
+            >
+              {entry.enabled ? t("停用") : t("启用")}
+            </Button>
+            {entry.updateAvailable ? (
+              <Button disabled={busy} onClick={() => void actions.updateSkill(entry.repoKey, entry.id)} size="sm">
+                <CircleArrowUp className="h-4 w-4" />
+                {t("更新")}
+              </Button>
+            ) : null}
+            <Button disabled={busy} onClick={() => void actions.uninstallSkill(entry.id)} size="sm" variant="ghost">
+              <Trash2 className="h-4 w-4" />
+              {t("卸载")}
+            </Button>
+          </>
+        ) : (
+          <Button disabled={busy || !entry.repoKey} onClick={() => void actions.installSkill(entry.repoKey, entry.id)} size="sm">
+            <Download className="h-4 w-4" />
+            {busy ? t("安装中") : t("安装")}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SkillRepoManager({ repos, actions }: { repos: SkillRepo[]; actions: Actions }) {
+  const [draft, setDraft] = useState<SkillRepo>({
+    owner: "",
+    name: "",
+    branch: "main",
+    subdir: "",
+    enabled: true,
+  });
+  const canAdd = draft.owner.trim().length > 0 && draft.name.trim().length > 0;
+
+  const addRepo = async () => {
+    const result = await actions.upsertSkillRepo(draft);
+    if (result && isSuccessStatus(result.status)) {
+      setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true });
+    }
+  };
+
+  return (
+    <Panel>
+      <CardHead
+        title={t("仓库源")}
+        detail={t("Skill 目录须直接包含 SKILL.md。子目录留空表示仓库根下就是各个 Skill。")}
+      />
+      <CardContent>
+        <div className="relay-context-list">
+          {repos.map((repo) => {
+            const key = skillRepoKey(repo);
+            return (
+              <div className="relay-context-row" key={key}>
+                <strong className="context-title">{key}</strong>
+                <div className="relay-context-actions">
+                  <button
+                    aria-checked={repo.enabled}
+                    aria-label={`skillRepoEnabledSwitch-${key}`}
+                    className={`context-enabled-switch ${repo.enabled ? "active" : ""}`}
+                    onClick={() => void actions.upsertSkillRepo({ ...repo, enabled: !repo.enabled })}
+                    role="switch"
+                    title={repo.enabled ? t("刷新时跳过此仓库") : t("刷新时包含此仓库")}
+                    type="button"
+                  >
+                    <span className="context-switch-track" aria-hidden="true">
+                      <span className="context-switch-thumb" />
+                    </span>
+                  </button>
+                  <Button
+                    className="relay-context-delete"
+                    onClick={() => void actions.deleteSkillRepo(key)}
+                    size="icon"
+                    title={t("删除仓库源")}
+                    variant="ghost"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="context-editor-fields">
+          <Field label="Owner">
+            <Input
+              onChange={(event) => setDraft({ ...draft, owner: event.currentTarget.value.trim() })}
+              placeholder={t("例如 openai")}
+              value={draft.owner}
+            />
+          </Field>
+          <Field label="Name">
+            <Input
+              onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value.trim() })}
+              placeholder={t("例如 skills")}
+              value={draft.name}
+            />
+          </Field>
+          <Field label="Branch">
+            <Input
+              onChange={(event) => setDraft({ ...draft, branch: event.currentTarget.value.trim() })}
+              placeholder="main"
+              value={draft.branch}
+            />
+          </Field>
+          <Field label={t("子目录")}>
+            <Input
+              onChange={(event) => setDraft({ ...draft, subdir: event.currentTarget.value.trim() })}
+              placeholder={t("例如 skills/.curated，留空表示仓库根")}
+              value={draft.subdir}
+            />
+          </Field>
+        </div>
+        <Toolbar>
+          <Button disabled={!canAdd} onClick={() => void addRepo()} size="sm">
+            <Plus className="h-4 w-4" />
+            {t("添加仓库源")}
+          </Button>
+        </Toolbar>
+      </CardContent>
+    </Panel>
+  );
+}
+
+function SkillBackupManager({ backups, actions }: { backups: SkillBackup[]; actions: Actions }) {
+  return (
+    <Panel>
+      <CardHead
+        title={t("卸载备份")}
+        detail={t("卸载 Skill 前会把源目录整体挪到备份目录。备份只累积不自动清理，需要时手动删。")}
+      />
+      <CardContent>
+        <div className="relay-context-list">
+          {backups.length ? (
+            backups.map((backup) => (
+              <div className="relay-context-row" key={backup.id}>
+                <strong className="context-title">{backup.name || backup.skillId}</strong>
+                <div className="relay-context-actions">
+                  <Button
+                    disabled={actions.skillBusyId === backup.id}
+                    onClick={() => void actions.restoreSkillBackup(backup.id)}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    {t("恢复")}
+                  </Button>
+                  <Button
+                    className="relay-context-delete"
+                    disabled={actions.skillBusyId === backup.id}
+                    onClick={() => void actions.deleteSkillBackup(backup.id)}
+                    size="icon"
+                    title={t("删除此备份")}
+                    variant="ghost"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="empty">{t("还没有备份。")}</div>
+          )}
+        </div>
       </CardContent>
     </Panel>
   );
@@ -7669,7 +8241,6 @@ function RelayProfileDetail({
         />
         {isAggregateRelayProfile(draft) ? null : (
         <RelayFileEditors
-          contextProfile={profile}
           profile={draft}
           form={form}
           isActive={isActive}
@@ -7738,7 +8309,7 @@ function ContextScreen({
 }) {
   return (
     <Panel fill>
-      <CardHead title={t("Codex 工具与插件")} detail={t("独立管理 Codex 的 MCP、Skills、Plugins；切换任意供应商都会带上。")} />
+      <CardHead title={t("Codex MCP&插件")} detail={t("独立管理 Codex 的 MCP 服务器与插件；切换任意供应商都会带上。")} />
       <CardContent>
         <RelayContextManager
           form={normalizeSettings(form)}
@@ -8092,103 +8663,103 @@ function RelayProfileEditor({
           }}
           value={profile.model}
         />
-        {showApiFields ? (
-          <section className="relay-config-section relay-field-model-list">
-            <div className="relay-config-section-head">
-              <div>
-                <strong>{t("模型列表")}</strong>
-                <span>
-                  {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
-                </span>
-              </div>
-              <div className="relay-model-list-tools">
+        {/* 模型列表始终显示：官方模式下也要能配每模型的上下文窗口（1M），
+            以前被 showApiFields 门控住了。*/}
+        <section className="relay-config-section relay-field-model-list">
+          <div className="relay-config-section-head">
+            <div>
+              <strong>{t("模型列表")}</strong>
+              <span>
+                {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
+              </span>
+            </div>
+            <div className="relay-model-list-tools">
+              <Button
+                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加模型")}
+              </Button>
+              <Button
+                onClick={async () => {
+                  const serializedRows = serializeModelWindowRows(modelWindowRows);
+                  const models = await actions.fetchRelayProfileModels({
+                    ...profile,
+                    modelList: serializedRows.modelList,
+                    modelWindows: serializedRows.modelWindows,
+                  });
+                  if (models?.length) {
+                    addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
+                  }
+                }}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <Download className="h-4 w-4" />
+                {t("从上游获取")}
+              </Button>
+              <Button
+                disabled={!modelWindowRows.some((row) => row.model.trim())}
+                onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
+                size="sm"
+                title={t("清空模型")}
+                type="button"
+                variant="outline"
+              >
+                <Trash2 className="h-4 w-4" />
+                {t("清空模型")}
+              </Button>
+            </div>
+          </div>
+          <div className="relay-model-row-editor">
+            <div className="relay-model-row relay-model-row-head">
+              <span>{t("模型名称")}</span>
+              <span>{t("上下文窗口")}</span>
+              <span>{t("图片处理方式")}</span>
+            </div>
+            {modelWindowRows.map((row, index) => (
+              <div className="relay-model-row" key={index}>
+                <Input
+                  value={row.model}
+                  onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
+                  placeholder="deepseek/deepseek-v4-flash"
+                />
+                <Input
+                  value={row.window}
+                  onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
+                  placeholder="1M"
+                />
+                <AppSelect
+                  className="text-xs"
+                  value={row.imageHandling}
+                  disabled={vlmUnsupportedProtocol}
+                  onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
+                  options={[
+                    { value: "", label: t("纯文本模型请配置此项"), disabled: true },
+                    { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
+                    { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
+                    { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
+                  ]}
+                  title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
+                />
                 <Button
-                  onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
-                  size="sm"
+                  aria-label={t("删除模型")}
+                  onClick={() => removeModelWindowRow(index)}
+                  size="icon"
+                  title={t("删除模型")}
                   type="button"
-                  variant="secondary"
-                >
-                  <Plus className="h-4 w-4" />
-                  {t("添加模型")}
-                </Button>
-                <Button
-                  onClick={async () => {
-                    const serializedRows = serializeModelWindowRows(modelWindowRows);
-                    const models = await actions.fetchRelayProfileModels({
-                      ...profile,
-                      modelList: serializedRows.modelList,
-                      modelWindows: serializedRows.modelWindows,
-                    });
-                    if (models?.length) {
-                      addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
-                    }
-                  }}
-                  size="sm"
-                  type="button"
-                  variant="secondary"
-                >
-                  <Download className="h-4 w-4" />
-                  {t("从上游获取")}
-                </Button>
-                <Button
-                  disabled={!modelWindowRows.some((row) => row.model.trim())}
-                  onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
-                  size="sm"
-                  title={t("清空模型")}
-                  type="button"
-                  variant="outline"
+                  variant="ghost"
                 >
                   <Trash2 className="h-4 w-4" />
-                  {t("清空模型")}
                 </Button>
               </div>
-            </div>
-            <div className="relay-model-row-editor">
-              <div className="relay-model-row relay-model-row-head">
-                <span>{t("模型名称")}</span>
-                <span>{t("上下文窗口")}</span>
-                <span>{t("图片处理方式")}</span>
-              </div>
-              {modelWindowRows.map((row, index) => (
-                <div className="relay-model-row" key={index}>
-                  <Input
-                    value={row.model}
-                    onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
-                    placeholder="deepseek/deepseek-v4-flash"
-                  />
-                  <Input
-                    value={row.window}
-                    onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
-                    placeholder="1M"
-                  />
-                  <AppSelect
-                    className="text-xs"
-                    value={row.imageHandling}
-                    disabled={vlmUnsupportedProtocol}
-                    onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
-                    options={[
-                      { value: "", label: t("纯文本模型请配置此项"), disabled: true },
-                      { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
-                      { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
-                      { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
-                    ]}
-                    title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
-                  />
-                  <Button
-                    aria-label={t("删除模型")}
-                    onClick={() => removeModelWindowRow(index)}
-                    size="icon"
-                    title={t("删除模型")}
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
+            ))}
+          </div>
+        </section>
         <label className="switch-row compact relay-switch-row relay-field-goals">
           <input
             checked={goalsFeatureState.enabled}
@@ -8607,6 +9178,7 @@ function RelayContextManager({
   const entries = contextEntriesWithLiveEntries(form, liveEntries);
   const [activeKind, setActiveKind] = useState<ContextKind>("mcp");
   const [editor, setEditor] = useState<{ kind: ContextKind; entry?: CodexContextEntry } | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
   const visibleEntries = contextEntriesByKind(entries, activeKind);
   const label = contextKindLabel(activeKind);
 
@@ -8640,15 +9212,43 @@ function RelayContextManager({
     await syncContextEntries(next);
   };
 
+  const importJson = async (json: string) => {
+    const next = await actions.importMcpServersJson(form, json);
+    if (!next) return;
+    onFormChange(next);
+    if (!(await syncContextEntries(next))) return;
+    setImportOpen(false);
+  };
+
   return (
     <div className="relay-context-panel">
       <div className="relay-context-head">
         <div>
-          <strong>{t("Codex 工具与插件")}</strong>
-          <span>{t("MCP、Skills、Plugins 作为全局配置独立管理，切换任意供应商都会合并。")}</span>
+          <strong>{t("Codex MCP&插件")}</strong>
+          <span>{t("MCP 与插件作为全局配置独立管理，切换任意供应商都会合并。")}</span>
         </div>
         <div className="relay-context-head-actions">
-          <Button onClick={() => setEditor({ kind: activeKind })} size="sm" variant="secondary">
+          {activeKind === "mcp" ? (
+            <Button
+              onClick={() => {
+                setEditor(null);
+                setImportOpen(true);
+              }}
+              size="sm"
+              variant="secondary"
+            >
+              <Download className="h-4 w-4" />
+              {t("导入 JSON")}
+            </Button>
+          ) : null}
+          <Button
+            onClick={() => {
+              setImportOpen(false);
+              setEditor({ kind: activeKind });
+            }}
+            size="sm"
+            variant="secondary"
+          >
             <Plus className="h-4 w-4" />
             {t("新增")}{label}
           </Button>
@@ -8689,7 +9289,15 @@ function RelayContextManager({
                     <span className="context-switch-thumb" />
                   </span>
                 </button>
-                <Button onClick={() => setEditor({ kind: entry.kind, entry })} size="icon" title={t("编辑扩展项")} variant="ghost">
+                <Button
+                  onClick={() => {
+                    setImportOpen(false);
+                    setEditor({ kind: entry.kind, entry });
+                  }}
+                  size="icon"
+                  title={t("编辑扩展项")}
+                  variant="ghost"
+                >
                   <Edit3 className="h-4 w-4" />
                 </Button>
                 <Button
@@ -8708,8 +9316,12 @@ function RelayContextManager({
           <div className="empty">{t("暂无")}{label}{t("，可以从通用配置文件或这里新增。")}</div>
         )}
       </div>
+      {importOpen ? (
+        <McpJsonImporter actions={actions} onCancel={() => setImportOpen(false)} onImport={importJson} />
+      ) : null}
       {editor ? (
         <ContextEntryEditor
+          actions={actions}
           entry={editor.entry}
           kind={editor.kind}
           onCancel={() => setEditor(null)}
@@ -8720,24 +9332,186 @@ function RelayContextManager({
   );
 }
 
+/**
+ * MCP JSON 导入。
+ *
+ * 社区文档里的 MCP 配置基本都是 Claude 风格的 `{"mcpServers":{…}}`，手工翻译成
+ * TOML 容易出错——尤其 headers 在 codex 里叫 http_headers，写错了不报错但认证
+ * 失效。这里先预览再写入，字段改写都列出来给用户看。
+ */
+function McpJsonImporter({
+  actions,
+  onCancel,
+  onImport,
+}: {
+  actions: Actions;
+  onCancel: () => void;
+  onImport: (json: string) => void;
+}) {
+  const [json, setJson] = useState("");
+  const [preview, setPreview] = useState<McpImportPreviewResult | null>(null);
+
+  const runPreview = async () => {
+    const result = await actions.previewMcpServersJson(json);
+    setPreview(result && isSuccessStatus(result.status) ? result : null);
+  };
+
+  return (
+    <div aria-modal="true" className="modal-backdrop" role="dialog">
+      <div className="modal-card context-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{t("导入 MCP JSON")}</h2>
+            <p className="modal-message">
+              {t("支持 mcpServers / servers 包裹，也支持直接粘贴单个服务器配置。")}
+            </p>
+          </div>
+          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onCancel} type="button">×</button>
+        </div>
+      <Field label={t("MCP 配置 JSON")}>
+        <Textarea
+          className="context-editor-textarea"
+          value={json}
+          onChange={(event) => {
+            setJson(event.currentTarget.value);
+            // 内容变了，旧预览就作废，免得用户对着过期结果点导入
+            setPreview(null);
+          }}
+          placeholder={'{\n  "mcpServers": {\n    "context7": {\n      "command": "npx",\n      "args": ["-y", "@upstash/context7-mcp"]\n    }\n  }\n}'}
+          spellCheck={false}
+        />
+      </Field>
+      {preview ? (
+        <div className="relay-context-summary">
+          <div>{tf("将导入 {0} 个：{1}", [preview.entries.length, preview.entries.map((item) => item.id).join("、")])}</div>
+          {preview.warnings.map((warning) => (
+            <div key={warning}>⚠ {warning}</div>
+          ))}
+        </div>
+      ) : null}
+      <Toolbar>
+        <Button disabled={!json.trim()} onClick={() => void runPreview()} size="sm" variant="secondary">
+          {t("预览")}
+        </Button>
+        <Button disabled={!preview} onClick={() => onImport(json)} size="sm">
+          <Download className="h-4 w-4" />
+          {t("确认导入")}
+        </Button>
+        <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
+      </Toolbar>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * MCP / 插件条目编辑器。
+ *
+ * MCP 走结构化表单：codex 的字段名有坑（headers 其实叫 http_headers，type 根本
+ * 不读），让用户手写 TOML 很容易踩。表单不认识的高级键（oauth、scopes 等）由
+ * Rust 侧收进 extraToml 原样带着，不会因为在表单里点一下就丢掉。
+ *
+ * 插件仍是裸 TOML：[plugins."x@y"] 实际只有 enabled 一个键，没必要做表单。
+ */
 function ContextEntryEditor({
   kind,
   entry,
   onCancel,
   onSave,
+  actions,
 }: {
   kind: ContextKind;
   entry?: CodexContextEntry;
   onCancel: () => void;
   onSave: (kind: ContextKind, id: string, tomlBody: string) => void;
+  actions: Actions;
 }) {
   const [draftKind, setDraftKind] = useState<ContextKind>(entry?.kind ?? kind);
   const [id, setId] = useState(entry?.id ?? "");
   const [tomlBody, setTomlBody] = useState(entry?.tomlBody ?? "");
+  const [form, setForm] = useState<McpServerForm>(emptyMcpForm());
+  const [rawMode, setRawMode] = useState(false);
+  const [formReady, setFormReady] = useState(false);
   const canSave = id.trim().length > 0;
+  const useForm = draftKind === "mcp";
+
+  // 打开已有 MCP 条目时把 TOML 拆进表单。解析失败（手写坏了）就退回裸 TOML，
+  // 总比把用户的内容丢掉强。
+  useEffect(() => {
+    let cancelled = false;
+    const initial = entry?.tomlBody ?? "";
+    if (!useForm || !initial.trim()) {
+      setFormReady(true);
+      return;
+    }
+    setFormReady(false);
+    void actions.parseMcpEntry(initial).then((parsed) => {
+      if (cancelled) return;
+      if (parsed) setForm(parsed);
+      else setRawMode(true);
+      setFormReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [entry, useForm, actions]);
+
+  const updateForm = (patch: Partial<McpServerForm>) => setForm((current) => ({ ...current, ...patch }));
+
+  // 选中预设就把 id 和配置一起填好；用户随后仍可自由改。已有条目不给选，
+  // 免得一次误触把手写的配置盖掉。
+  const applyPreset = async (presetId: string) => {
+    const preset = mcpPresetById(presetId);
+    if (!preset) return;
+    const body = preset.tomlBody({ windows: isWindowsPlatform });
+    setId(preset.id);
+    setTomlBody(body);
+    const parsed = await actions.parseMcpEntry(body);
+    if (parsed) setForm(parsed);
+  };
+
+  // 展开高级区：表单 → TOML；收起：TOML → 表单。以当前所处模式为准保存。
+  const toggleRawMode = async () => {
+    if (!rawMode) {
+      const built = await actions.buildMcpEntry(form);
+      if (built === null) return;
+      setTomlBody(built);
+      setRawMode(true);
+      return;
+    }
+    const parsed = await actions.parseMcpEntry(tomlBody);
+    if (!parsed) return;
+    setForm(parsed);
+    setRawMode(false);
+  };
+
+  const save = async () => {
+    if (!useForm || rawMode) {
+      onSave(draftKind, id.trim(), tomlBody);
+      return;
+    }
+    const built = await actions.buildMcpEntry(form);
+    if (built === null) return;
+    onSave(draftKind, id.trim(), built);
+  };
+
+  const title = entry ? t("编辑扩展项") : tf("新增{0}", [contextKindLabel(draftKind)]);
 
   return (
-    <div className="context-editor">
+    <div aria-modal="true" className="modal-backdrop" role="dialog">
+      <div className="modal-card context-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{title}</h2>
+            <p className="modal-message">
+              {useForm
+                ? t("按字段填写即可；表单没覆盖的高级配置会原样保留。")
+                : t("只填写表头下面的内容。")}
+            </p>
+          </div>
+          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onCancel} type="button">×</button>
+        </div>
+      <div className="context-editor">
       <div className="context-editor-fields">
         <Field label={t("类型")}>
           <AppSelect
@@ -8747,6 +9521,18 @@ function ContextEntryEditor({
             options={contextKindOptions.map((option) => ({ value: option.kind, label: option.label }))}
           />
         </Field>
+        {!entry && useForm ? (
+          <Field label={t("从预设填充")}>
+            <AppSelect
+              value=""
+              onChange={(value) => void applyPreset(value)}
+              options={[
+                { value: "", label: t("不使用预设") },
+                ...MCP_PRESETS.map((preset) => ({ value: preset.id, label: preset.name })),
+              ]}
+            />
+          </Field>
+        ) : null}
         <Field label="ID">
           <Input
             disabled={!!entry}
@@ -8756,23 +9542,238 @@ function ContextEntryEditor({
           />
         </Field>
       </div>
-      <Field label={t("TOML 配置体")}>
-        <Textarea
-          className="context-editor-textarea"
-          value={tomlBody}
-          onChange={(event) => setTomlBody(event.currentTarget.value)}
-          placeholder={t("只填写表头下面的内容，例如：\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]")}
-          spellCheck={false}
-        />
-      </Field>
+      {!entry && useForm && mcpPresetById(id) ? (
+        <div className="relay-context-summary">{mcpPresetById(id)?.description}</div>
+      ) : null}
+
+      {useForm && !rawMode && formReady ? (
+        <McpServerFormFields form={form} onChange={updateForm} />
+      ) : null}
+
+      {useForm ? (
+        <button className="context-advanced-toggle" onClick={() => void toggleRawMode()} type="button">
+          {rawMode ? "▾" : "▸"} {t("高级：直接编辑 TOML")}
+        </button>
+      ) : null}
+
+      {!useForm || rawMode ? (
+        <Field label={t("TOML 配置体")}>
+          <Textarea
+            className="context-editor-textarea"
+            value={tomlBody}
+            onChange={(event) => setTomlBody(event.currentTarget.value)}
+            placeholder={t("只填写表头下面的内容，例如：\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]")}
+            spellCheck={false}
+          />
+        </Field>
+      ) : null}
+
       <Toolbar>
-        <Button disabled={!canSave} onClick={() => onSave(draftKind, id.trim(), tomlBody)} size="sm">
+        <Button disabled={!canSave} onClick={() => void save()} size="sm">
           <Save className="h-4 w-4" />
           {t("保存扩展项")}
         </Button>
         <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
       </Toolbar>
+      </div>
+      </div>
     </div>
+  );
+}
+
+/** stdio 和 HTTP 两套字段，按传输方式切换显示。 */
+function McpServerFormFields({
+  form,
+  onChange,
+}: {
+  form: McpServerForm;
+  onChange: (patch: Partial<McpServerForm>) => void;
+}) {
+  return (
+    <>
+      <Field label={t("传输方式")}>
+        <div className="script-market-view-toggle" role="group" aria-label={t("传输方式")}>
+          {([
+            { value: "stdio" as const, label: t("本地命令 (stdio)") },
+            { value: "http" as const, label: t("远程 HTTP") },
+          ]).map((option) => (
+            <Button
+              aria-pressed={form.transport === option.value}
+              key={option.value}
+              onClick={() => onChange({ transport: option.value })}
+              size="sm"
+              variant={form.transport === option.value ? "secondary" : "ghost"}
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+      </Field>
+
+      {form.transport === "stdio" ? (
+        <>
+          <Field label={t("命令")}>
+            <Input
+              value={form.command}
+              onChange={(event) => onChange({ command: event.currentTarget.value })}
+              placeholder={isWindowsPlatform ? "cmd" : "npx"}
+            />
+          </Field>
+          <McpStringListField
+            label={t("参数")}
+            values={form.args}
+            onChange={(args) => onChange({ args })}
+            addLabel={t("添加参数")}
+            placeholder={t("例如 -y")}
+          />
+          <McpPairListField
+            label={t("环境变量")}
+            pairs={form.env}
+            onChange={(env) => onChange({ env })}
+            addLabel={t("添加环境变量")}
+          />
+          <Field label={t("工作目录")}>
+            <Input
+              value={form.cwd}
+              onChange={(event) => onChange({ cwd: event.currentTarget.value })}
+              placeholder={t("留空则用默认目录")}
+            />
+          </Field>
+        </>
+      ) : (
+        <>
+          <Field label="URL">
+            <Input
+              value={form.url}
+              onChange={(event) => onChange({ url: event.currentTarget.value })}
+              placeholder="https://example.com/mcp"
+            />
+          </Field>
+          <McpPairListField
+            label={t("请求头")}
+            pairs={form.httpHeaders}
+            onChange={(httpHeaders) => onChange({ httpHeaders })}
+            addLabel={t("添加请求头")}
+          />
+          <Field label={t("Bearer Token")}>
+            <Input
+              value={form.bearerToken}
+              onChange={(event) => onChange({ bearerToken: event.currentTarget.value })}
+              placeholder={t("留空则不写入")}
+            />
+          </Field>
+        </>
+      )}
+
+      <Field label={t("启动超时（秒）")}>
+        <Input
+          value={form.startupTimeoutSec}
+          onChange={(event) => onChange({ startupTimeoutSec: event.currentTarget.value })}
+          placeholder={t("留空则用 codex 默认值")}
+        />
+      </Field>
+      {form.extraToml.trim() ? (
+        <div className="relay-context-summary">
+          {t("此条目还有表单未覆盖的高级配置，保存时会原样保留。展开下方高级区可查看。")}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function McpStringListField({
+  label,
+  values,
+  onChange,
+  addLabel,
+  placeholder,
+}: {
+  label: string;
+  values: string[];
+  onChange: (values: string[]) => void;
+  addLabel: string;
+  placeholder?: string;
+}) {
+  return (
+    <Field label={label}>
+      <div className="mcp-list-field">
+        {values.map((value, index) => (
+          <div className="mcp-list-row" key={index}>
+            <Input
+              value={value}
+              onChange={(event) => {
+                const next = [...values];
+                next[index] = event.currentTarget.value;
+                onChange(next);
+              }}
+              placeholder={placeholder}
+            />
+            <Button
+              onClick={() => onChange(values.filter((_, position) => position !== index))}
+              size="icon"
+              title={t("删除这一项")}
+              variant="ghost"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button onClick={() => onChange([...values, ""])} size="sm" variant="secondary">
+          <Plus className="h-4 w-4" />
+          {addLabel}
+        </Button>
+      </div>
+    </Field>
+  );
+}
+
+function McpPairListField({
+  label,
+  pairs,
+  onChange,
+  addLabel,
+}: {
+  label: string;
+  pairs: McpKeyValue[];
+  onChange: (pairs: McpKeyValue[]) => void;
+  addLabel: string;
+}) {
+  const update = (index: number, patch: Partial<McpKeyValue>) => {
+    const next = [...pairs];
+    next[index] = { ...next[index], ...patch };
+    onChange(next);
+  };
+  return (
+    <Field label={label}>
+      <div className="mcp-list-field">
+        {pairs.map((pair, index) => (
+          <div className="mcp-list-row mcp-pair-row" key={index}>
+            <Input
+              value={pair.key}
+              onChange={(event) => update(index, { key: event.currentTarget.value })}
+              placeholder="KEY"
+            />
+            <Input
+              value={pair.value}
+              onChange={(event) => update(index, { value: event.currentTarget.value })}
+              placeholder="VALUE"
+            />
+            <Button
+              onClick={() => onChange(pairs.filter((_, position) => position !== index))}
+              size="icon"
+              title={t("删除这一项")}
+              variant="ghost"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button onClick={() => onChange([...pairs, { key: "", value: "" }])} size="sm" variant="secondary">
+          <Plus className="h-4 w-4" />
+          {addLabel}
+        </Button>
+      </div>
+    </Field>
   );
 }
 
@@ -8854,13 +9855,11 @@ function SyncedCodeEditor({
 }
 
 function RelayFileEditors({
-  contextProfile,
   profile,
   form,
   isActive,
   onProfileChange,
 }: {
-  contextProfile: RelayProfile;
   profile: RelayProfile;
   form: BackendSettings;
   isActive: boolean;
@@ -8868,8 +9867,8 @@ function RelayFileEditors({
 }) {
   // 「应用通用配置」开关在上面的 RelayProfileEditor 里；这里只读它来决定预览剥离什么
   const useCommonConfig = profile.useCommonConfig !== false;
-  const configPreview = effectiveRelayConfigPreview(profile, form, contextProfile);
-  const entries = contextEntriesForProfile(form, contextProfile);
+  const configPreview = effectiveRelayConfigPreview(profile, form);
+  const entries = contextEntriesFromSettings(form);
   return (
       <div className="relay-file-grid">
       <div className="relay-file-panel">
@@ -8947,7 +9946,7 @@ function RelayCommonConfigModal({
           <div>
             <h2>{t("通用配置文件")}</h2>
             <p className="modal-message">
-              {t("只保留非 MCP、Skills、Plugins 的跨供应商配置；工具与插件在独立页面管理。")}
+              {t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。")}
             </p>
           </div>
           <button aria-label={t("关闭窗口")} className="toast-close" onClick={onClose} type="button">×</button>
@@ -9749,7 +10748,8 @@ function routeSubtitle(route: Route) {
     grok: t("管理 Grok CLI 的模型与 API 端点"),
     relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
-    context: t("独立管理 MCP、Skills、Plugins"),
+    context: t("独立管理 MCP 服务器与插件"),
+    skills: t("从 GitHub 仓库安装 Skill 到 Codex"),
     weixin: t("通过个人微信连接本机 Codex 会话"),
     enhance: t("会话删除、导出和脚本能力"),
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
@@ -9765,7 +10765,6 @@ function routeSubtitle(route: Route) {
 
 const contextKindOptions: Array<{ kind: ContextKind; label: string; tableName: string }> = [
   { kind: "mcp", label: "MCP", tableName: "mcp_servers" },
-  { kind: "skill", label: "Skills", tableName: "skills" },
   { kind: "plugin", label: t("插件"), tableName: "plugins" },
 ];
 
@@ -9777,7 +10776,6 @@ function contextEntriesFromSettings(settings: BackendSettings): CodexContextEntr
   const commonConfig = normalizeDuplicateTomlTables(settings.relayContextConfigContents || "");
   return {
     mcpServers: parseContextEntries(commonConfig, "mcp", "mcp_servers"),
-    skills: parseContextEntries(commonConfig, "skill", "skills"),
     plugins: parseContextEntries(commonConfig, "plugin", "plugins"),
   };
 }
@@ -9787,12 +10785,10 @@ function contextEntriesWithLiveEntries(settings: BackendSettings, liveEntries: C
   if (!liveEntries) return commonEntries;
   const liveByKind: Record<ContextKind, Map<string, CodexContextEntry>> = {
     mcp: new Map(liveEntries.mcpServers.map((entry) => [entry.id, entry])),
-    skill: new Map(liveEntries.skills.map((entry) => [entry.id, entry])),
     plugin: new Map(liveEntries.plugins.map((entry) => [entry.id, entry])),
   };
   return {
     mcpServers: mergeLiveContextEntries(commonEntries.mcpServers, liveByKind.mcp),
-    skills: mergeLiveContextEntries(commonEntries.skills, liveByKind.skill),
     plugins: mergeLiveContextEntries(commonEntries.plugins, liveByKind.plugin),
   };
 }
@@ -9810,18 +10806,23 @@ function mergeLiveContextEntries(entries: CodexContextEntry[], liveEntries: Map<
   return merged;
 }
 
+/**
+ * 合并 live 配置里的实际状态。
+ *
+ * live 里有这个条目就用它的实际启停状态；**没有则保留条目自身的配置意图**。
+ *
+ * 不能在缺失时强制 false：供应商关掉「应用通用配置」、条目刚新增还没同步、
+ * 或正处于切换过程中时，live 里都不会有它，那会让面板上所有 MCP 显示成已停用
+ * ——用户看到的就是「编辑一下供应商配置，MCP 就自己关了」（#1928）。
+ * 后端 context_entry_enabled 的默认同样是「没有 enabled 键即启用」，两边要一致。
+ */
 function withLiveEntryState(entry: CodexContextEntry, live?: CodexContextEntry): CodexContextEntry {
-  return live ? { ...entry, enabled: live.enabled } : { ...entry, enabled: false };
-}
-
-function contextEntriesForProfile(settings: BackendSettings, profile: RelayProfile): CodexContextEntries {
-  return filterContextEntriesBySelection(contextEntriesFromSettings(settings), profile.contextSelection);
+  return live ? { ...entry, enabled: live.enabled } : entry;
 }
 
 function contextEntriesFromConfig(configContents: string): CodexContextEntries {
   return {
     mcpServers: parseContextEntries(configContents, "mcp", "mcp_servers"),
-    skills: parseContextEntries(configContents, "skill", "skills"),
     plugins: parseContextEntries(configContents, "plugin", "plugins"),
   };
 }
@@ -9829,7 +10830,6 @@ function contextEntriesFromConfig(configContents: string): CodexContextEntries {
 function mergeContextEntries(primary: CodexContextEntries, secondary: CodexContextEntries): CodexContextEntries {
   return {
     mcpServers: mergeContextEntryList(primary.mcpServers, secondary.mcpServers),
-    skills: mergeContextEntryList(primary.skills, secondary.skills),
     plugins: mergeContextEntryList(primary.plugins, secondary.plugins),
   };
 }
@@ -9976,25 +10976,11 @@ function unquoteTomlKey(key: string) {
 
 function contextEntriesByKind(entries: CodexContextEntries, kind: ContextKind): CodexContextEntry[] {
   if (kind === "mcp") return dedupeContextEntryList(entries.mcpServers);
-  if (kind === "skill") return dedupeContextEntryList(entries.skills);
   return dedupeContextEntryList(entries.plugins);
 }
 
-function filterContextEntriesBySelection(entries: CodexContextEntries, selection: RelayContextSelection): CodexContextEntries {
-  const selected = {
-    mcp: new Set(selection.mcpServers.map((id) => id.trim()).filter(Boolean)),
-    skill: new Set(selection.skills.map((id) => id.trim()).filter(Boolean)),
-    plugin: new Set(selection.plugins.map((id) => id.trim()).filter(Boolean)),
-  };
-  return {
-    mcpServers: entries.mcpServers.filter((entry) => selected.mcp.has(entry.id)),
-    skills: entries.skills.filter((entry) => selected.skill.has(entry.id)),
-    plugins: entries.plugins.filter((entry) => selected.plugin.has(entry.id)),
-  };
-}
-
-function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSettings, contextProfile = profile): string {
-  const entries = contextEntriesForProfile(settings, contextProfile);
+function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSettings): string {
+  const entries = contextEntriesFromSettings(settings);
   const isolatedConfig = stripContextEntriesFromConfig(profile.configContents, entries);
   const configWithLimits = applyContextLimitPreview(isolatedConfig, profile);
   // 与后端 relay_config.rs 保持一致：关掉「应用通用配置」的供应商不合并通用配置
@@ -10111,7 +11097,6 @@ function splitContextConfigText(configContents: string): { common: string; conte
 function stripContextEntriesFromConfig(configContents: string, entries: CodexContextEntries): string {
   const knownIds: Record<ContextKind, Set<string>> = {
     mcp: new Set(entries.mcpServers.map((entry) => entry.id)),
-    skill: new Set(entries.skills.map((entry) => entry.id)),
     plugin: new Set(entries.plugins.map((entry) => entry.id)),
   };
   const lines = configContents.split(/\r?\n/);
@@ -10304,45 +11289,6 @@ function tomlKey(key: string): string {
   return /^[A-Za-z0-9_-]+$/.test(key) ? key : `"${tomlString(key)}"`;
 }
 
-function contextSelectionIds(selection: RelayContextSelection, kind: ContextKind): string[] {
-  if (kind === "mcp") return selection.mcpServers;
-  if (kind === "skill") return selection.skills;
-  return selection.plugins;
-}
-
-function setContextSelectionId(selection: RelayContextSelection, kind: ContextKind, id: string, checked: boolean): RelayContextSelection {
-  const next = {
-    mcpServers: [...selection.mcpServers],
-    skills: [...selection.skills],
-    plugins: [...selection.plugins],
-  };
-  const list = contextSelectionIds(next, kind);
-  const normalizedId = id.trim();
-  const exists = list.includes(normalizedId);
-  if (checked && normalizedId && !exists) list.push(normalizedId);
-  if (!checked && exists) list.splice(list.indexOf(normalizedId), 1);
-  return next;
-}
-
-function removeContextSelectionFromSettings(settings: BackendSettings, kind: ContextKind, id: string): BackendSettings {
-  return {
-    ...settings,
-    relayProfiles: settings.relayProfiles.map((profile) => ({
-      ...profile,
-      contextSelection: setContextSelectionId(profile.contextSelection, kind, id, false),
-    })),
-  };
-}
-
-function contextSelectionForAllEntries(settings: BackendSettings): RelayContextSelection {
-  const entries = contextEntriesFromSettings(settings);
-  return {
-    mcpServers: entries.mcpServers.map((entry) => entry.id),
-    skills: entries.skills.map((entry) => entry.id),
-    plugins: entries.plugins.map((entry) => entry.id),
-  };
-}
-
 function relayProfileEditorStatus(profile: RelayProfile, form: BackendSettings, isNew: boolean) {
   if (isNew) return t("新建供应商需要先保存到列表");
   if (!form.relayProfilesEnabled) return t("供应商配置总开关已关闭；当前只保存配置，不写入 Codex live 文件");
@@ -10422,15 +11368,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     settings.relayContextConfigContents || "",
     splitCommon.context,
   ]);
-  const defaultContextSelection = contextSelectionForAllEntries({
-    ...settings,
-    relayCommonConfigContents,
-    relayContextConfigContents,
-  });
   const profiles =
     settings.relayProfiles?.length
       ? settings.relayProfiles.map((profile) =>
-          normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id)), defaultContextSelection),
+          normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id))),
         )
       : [
           {
@@ -10449,8 +11390,6 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             configContents: "",
             authContents: "",
             useCommonConfig: true,
-            contextSelection: defaultContextSelection,
-            contextSelectionInitialized: true,
             contextWindow: "",
             autoCompactLimit: "",
             modelList: "",
@@ -10515,7 +11454,7 @@ function inputToCodexExtraArgs(value: string) {
   return value === "" ? [] : value.split(/\r?\n/);
 }
 
-function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = emptyContextSelection()): RelayProfile {
+function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
   const legacyMixedApi = profile.relayMode === "mixedApi";
   if (profile.relayMode === "aggregate" || profile.aggregate) {
     return normalizeAggregateRelayProfile(
@@ -10534,10 +11473,6 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         configContents: "",
         authContents: "",
         useCommonConfig: profile.useCommonConfig !== false,
-        contextSelection: profile.contextSelectionInitialized
-          ? normalizeContextSelection(profile.contextSelection)
-          : normalizeContextSelection(undefined, defaultContextSelection),
-        contextSelectionInitialized: true,
         contextWindow: "",
         autoCompactLimit: "",
         modelList: "",
@@ -10566,10 +11501,6 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     configContents: relayMode === "official" && !officialMixApiKey ? "" : profile.configContents || "",
     authContents: relayMode === "official" && !officialMixApiKey ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "",
     useCommonConfig: profile.useCommonConfig !== false,
-    contextSelection: profile.contextSelectionInitialized
-      ? normalizeContextSelection(profile.contextSelection)
-      : normalizeContextSelection(undefined, defaultContextSelection),
-    contextSelectionInitialized: true,
     contextWindow: profile.contextWindow || "",
     autoCompactLimit: profile.autoCompactLimit || "",
     modelList: profile.modelList || "",
@@ -10636,24 +11567,6 @@ function relaySessionProviderFromConfig(contents: string): RelaySessionProvider 
 function relaySessionProvider(profile: Pick<RelayProfile, "configContents" | "sessionProvider">): RelaySessionProvider {
   const fromConfig = relaySessionProviderFromConfig(profile.configContents);
   return fromConfig === "openai" || profile.sessionProvider === "openai" ? "openai" : "custom";
-}
-
-function normalizeContextSelection(
-  selection?: Partial<RelayContextSelection>,
-  fallback: RelayContextSelection = emptyContextSelection(),
-): RelayContextSelection {
-  if (!selection) {
-    return {
-      mcpServers: [...fallback.mcpServers],
-      skills: [...fallback.skills],
-      plugins: [...fallback.plugins],
-    };
-  }
-  return {
-    mcpServers: Array.isArray(selection?.mcpServers) ? selection.mcpServers.map(String) : [],
-    skills: Array.isArray(selection?.skills) ? selection.skills.map(String) : [],
-    plugins: Array.isArray(selection?.plugins) ? selection.plugins.map(String) : [],
-  };
 }
 
 function relayModeLabel(mode: RelayMode): string {
@@ -11343,7 +12256,6 @@ function updateRelayProfile(settings: BackendSettings, id: string, patch: Partia
 
 function createRelayProfile(settings: BackendSettings): RelayProfile {
   const id = `relay-${Date.now().toString(36)}`;
-  const contextSelection = contextSelectionForAllEntries(settings);
   const next = {
     id,
     name: tf("供应商 {0}", [settings.relayProfiles.length + 1]),
@@ -11360,8 +12272,6 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     configContents: "",
     authContents: "",
     useCommonConfig: true,
-    contextSelection,
-    contextSelectionInitialized: true,
     contextWindow: "",
     autoCompactLimit: "",
     modelList: "",
@@ -11380,7 +12290,6 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
 
 function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
   const id = `aggregate-${Date.now().toString(36)}`;
-  const contextSelection = contextSelectionForAllEntries(settings);
   const candidates = aggregateMemberCandidates(settings, id);
   return normalizeAggregateRelayProfile(
     {
@@ -11399,8 +12308,6 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
-      contextSelection,
-      contextSelectionInitialized: true,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",

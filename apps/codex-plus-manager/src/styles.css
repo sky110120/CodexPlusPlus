@@ -2131,11 +2131,62 @@ body {
   gap: 10px;
 }
 
+/* MCP 表单和 JSON 导入的模态。
+ *
+ * 默认 modal-card 是 560px，装不下两列的表单字段；表单展开后也可能超出屏幕，
+ * 所以放宽并让正文区自己滚动，头部（标题 + 关闭）保持可见。 */
+.modal-card.context-modal {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(720px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+}
+
+.modal-card.context-modal .context-editor {
+  overflow-y: auto;
+  /* 内联形态才需要顶部分隔线，模态里头部已经分隔过了 */
+  border-top: 0;
+  padding-top: 0;
+}
+
 .context-editor-textarea {
   min-height: 160px;
   font-family: Consolas, "SFMono-Regular", monospace;
   font-size: 12px;
   line-height: 1.45;
+}
+
+/* MCP 表单里的 args / env / headers：一行一项，末尾一个删除按钮。 */
+.mcp-list-field {
+  display: grid;
+  gap: 6px;
+}
+
+.mcp-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 键值对多一列：键窄一些，值占剩下的空间。 */
+.mcp-pair-row {
+  grid-template-columns: minmax(0, 0.5fr) minmax(0, 1fr) auto;
+}
+
+/* 「高级：直接编辑 TOML」的展开开关。做成纯文字，别和表单里的实体按钮抢注意力。 */
+.context-advanced-toggle {
+  justify-self: start;
+  border: 0;
+  background: none;
+  padding: 2px 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.context-advanced-toggle:hover {
+  color: hsl(var(--foreground));
 }
 
 /* 一行一个：两列并排时每个预览都很窄，config.toml 的长行几乎全靠横向滚动 */
@@ -3921,6 +3972,81 @@ input[type="range"]:disabled {
   gap: 12px;
 }
 
+/* Skills 卡片。
+ *
+ * 不复用 .script-market-card：那个卡片是 display:grid 且行高 auto，被同行最高的
+ * 卡片拉伸时多余高度会分摊进每一行，描述框跟着变高，line-clamp 只渲染 3 行但盒子
+ * 更高，overflow:hidden 下面就会露出第 4 行的一小截。这里用 align-content:
+ * space-between，多余空间只落在行与行之间，各行保持自然高度。 */
+.skill-card {
+  display: grid;
+  align-content: space-between;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--card));
+  padding: 14px;
+  transition:
+    border-color var(--motion-normal) var(--motion-ease),
+    box-shadow var(--motion-normal) var(--motion-ease),
+    transform var(--motion-normal) var(--motion-ease);
+}
+
+.skill-card:hover {
+  border-color: hsl(var(--primary) / 0.36);
+  box-shadow: 0 12px 26px hsl(var(--foreground) / 0.08);
+  transform: translateY(-1px);
+}
+
+.skill-card-title {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.skill-card-title strong {
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+/* 仓库标识可能很长（ComposioHQ/awesome-claude-skills@master），
+ * 让它单行省略，避免换行把卡片撑出参差不齐的高度。 */
+.skill-card-source {
+  overflow: hidden;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-card-description {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.skill-card-tags,
+.skill-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skill-card-tag {
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .script-market-toolbar {
   display: flex;
   align-items: center;
@@ -4100,6 +4226,15 @@ input[type="range"]:disabled {
   align-items: center;
   gap: 12px;
   padding: 12px;
+}
+
+/* 卡片被同行最高的那张拉伸时，多余高度默认会分摊进每一行；描述框跟着变高，
+ * 但 line-clamp 只渲染 3 行，overflow:hidden 下面就露出第 4 行的一小截。
+ * 实测触发条件是行内出现空容器（标签为空时溢出 2.8px），当前 .script-market-tags
+ * 总会渲染 v{version} 所以碰不到，这里是防御性收口。
+ * 顺带把多余空间集中到行间，操作按钮在同一行的卡片间底部对齐。 */
+.script-market-card[data-view="grid"] {
+  align-content: space-between;
 }
 
 .script-market-card:hover {

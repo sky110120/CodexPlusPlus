@@ -699,7 +699,7 @@ impl BridgeDataService for LauncherDataService {
         let backup_store = codex_plus_data::BackupStore::new(self.backup_dir.clone());
         let session_for_cleanup = session.clone();
         let result = tokio::task::spawn_blocking(move || {
-            codex_plus_data::delete_local_from_paths(db_paths, backup_store, &session)
+            codex_plus_data::delete_local_from_paths(db_paths, backup_store, &session, None)
         })
         .await
         .map_err(|error| anyhow::anyhow!("delete task failed: {error}"))?;
