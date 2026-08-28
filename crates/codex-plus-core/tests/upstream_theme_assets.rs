@@ -10,7 +10,8 @@ fn compile_time_injected_scripts_are_pinned_to_lf() {
     for path in [
         "assets/inject/renderer-inject.js",
         "assets/inject/pet-real-mouse-inject.js",
-        "assets/inject/stepwise-inject.js",
+        "assets/inject/floating-panel/core/index.js",
+        "assets/inject/floating-panel-inject.js",
     ] {
         let bytes = std::fs::read(root.join(path))
             .unwrap_or_else(|error| panic!("failed to read injected script {path}: {error}"));
