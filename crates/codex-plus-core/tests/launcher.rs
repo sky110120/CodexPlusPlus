@@ -1276,9 +1276,9 @@ async fn a_permanently_busy_protocol_proxy_port_reports_what_the_user_should_do(
     );
 }
 
-/// 普通 helper 端口在上面已经挑过空闲的了，占用说明是别的问题，不该白等六秒。
+/// macOS 重启时旧 launcher 可能尚未释放普通 helper 端口，其他平台则立即失败。
 #[tokio::test]
-async fn a_busy_floating_helper_port_fails_immediately_without_waiting() {
+async fn a_busy_floating_helper_port_uses_platform_retry_policy() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -1299,15 +1299,17 @@ async fn a_busy_floating_helper_port_fails_immediately_without_waiting() {
     .unwrap_err();
 
     assert!(format!("{error:#}").contains("failed to bind helper runtime"));
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| event.starts_with("start-helper-busy:"))
-            .count(),
-        1
-    );
+    let attempts = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.starts_with("start-helper-busy:"))
+        .count();
+    if cfg!(target_os = "macos") {
+        assert!(attempts > 1);
+    } else {
+        assert_eq!(attempts, 1);
+    }
 }
 
 #[tokio::test]

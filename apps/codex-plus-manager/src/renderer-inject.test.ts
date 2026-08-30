@@ -271,7 +271,7 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /if \(!overlay\.isConnected\) overlay\.__codexPlusThemeCleanup\?\.\(\)/);
     assert.match(renderer, /function removeCodexPlusModalOverlay\(overlay\)[\s\S]*__codexPlusThemeCleanup/);
     assert.match(renderer, /overlay\.className = "codex-plus-modal-overlay";\s*installCodexPlusThemeSync\(overlay\);/);
-    assert.match(style.textContent ?? "", /Theme compatibility for retained modal and non-modal injected surfaces/);
+    assert.match(style.textContent ?? "", /Keep injected surfaces on Codex's own semantic palette in both themes/);
     assert.match(style.textContent ?? "", /background: var\(--codex-plus-bg-primary\)/);
     assert.match(style.textContent ?? "", /color: var\(--codex-plus-text\)/);
     assert.match(style.textContent ?? "", /\.codex-session-more-menu\s*\{[\s\S]*background: var\(--codex-plus-bg-elevated\)/);
@@ -337,6 +337,17 @@ describe("renderer injection header compatibility", () => {
 
     assert.equal(appended.length, 1);
     assert.match(appended[0].textContent ?? "", /#codex-plus-menu/);
+  });
+
+  it("does not override the host document root typography or foreground", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const appended = installRendererStyle(renderer);
+    const css = appended[0].textContent ?? "";
+    const rootRule = css.match(/:root\s*\{([^}]*)\}/)?.[1] ?? "";
+
+    assert.doesNotMatch(rootRule, /(?:^|;)\s*font(?:-family)?\s*:/);
+    assert.doesNotMatch(rootRule, /(?:^|;)\s*color\s*:/);
+    assert.match(css, /:where\([^)]*codex-plus-modal-overlay[^)]*\)\s*\{[^}]*font-family:\s*inherit;/s);
   });
 
   it("hides only the official usage alert and restores it without changing upstream styles", async () => {

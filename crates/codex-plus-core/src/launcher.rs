@@ -325,6 +325,14 @@ where
     }
 }
 
+fn helper_bind_retry_timeout_ms(protocol_proxy_enabled: bool, is_macos: bool) -> u64 {
+    if protocol_proxy_enabled || is_macos {
+        HELPER_BIND_RETRY_TIMEOUT_MS
+    } else {
+        0
+    }
+}
+
 pub async fn launch_and_inject_with_hooks<H>(
     options: LaunchOptions,
     hooks: H,
@@ -406,12 +414,11 @@ where
             match hooks.helper_status(helper_port).await {
                 HelperStatus::Compatible => {}
                 HelperStatus::Missing => {
-                    // 普通 helper 端口不会等待；固定协议代理端口需要给旧进程释放监听的时间。
-                    let bind_retry_timeout_ms = if protocol_proxy_enabled {
-                        HELPER_BIND_RETRY_TIMEOUT_MS
-                    } else {
-                        0
-                    };
+                    // 固定协议代理端口和 macOS 重启都可能需要等待旧 launcher 释放监听。
+                    let bind_retry_timeout_ms = helper_bind_retry_timeout_ms(
+                        protocol_proxy_enabled,
+                        cfg!(target_os = "macos"),
+                    );
                     start_helper_waiting_for_busy_port(
                         || hooks.start_helper(helper_port),
                         bind_retry_timeout_ms,
@@ -3203,6 +3210,19 @@ mod tests {
         assert!(should_probe_launcher_cdp(true, false));
         assert!(!should_probe_launcher_cdp(true, true));
         assert!(!should_probe_launcher_cdp(false, false));
+    }
+
+    #[test]
+    fn helper_bind_retry_covers_fixed_proxy_ports_and_macos_restarts() {
+        assert_eq!(
+            helper_bind_retry_timeout_ms(true, false),
+            HELPER_BIND_RETRY_TIMEOUT_MS
+        );
+        assert_eq!(
+            helper_bind_retry_timeout_ms(false, true),
+            HELPER_BIND_RETRY_TIMEOUT_MS
+        );
+        assert_eq!(helper_bind_retry_timeout_ms(false, false), 0);
     }
 
     #[tokio::test]
