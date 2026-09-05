@@ -168,14 +168,45 @@ verify_app "$STAGE/Codex++ 管理工具.app"
 ln -s /Applications "$STAGE/Applications"
 
 MAX_ATTEMPTS="${DMG_CREATE_MAX_ATTEMPTS:-3}"
+CONVERT_MAX_ATTEMPTS="${DMG_CONVERT_MAX_ATTEMPTS:-5}"
 DMG_CREATED=false
 DMG_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-plus-plus-dmg.XXXXXX")"
 DMG_WORK_PATH="$DMG_WORK_DIR/$(basename "$DMG")"
 MOUNT_POINT=""
+MOUNT_DEVICE=""
+
+detach_dmg() {
+  local target="$1"
+  local attempt
+
+  [ -z "$target" ] && return 0
+  for attempt in 1 2 3 4; do
+    if hdiutil detach "$target" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    # hdiutil can report a transient failure even though the device detached
+    # while the command was returning. Treat an already-gone device as done.
+    if ! hdiutil info 2>/dev/null | grep -Fq -- "$target"; then
+      return 0
+    fi
+
+    sleep "$attempt"
+    hdiutil detach "$target" -force >/dev/null 2>&1 || true
+    if ! hdiutil info 2>/dev/null | grep -Fq -- "$target"; then
+      return 0
+    fi
+  done
+
+  echo "error: failed to detach DMG device: $target" >&2
+  return 1
+}
 
 cleanup_dmg_work_dir() {
-  if [ -n "$MOUNT_POINT" ]; then
-    hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+  if [ -n "$MOUNT_DEVICE" ]; then
+    detach_dmg "$MOUNT_DEVICE" || true
+  elif [ -n "$MOUNT_POINT" ]; then
+    detach_dmg "$MOUNT_POINT" || true
   fi
   rm -f "$DMG_WORK_PATH"
   rmdir "$DMG_WORK_DIR" 2>/dev/null || true
@@ -203,6 +234,7 @@ create_dmg_work_image() {
 create_dmg_work_image
 
 MOUNT_OUTPUT="$(hdiutil attach "$DMG_WORK_PATH" -readwrite -noverify -noautoopen -nobrowse)"
+MOUNT_DEVICE="$(printf '%s\n' "$MOUNT_OUTPUT" | awk '/^\/dev\/disk/ {print $1; exit}')"
 MOUNT_POINT="$(printf '%s\n' "$MOUNT_OUTPUT" | awk 'match($0, /\/Volumes\//) {print substr($0, RSTART)}' | tail -1)"
 if [ -z "$MOUNT_POINT" ]; then
   echo "error: failed to find mounted DMG volume" >&2
@@ -245,28 +277,50 @@ then
   echo "warning: unable to persist Finder DMG window layout; the background is still included" >&2
 fi
 
-if ! hdiutil detach "$MOUNT_POINT" >/dev/null; then
-  sleep 1
-  hdiutil detach "$MOUNT_POINT" -force >/dev/null
+# GitHub macOS runner 上 Finder 刚完成窗口布局，卷可能仍被短暂占用
+# （Resource busy）；且优雅 detach 失败也可能已触发延迟弹出，后续重试会报
+# No such file or directory（卷已消失，应视为成功）。退避重试后仍失败才
+# -force；-force 后卷已消失同样视为成功。
+detach_volume() {
+  local attempt
+  for attempt in 1 2 3; do
+    if hdiutil detach "$MOUNT_POINT" >/dev/null; then
+      return 0
+    fi
+    if [ ! -e "$MOUNT_POINT" ]; then
+      return 0
+    fi
+    sleep "$((attempt * 2))"
+  done
+  hdiutil detach "$MOUNT_POINT" -force >/dev/null 2>&1
+  [ ! -e "$MOUNT_POINT" ]
+}
+
+if ! detach_volume; then
+  echo "error: failed to detach DMG volume $MOUNT_POINT" >&2
+  exit 1
 fi
 MOUNT_POINT=""
+MOUNT_DEVICE=""
 
 attempt=0
 while :; do
   attempt=$((attempt + 1))
+# 上一步 detach 可能触发延迟弹出：卷目录已消失但磁盘镜像仍在弹出中，
+# convert 会暂时报 Resource temporarily unavailable——退避重试等它完成。
   if hdiutil convert "$DMG_WORK_PATH" -format UDZO -ov -o "$DMG"; then
     DMG_CREATED=true
     break
   fi
   rm -f "$DMG"
-  if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+  if [ "$attempt" -ge "$CONVERT_MAX_ATTEMPTS" ]; then
     break
   fi
-  echo "hdiutil convert failed (attempt $attempt/$MAX_ATTEMPTS); retrying..." >&2
-  sleep "$((attempt * 2))"
+  echo "hdiutil convert failed (attempt $attempt/$CONVERT_MAX_ATTEMPTS); retrying..." >&2
+  sleep "$((attempt * 3))"
 done
 if [ "$DMG_CREATED" != true ]; then
-  echo "error: hdiutil convert failed after $MAX_ATTEMPTS attempts" >&2
+  echo "error: hdiutil convert failed after $CONVERT_MAX_ATTEMPTS attempts" >&2
   exit 1
 fi
 echo "$DMG"

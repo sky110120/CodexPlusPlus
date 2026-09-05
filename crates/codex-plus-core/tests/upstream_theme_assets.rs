@@ -7,18 +7,35 @@ fn compile_time_injected_scripts_are_pinned_to_lf() {
         std::fs::read_to_string(root.join(".gitattributes")).expect("read .gitattributes");
     assert!(gitattributes.contains("assets/inject/*.js text eol=lf"));
 
-    for path in [
-        "assets/inject/renderer-inject.js",
-        "assets/inject/pet-real-mouse-inject.js",
-        "assets/inject/floating-panel/core/index.js",
-        "assets/inject/floating-panel-inject.js",
-    ] {
-        let bytes = std::fs::read(root.join(path))
-            .unwrap_or_else(|error| panic!("failed to read injected script {path}: {error}"));
+    let mut paths = vec![
+        root.join("assets/inject/renderer-inject.js"),
+        root.join("assets/inject/pet-real-mouse-inject.js"),
+        root.join("assets/inject/floating-panel-inject.js"),
+    ];
+    collect_javascript_files(&root.join("assets/inject/floating-panel"), &mut paths);
+
+    for path in paths {
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("failed to read injected script {}: {error}", path.display())
+        });
         assert!(
             !bytes.windows(2).any(|window| window == b"\r\n"),
-            "injected script must stay LF on every checkout: {path}"
+            "injected script must stay LF on every checkout: {}",
+            path.display()
         );
+    }
+}
+
+fn collect_javascript_files(directory: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
+    {
+        let path = entry.expect("read directory entry").path();
+        if path.is_dir() {
+            collect_javascript_files(&path, paths);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("js") {
+            paths.push(path);
+        }
     }
 }
 

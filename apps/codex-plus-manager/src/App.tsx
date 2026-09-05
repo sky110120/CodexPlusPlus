@@ -82,11 +82,20 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { tokenizeCode, type CodeLanguage } from "./code-highlight";
-import { filterModelGroups } from "./model-groups";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
 import { isGitHubRepositoryHomepage } from "./github-repository";
-import { MCP_PRESETS, mcpPresetById } from "./mcp-presets";
+import { DEFAULT_AUTO_COMPACT_PERCENT, normalizeAutoCompactEditing, normalizeAutoCompactPercent } from "./auto-compact";
+import {
+  clearModelMetadataForSlug,
+  parseModelMetadataDocument,
+  parseModelMetadataMap,
+  remapModelMetadataSlugs,
+  replaceModelMetadataForSlug,
+  retainModelMetadataForSlugs,
+  serializeModelMetadataDocument,
+  synchronizeModelMetadataDocumentLimitsPreview,
+  type ImportedModelMetadata,
+} from "./model-metadata";
 import {
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
@@ -98,12 +107,13 @@ import {
 import {
   mergeModelWindowRows,
   modelWindowRowsFromProfile,
+  modelWindowRowsValidationError,
   serializeModelWindowRows,
   type ImageHandling,
+  type ModelWindowRowsValidationIssue,
   type ModelWindowRow,
 } from "./model-windows";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
-import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
 import {
@@ -132,6 +142,7 @@ import {
   type DreamSkinVerificationResult,
 } from "./dream-skin";
 import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
+import { vlmTestTranslation } from "./vlm-test-translation";
 
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
 const dreamSkinWindowsPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/windows/dream-reference.jpg", import.meta.url).href;
@@ -140,6 +151,15 @@ const dreamSkinCompanionDataUrlLimit = 240_000;
 const dreamSkinCompanionMimeTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 type Status = "ok" | "failed" | "not_implemented" | "not_checked" | string;
+
+function modelWindowRowsValidationMessage(issue: ModelWindowRowsValidationIssue | null): string | null {
+  if (!issue) return null;
+  if (issue.code === "duplicateModel") return tf("模型名称重复：{0}", [issue.model]);
+  if (issue.code === "invalidWindow") {
+    return tf("模型 {0} 的上下文窗口无效；请输入正整数，或使用 K/M 整数后缀。", [issue.model]);
+  }
+  return tf("模型 {0} 的自动压缩百分比无效；请输入 0 到 100 之间、最多 6 位小数的十进制数。", [issue.model]);
+}
 
 type CommandResult<T> = T & {
   status: Status;
@@ -240,7 +260,10 @@ type BackendSettings = {
   codexAppServiceTierControls: boolean;
   codexAppPetRealMouseLook: boolean;
   codexAppStepwiseEnabled: boolean;
+  codexAppAnswerOutlineEnabled: boolean;
   codexAppStepwiseDirectSend: boolean;
+  codexAppStepwiseProtocol: StepwiseProtocol;
+  codexAppStepwiseGenerationMode: StepwiseGenerationMode;
   codexAppStepwiseBaseUrl: string;
   codexAppStepwiseApiKey: string;
   codexAppStepwiseApiKeyEnv: string;
@@ -302,10 +325,14 @@ export type RelayProfile = {
   configContents: string;
   authContents: string;
   useCommonConfig: boolean;
+  contextSelection: RelayContextSelection;
+  contextSelectionInitialized: boolean;
   contextWindow: string;
   autoCompactLimit: string;
   modelList: string;
   modelWindows: string;
+  modelAutoCompact: string;
+  modelMetadata: string;
   modelVlm: string;
   vlmApiKey: string;
   vlmModel: string;
@@ -338,9 +365,13 @@ type AggregateRelayProfile = {
   members: AggregateRelayMember[];
 };
 
-/// codex 的 config.toml 上下文表。skill 不在这里——它是 `$CODEX_HOME/skills/`
-/// 下的目录约定，`[skills.<id>]` codex 根本不读，由 Skills 面板单独管。
-type ContextKind = "mcp" | "plugin";
+type RelayContextSelection = {
+  mcpServers: string[];
+  skills: string[];
+  plugins: string[];
+};
+
+type ContextKind = "mcp" | "skill" | "plugin";
 
 type CodexContextEntry = {
   id: string;
@@ -353,54 +384,23 @@ type CodexContextEntry = {
 
 type CodexContextEntries = {
   mcpServers: CodexContextEntry[];
+  skills: CodexContextEntry[];
   plugins: CodexContextEntry[];
 };
 
-type McpTransport = "stdio" | "http";
-type McpKeyValue = { key: string; value: string };
-
-/** 与 Rust 侧 mcp_config::McpServerForm 一一对应。 */
-type McpServerForm = {
-  transport: McpTransport;
-  command: string;
-  args: string[];
-  env: McpKeyValue[];
-  cwd: string;
-  url: string;
-  httpHeaders: McpKeyValue[];
-  bearerToken: string;
-  startupTimeoutSec: string;
-  enabled: boolean;
-  /** 表单不认识的键（oauth、scopes 之类），原样带着，保存时合并回去。 */
-  extraToml: string;
-};
-
-const emptyMcpForm = (): McpServerForm => ({
-  transport: "stdio",
-  command: "",
-  args: [],
-  env: [],
-  cwd: "",
-  url: "",
-  httpHeaders: [],
-  bearerToken: "",
-  startupTimeoutSec: "",
-  enabled: true,
-  extraToml: "",
-});
-
-type McpFormResult = CommandResult<{ form: McpServerForm }>;
-type McpTomlResult = CommandResult<{ tomlBody: string }>;
-type McpImportPreviewResult = CommandResult<{
-  entries: Array<{ id: string; tomlBody: string }>;
-  warnings: string[];
-}>;
-
 type RelayProtocol = "responses" | "chatCompletions";
+type StepwiseProtocol = "auto" | "chat_completions" | "responses" | "anthropic_messages";
+type StepwiseGenerationMode = "auto" | "manual";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 type RelaySessionProvider = "custom" | "openai";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
 const SCRIPT_MARKET_REPOSITORY_URL = "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket";
+
+const emptyContextSelection = (): RelayContextSelection => ({
+  mcpServers: [],
+  skills: [],
+  plugins: [],
+});
 
 type UserScriptInventory = {
   enabled?: boolean;
@@ -581,6 +581,11 @@ type DeleteLocalSessionResult = CommandResult<{
 type ContextEntriesResult = CommandResult<{
   settings: BackendSettings;
   entries: CodexContextEntries;
+}>;
+
+type McpImportPreviewResult = CommandResult<{
+  entries: Array<{ id: string; tomlBody: string }>;
+  warnings: string[];
 }>;
 
 type LiveContextEntriesResult = CommandResult<{
@@ -971,8 +976,16 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
+type ManagerNavigationIntent = {
+  page: "settings";
+  section?: "stepwise";
+};
+
 type Route = "overview" | "relay" | "grok" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
+
+const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
+const SETTINGS_STEPWISE_SECTION_ID = "settings-stepwise";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
   { id: "overview", label: t("概览"), icon: LayoutDashboard },
@@ -1040,12 +1053,15 @@ const defaultSettings: BackendSettings = {
   codexAppServiceTierControls: false,
   codexAppPetRealMouseLook: false,
   codexAppStepwiseEnabled: false,
+  codexAppAnswerOutlineEnabled: false,
   codexAppStepwiseDirectSend: false,
+  codexAppStepwiseProtocol: "chat_completions",
+  codexAppStepwiseGenerationMode: "auto",
   codexAppStepwiseBaseUrl: "",
   codexAppStepwiseApiKey: "",
   codexAppStepwiseApiKeyEnv: "CODEX_STEPWISE_API_KEY",
   codexAppStepwiseModel: "",
-  codexAppStepwiseMaxItems: 6,
+  codexAppStepwiseMaxItems: 4,
   codexAppStepwiseMaxInputChars: 6000,
   codexAppStepwiseMaxOutputTokens: 500,
   codexAppStepwiseTimeoutMs: 8000,
@@ -1089,10 +1105,14 @@ const defaultSettings: BackendSettings = {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
+      contextSelection: emptyContextSelection(),
+      contextSelectionInitialized: true,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",
       modelWindows: "",
+      modelAutoCompact: "",
+      modelMetadata: "",
       modelVlm: "",
       vlmApiKey: "",
       vlmModel: "",
@@ -1113,6 +1133,7 @@ const defaultSettings: BackendSettings = {
 export function App() {
   const [theme, setTheme] = useState<Theme>(() => loadInitialTheme());
   const [route, setRoute] = useState<Route>(() => loadInitialRoute());
+  const [pendingSettingsSection, setPendingSettingsSection] = useState<ManagerNavigationIntent["section"] | null>(null);
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
@@ -1421,6 +1442,7 @@ export function App() {
       if (!silent) showResultNotice(t("登录状态"), result, { silentSuccess: true });
     }
   };
+
   const refreshRelayFiles = async (silent = false) => {
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
     if (result) {
@@ -2311,8 +2333,8 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshCcsProviders(true);
     }
-    if (next === "relayEnvironment") await refreshRelayEnvironment(true);
     if (next === "grok") await refreshGrokConfig(true);
+    if (next === "relayEnvironment") await refreshRelayEnvironment(true);
     if (next === "sessions") {
       await refreshSettings(true);
       await refreshLocalSessions(true);
@@ -2326,11 +2348,6 @@ export function App() {
       await refreshSettings(true);
       await refreshRelayFiles(true);
       await refreshLiveContextEntries(true);
-    }
-    if (next === "skills") {
-      // 先把本地已装的列出来，远端清单要联网，慢一步再补上
-      await listInstalledSkills();
-      await refreshSkillCatalog(true);
     }
     if (next === "weixin") {
       await refreshSettings(true);
@@ -2351,6 +2368,10 @@ export function App() {
       await refreshScriptMarket(true);
       await refreshUserScriptInventory();
     }
+    if (next === "skills") {
+      await listInstalledSkills();
+      void refreshSkillCatalog(true);
+    }
     // 推荐页面已隐藏，暂不触发推荐内容拉取
     // if (next === "recommendations") await refreshAds(true);
     if (next === "about") {
@@ -2362,6 +2383,22 @@ export function App() {
       await refreshOverview(true);
       await refreshWatcher(true);
     }
+  };
+
+  const consumePendingManagerNavigation = async (): Promise<boolean> => {
+    try {
+      const navigation = await invoke<ManagerNavigationIntent | null>("consume_pending_manager_navigation");
+      if (!navigation) return false;
+      if (navigation.page === "settings") {
+        setPendingSettingsSection(navigation.section ?? null);
+        setRoute("settings");
+        await refreshSettings(true);
+        return true;
+      }
+    } catch (error) {
+      logDiagnostic("manager.navigation_failed", { error: stringifyError(error) });
+    }
+    return false;
   };
 
   const launch = async () => {
@@ -2978,26 +3015,22 @@ export function App() {
     return normalized;
   };
 
-  // MCP 的 TOML ↔ 表单转换放在 Rust 侧：前端没有 TOML 解析器，正则切段拼不出
-  // 「保住表单不认识的高级字段」这件事。两个都是纯转换，不碰 settings。
-  const parseMcpEntry = async (tomlBody: string): Promise<McpServerForm | null> => {
-    const result = await run(() => call<McpFormResult>("parse_mcp_entry", { tomlBody }));
+  const deleteContextEntry = async (next: BackendSettings, kind: ContextKind, id: string) => {
+    const result = await run(() =>
+      call<ContextEntriesResult>("delete_context_entry", {
+        request: { settings: next, kind, id },
+      }),
+    );
     if (!result) return null;
-    if (!isSuccessStatus(result.status)) {
-      showResultNotice(t("MCP 配置"), result);
-      return null;
+    let normalized = normalizeSettings(result.settings);
+    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    if (saveResult) {
+      setSettings(saveResult);
+      normalized = normalizeSettings(saveResult.settings);
     }
-    return result.form;
-  };
-
-  const buildMcpEntry = async (form: McpServerForm): Promise<string | null> => {
-    const result = await run(() => call<McpTomlResult>("build_mcp_entry", { form }));
-    if (!result) return null;
-    if (!isSuccessStatus(result.status)) {
-      showResultNotice(t("MCP 配置"), result);
-      return null;
-    }
-    return result.tomlBody;
+    setSettingsForm(normalized);
+    if (!isSuccessStatus(result.status)) showResultNotice(t("MCP&插件"), result);
+    return normalized;
   };
 
   const previewMcpServersJson = async (json: string) => {
@@ -3020,23 +3053,6 @@ export function App() {
     setSettingsForm(normalized);
     showResultNotice(t("MCP 导入"), result);
     return isSuccessStatus(result.status) ? normalized : null;
-  };
-
-  const deleteContextEntry = async (next: BackendSettings, kind: ContextKind, id: string) => {    const result = await run(() =>
-      call<ContextEntriesResult>("delete_context_entry", {
-        request: { settings: next, kind, id },
-      }),
-    );
-    if (!result) return null;
-    let normalized = normalizeSettings(result.settings);
-    const saveResult = await run(() => call<SettingsResult>("save_settings", saveSettingsArgs(normalized)));
-    if (saveResult) {
-      setSettings(saveResult);
-      normalized = normalizeSettings(saveResult.settings);
-    }
-    setSettingsForm(normalized);
-    if (!isSuccessStatus(result.status)) showResultNotice(t("MCP&插件"), result);
-    return normalized;
   };
 
   const extractRelayCommonConfig = async (configContents: string) => {
@@ -3237,14 +3253,15 @@ export function App() {
   useEffect(() => {
     void (async () => {
       const startup = await run(() => call<StartupResult>("startup_options"));
-      if (startup?.showUpdate) {
+      const handledNavigation = await consumePendingManagerNavigation();
+      if (!handledNavigation && startup?.showUpdate) {
         setRoute("about");
         void checkUpdate(false);
       } else {
         void checkUpdate(true);
       }
       await refreshOverview(true);
-      await refreshSettings(true);
+      if (!handledNavigation) await refreshSettings(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
@@ -3255,6 +3272,42 @@ export function App() {
       await refreshRemotePluginMarketplace(true);
     })();
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen(MANAGER_NAVIGATION_EVENT, () => {
+      if (!disposed) void consumePendingManagerNavigation();
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        stopListening = unlisten;
+      }
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (route !== "settings" || pendingSettingsSection !== "stepwise") return;
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        document.getElementById(SETTINGS_STEPWISE_SECTION_ID)?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+        setPendingSettingsSection(null);
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [pendingSettingsSection, route]);
 
   useEffect(() => {
     if (getLanguage() === "en") {
@@ -3642,8 +3695,6 @@ export function App() {
       saveRelayFile,
       upsertContextEntry,
       deleteContextEntry,
-      parseMcpEntry,
-      buildMcpEntry,
       previewMcpServersJson,
       importMcpServersJson,
       extractRelayCommonConfig,
@@ -3675,7 +3726,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart, skillBusyId],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -3781,15 +3832,15 @@ export function App() {
               actions={actions}
             />
           ) : null}
-          {route === "relayEnvironment" ? (
-            <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
-          ) : null}
           {route === "grok" ? (
             <GrokConfigScreen
               config={grokConfig}
               onRefresh={() => refreshGrokConfig(false)}
               onSave={saveGrokConfig}
             />
+          ) : null}
+          {route === "relayEnvironment" ? (
+            <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
           ) : null}
           {route === "sessions" ? (
             <SessionsScreen
@@ -3812,7 +3863,6 @@ export function App() {
               actions={actions}
             />
           ) : null}
-          {route === "skills" ? <SkillsScreen skills={skills} actions={actions} /> : null}
           {route === "weixin" ? (
             <WeixinConnectScreen
               form={settingsForm}
@@ -3861,6 +3911,7 @@ export function App() {
           {route === "zedRemote" ? (
             <ZedRemoteScreen projects={zedRemoteProjects} form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
           ) : null}
+          {route === "skills" ? <SkillsScreen skills={skills} actions={actions} /> : null}
           {route === "userScripts" ? <UserScriptsScreen settings={settings} market={scriptMarket} actions={actions} /> : null}
           {route === "recommendations" ? <RecommendationsScreen ads={ads} actions={actions} /> : null}
           {route === "maintenance" ? (
@@ -4081,8 +4132,6 @@ type Actions = {
     tomlBody: string,
   ) => Promise<BackendSettings | null>;
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
-  parseMcpEntry: (tomlBody: string) => Promise<McpServerForm | null>;
-  buildMcpEntry: (form: McpServerForm) => Promise<string | null>;
   previewMcpServersJson: (json: string) => Promise<McpImportPreviewResult | null>;
   importMcpServersJson: (settings: BackendSettings, json: string) => Promise<BackendSettings | null>;
   extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
@@ -5425,7 +5474,7 @@ function EnhanceScreen({
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
+              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
                 <div>
                   <strong>{t("官方远端插件缓存")}</strong>
@@ -5458,9 +5507,9 @@ function EnhanceScreen({
               <FeatureToggle title={t("对话居中宽度")} detail={t("把主对话和输入框限制到固定最大宽度，适合大屏阅读。")} checked={form.codexAppConversationView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppConversationView", value)} />
               <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
             </FeatureGroup>
-            <FeatureGroup title="Stepwise" detail={t("基于当前对话生成下一步建议，使用独立 API 配置。")}>
-              <FeatureToggle title="Stepwise" detail={t("在 Codex 页面显示可拖动的后续建议浮层；建议由单独配置的 Stepwise API 生成。启停后需重启 Codex++ 生效。")} checked={form.codexAppStepwiseEnabled} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseEnabled", value)} />
-              <FeatureToggle title={t("Stepwise 直接发送")} detail={t("点击建议后自动发送；关闭时只填入输入框。")} checked={form.codexAppStepwiseDirectSend} disabled={!masterEnabled || !form.codexAppStepwiseEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseDirectSend", value)} />
+            <FeatureGroup title={t("悬浮球")} detail={t("控制下一步建议与回答大纲。")}>
+              <FeatureToggle title="Stepwise" detail={t("根据当前回答生成下一步建议。")} checked={form.codexAppStepwiseEnabled} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppStepwiseEnabled", value)} />
+              <FeatureToggle title={t("回答大纲")} detail={t("整理当前回答的结构。")} checked={form.codexAppAnswerOutlineEnabled} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppAnswerOutlineEnabled", value)} />
             </FeatureGroup>
             <FeatureGroup title={t("界面与启动")} detail={t("控制语言、启动速度和 Codex 原生界面调整。")}>
               {isWindowsPlatform ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
@@ -7675,14 +7724,14 @@ function SettingsScreen({
             </div>
             <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
           </div>
-          <Field label={t("供应商测试模型")}>
+          <Field className="settings-test-model-field" label={t("供应商测试模型")}>
             <Input
               value={form.relayTestModel}
               onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
               placeholder={t("例如 gpt-5.4-mini")}
             />
           </Field>
-          <div className="settings-block stepwise-settings-block">
+          <div className="settings-block stepwise-settings-block" id={SETTINGS_STEPWISE_SECTION_ID}>
             <div className="section-title">Stepwise</div>
             <div className="stepwise-settings-section">{t("连接")}</div>
             <div className="form-row">
@@ -7698,6 +7747,30 @@ function SettingsScreen({
                   value={form.codexAppStepwiseModel}
                   onChange={(event) => onFormChange({ ...form, codexAppStepwiseModel: event.currentTarget.value })}
                   placeholder={t("例如 gpt-5.4-mini")}
+                />
+              </Field>
+            </div>
+            <div className="form-row">
+              <Field label={t("协议")}>
+                <AppSelect
+                  value={form.codexAppStepwiseProtocol}
+                  onChange={(value) => onFormChange({ ...form, codexAppStepwiseProtocol: value })}
+                  options={[
+                    { value: "auto", label: t("自动兼容") },
+                    { value: "chat_completions", label: "Chat Completions" },
+                    { value: "responses", label: "Responses API" },
+                    { value: "anthropic_messages", label: "Anthropic Messages" },
+                  ]}
+                />
+              </Field>
+              <Field label={t("模式")}>
+                <AppSelect
+                  value={form.codexAppStepwiseGenerationMode}
+                  onChange={(value) => onFormChange({ ...form, codexAppStepwiseGenerationMode: value })}
+                  options={[
+                    { value: "auto", label: t("自动生成") },
+                    { value: "manual", label: t("手动刷新") },
+                  ]}
                 />
               </Field>
             </div>
@@ -7796,8 +7869,6 @@ function SettingsScreen({
                 min={1}
                 max={100}
                 type="range"
-                // WebKit 没有 ::-moz-range-progress，已填充部分靠这个变量画渐变
-                style={{ "--range-progress": `${form.codexAppImageOverlayOpacity}%` } as CSSProperties}
                 value={form.codexAppImageOverlayOpacity}
                 onChange={(event) =>
                   onFormChange({
@@ -8171,14 +8242,12 @@ function RelayProfileDetail({
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
-    modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
+    modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact),
   );
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
-  // 通用配置弹窗的开关放在这一层：.relay-profile-editor 有 will-change，
-  // 会给 position:fixed 造包含块，弹窗渲染在卡片里就会被裁进卡片。
-  const [commonConfigOpen, setCommonConfigOpen] = useState(false);
   const [doctorRunning, setDoctorRunning] = useState(false);
+  const [savingDraft, setSavingDraft] = useState(false);
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
   useEffect(() => {
@@ -8199,54 +8268,83 @@ function RelayProfileDetail({
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
     setDraft(nextDraft);
-    setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm));
-  }, [profile.id, profile.modelList, profile.modelWindows, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
+    setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact));
+  }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelMetadata, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
   const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
       ? aggregateRelayProfileValidation(draft)
       : relayModelRoutesSettingsValidation(validationSettings));
+  const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
-    return { ...draft, modelList: serializedRows.modelList, modelWindows: serializedRows.modelWindows, modelVlm: serializedRows.modelVlm };
+    const validSlugs = serializedRows.modelList.split("\n").map((slug) => slug.trim()).filter(Boolean);
+    return {
+      ...draft,
+      modelList: serializedRows.modelList,
+      modelWindows: serializedRows.modelWindows,
+      modelAutoCompact: serializedRows.modelAutoCompact,
+      modelMetadata: retainModelMetadataForSlugs(draft.modelMetadata, validSlugs),
+      modelVlm: serializedRows.modelVlm,
+    };
   };
+  const currentModelState = draftWithModelRows();
+  const persistedModelState = {
+    modelList: profile.modelList || "",
+    modelWindows: profile.modelWindows || "",
+    modelAutoCompact: profile.modelAutoCompact || "",
+    modelMetadata: profile.modelMetadata || "",
+    modelVlm: profile.modelVlm || "",
+  };
+  const hasUnsavedModelChanges = JSON.stringify({
+    modelList: currentModelState.modelList,
+    modelWindows: currentModelState.modelWindows,
+    modelAutoCompact: currentModelState.modelAutoCompact,
+    modelMetadata: currentModelState.modelMetadata,
+    modelVlm: currentModelState.modelVlm,
+  }) !== JSON.stringify(persistedModelState);
   const saveDraft = async () => {
-    if (validationError) return;
-    const draftWithWindows = draftWithModelRows();
-    const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
-    const next = normalizeSettings(isNew
-      ? addRelayProfile(form, normalizedDraft)
-      : updateRelayProfile(form, profile.id, normalizedDraft));
-    const settingsValidationError = relaySettingsValidation(next);
-    if (settingsValidationError) return;
-    const activeLiveBaseUrl = codexBaseUrlFromConfig(
-      relayFiles?.configContents ?? profile.configContents,
-    );
-    const requiresRestart = isActive && modelRouteSaveRequiresRestart(
-      normalizeSettings(form),
-      next,
-      activeLiveBaseUrl,
-    );
-    if (requiresRestart && !window.confirm(t("此配置需要启动本地协议代理。保存后将立即重启 Codex，使配置生效。是否继续？"))) {
-      return;
-    }
-    const savedSettings = await onFormChange(next);
-    if (!savedSettings) return;
-    if (requiresRestart) {
-      const restarted = await actions.restart(true);
-      if (!restarted) return;
+    if (savingDraft || validationError || modelRowsError) return;
+    setSavingDraft(true);
+    try {
+      const draftWithWindows = draftWithModelRows();
+      const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
+      const next = normalizeSettings(isNew
+        ? addRelayProfile(form, normalizedDraft)
+        : updateRelayProfile(form, profile.id, normalizedDraft));
+      const settingsValidationError = relaySettingsValidation(next);
+      if (settingsValidationError) return;
+      const activeLiveBaseUrl = codexBaseUrlFromConfig(
+        relayFiles?.configContents ?? profile.configContents,
+      );
+      const requiresRestart = isActive && modelRouteSaveRequiresRestart(
+        normalizeSettings(form),
+        next,
+        activeLiveBaseUrl,
+      );
+      if (requiresRestart && !window.confirm(t("首次启用单模型路由需要启动本地协议代理。保存后将立即重启 Codex，使路由安全生效。是否继续？"))) {
+        return;
+      }
+      const savedSettings = await onFormChange(next);
+      if (!savedSettings) return;
+      if (requiresRestart) {
+        const restarted = await actions.restart(true);
+        if (!restarted) return;
+        onSaved?.();
+        return;
+      }
+      const savedProfile = savedSettings.relayProfiles.find((candidate) => candidate.id === normalizedDraft.id)
+        ?? normalizedDraft;
+      if (isActive && savedSettings.relayProfilesEnabled && relayProfileUsesLiveFiles(savedProfile)) {
+        await actions.switchRelayProfile(savedSettings, savedSettings.activeRelayId);
+      }
       onSaved?.();
-      return;
+    } finally {
+      setSavingDraft(false);
     }
-    const savedProfile = savedSettings.relayProfiles.find((candidate) => candidate.id === normalizedDraft.id)
-      ?? normalizedDraft;
-    if (isActive && savedSettings.relayProfilesEnabled && relayProfileUsesLiveFiles(savedProfile)) {
-      await actions.switchRelayProfile(savedSettings, savedSettings.activeRelayId);
-    }
-    onSaved?.();
   };
   const switchDraft = () => {
-    if (isNew || !form.relayProfilesEnabled || validationError) return;
+    if (isNew || !form.relayProfilesEnabled || validationError || modelRowsError) return;
     const draftWithWindows = draftWithModelRows();
     const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
     const previousActiveRelayId = form.activeRelayId;
@@ -8275,14 +8373,18 @@ function RelayProfileDetail({
     : relayProfileEditorStatus(draft, form, isNew);
   return (
     <div className="relay-detail-page" key={profile.id}>
-      {/* 标题栏 / 滚动区 / 底部操作栏三段式：保存按钮常驻可见，不随表单滚走 */}
       <div className="relay-detail-header">
-        <Button aria-label={t("返回列表")} onClick={onBack} size="icon" title={t("返回列表")} type="button" variant="outline">
-          <ArrowLeft className="h-4 w-4" />
-        </Button>
-        <div className="relay-editor-heading-copy">
-          <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
-          <span>{detailStatus}</span>
+        <div className="relay-editor-heading">
+          <Button aria-label={t("返回列表")} onClick={() => {
+            if (hasUnsavedModelChanges && !window.confirm(t("有未保存的模型修改，确定放弃吗？"))) return;
+            onBack();
+          }} size="icon" title={t("返回列表")} type="button" variant="ghost">
+            <ArrowLeft className="h-4 w-4" />
+          </Button>
+          <div className="relay-editor-heading-copy">
+            <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
+            <span>{hasUnsavedModelChanges ? `${detailStatus} · ${t("有未保存修改")}` : detailStatus}</span>
+          </div>
         </div>
         {aggregateProfile ? <UiBadge variant="secondary">{t("聚合")}</UiBadge> : null}
       </div>
@@ -8291,7 +8393,6 @@ function RelayProfileDetail({
           profile={draft}
           form={form}
           isNew={isNew}
-          onEditCommonConfig={() => setCommonConfigOpen(true)}
           onProfileChange={setDraft}
           actions={actions}
           modelWindowRows={modelWindowRows}
@@ -8299,16 +8400,20 @@ function RelayProfileDetail({
         />
         {isAggregateRelayProfile(draft) ? null : (
         <RelayFileEditors
+          contextProfile={profile}
           profile={draft}
           form={form}
           isActive={isActive}
+          profileId={profile.id}
+          onFormChange={onFormChange}
           onProfileChange={setDraft}
+          actions={actions}
         />
         )}
       </div>
       <div className="relay-detail-footer">
         {showDoctor ? (
-          <Button disabled={doctorRunning} onClick={() => void runProviderDoctor()} type="button" variant="outline">
+          <Button disabled={doctorRunning} onClick={() => void runProviderDoctor()} type="button" variant="secondary">
             <Stethoscope className="h-4 w-4" />
             {doctorRunning ? t("诊断中") : t("诊断供应商")}
           </Button>
@@ -8323,9 +8428,14 @@ function RelayProfileDetail({
             {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
           </Button>
         )}
-        <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")} type="button">
+        <Button
+          disabled={savingDraft || !!validationError || !!modelRowsError}
+          onClick={() => void saveDraft()}
+          title={validationError || modelRowsError || t("保存")}
+          type="button"
+        >
           <Save className="h-4 w-4" />
-          {t("保存")}
+          {savingDraft ? t("保存中") : t("保存此模型")}
         </Button>
       </div>
       {doctorOpen ? (
@@ -8335,17 +8445,6 @@ function RelayProfileDetail({
           onClose={() => {
             if (!doctorRunning) setDoctorOpen(false);
           }}
-        />
-      ) : null}
-      {commonConfigOpen ? (
-        <RelayCommonConfigModal
-          actions={actions}
-          form={form}
-          onClose={() => setCommonConfigOpen(false)}
-          onFormChange={onFormChange}
-          onProfileChange={setDraft}
-          profile={draft}
-          profileId={profile.id}
         />
       ) : null}
     </div>
@@ -8381,149 +8480,10 @@ function ContextScreen({
   );
 }
 
-/**
- * 「默认模型」字段：可直接输入，也可从上游拉一份模型列表后在下拉里挑。
- *
- * 容器故意用 div 而不是 Field 的 label：label 里点按钮会把焦点抢给输入框，
- * 下拉里的搜索框就拿不到焦点了。
- */
-function DefaultModelField({
-  value,
-  knownModels,
-  onChange,
-  onFetchModels,
-}: {
-  value: string;
-  knownModels: string[];
-  onChange: (value: string) => void;
-  onFetchModels: () => Promise<string[] | null>;
-}) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [fetching, setFetching] = useState(false);
-  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
-  const rootRef = useRef<HTMLDivElement>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
-
-  const models = useMemo(
-    () => [...knownModels, ...fetchedModels],
-    [fetchedModels, knownModels],
-  );
-  const groups = useMemo(() => filterModelGroups(models, query), [models, query]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
-
-  useEffect(() => {
-    if (open) searchRef.current?.focus();
-    else setQuery("");
-  }, [open]);
-
-  const fetchModels = async () => {
-    setFetching(true);
-    try {
-      const fetched = await onFetchModels();
-      if (fetched?.length) {
-        setFetchedModels(fetched);
-        setOpen(true);
-      }
-    } finally {
-      setFetching(false);
-    }
-  };
-
-  return (
-    <div className="field relay-field-config-model" ref={rootRef}>
-      <span>{t("默认模型")}</span>
-      <div className="default-model-control">
-        <Input
-          onChange={(event) => onChange(event.currentTarget.value)}
-          placeholder={t("例如 deepseek-v4-pro")}
-          value={value}
-        />
-        <Button
-          aria-expanded={open}
-          className={open ? "is-open" : ""}
-          onClick={() => setOpen((previous) => !previous)}
-          size="icon"
-          title={t("选择模型")}
-          type="button"
-          variant="outline"
-        >
-          <ChevronDown className="h-4 w-4" />
-        </Button>
-        <Button
-          disabled={fetching}
-          onClick={() => void fetchModels()}
-          size="icon"
-          title={t("从上游获取")}
-          type="button"
-          variant="outline"
-        >
-          <Download className="h-4 w-4" />
-        </Button>
-        {open ? (
-          <div className="default-model-menu">
-            <div className="default-model-search">
-              <Search className="h-4 w-4" />
-              <input
-                aria-label={t("搜索模型…")}
-                onChange={(event) => setQuery(event.currentTarget.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") setOpen(false);
-                }}
-                placeholder={t("搜索模型…")}
-                ref={searchRef}
-                value={query}
-              />
-            </div>
-            <div className="default-model-options" role="listbox">
-              {groups.length ? groups.map((group) => (
-                <div className="default-model-group" key={group.label}>
-                  <div className="default-model-group-label">{group.label}</div>
-                  {group.models.map((model) => (
-                    <button
-                      aria-selected={model === value}
-                      className="default-model-option"
-                      key={model}
-                      onClick={() => {
-                        onChange(model);
-                        setOpen(false);
-                      }}
-                      role="option"
-                      type="button"
-                    >
-                      {model}
-                    </button>
-                  ))}
-                </div>
-              )) : (
-                <div className="default-model-empty">
-                  {models.length ? t("没有匹配的模型。") : t("还没有模型列表，先点左边的按钮从上游获取。")}
-                </div>
-              )}
-            </div>
-          </div>
-        ) : null}
-      </div>
-      <p className="field-hint">
-        {t("默认启动 Codex 时使用的模型名，请勿带后缀；上下文窗口请在下方「模型列表」中按模型单独配置。")}
-      </p>
-    </div>
-  );
-}
-
 function RelayProfileEditor({
   profile,
   form,
   isNew = false,
-  onEditCommonConfig,
   onProfileChange,
   actions,
   modelWindowRows,
@@ -8532,14 +8492,32 @@ function RelayProfileEditor({
   profile: RelayProfile;
   form: BackendSettings;
   isNew?: boolean;
-  onEditCommonConfig: () => void;
   onProfileChange: (value: RelayProfile) => void;
   actions: Actions;
   modelWindowRows: ModelWindowRow[];
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [vlmTestOpen, setVlmTestOpen] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
+  const [metadataImportTarget, setMetadataImportTarget] = useState<{
+    index: number;
+    slug: string;
+    originalWindow: string;
+    originalAutoCompact: string;
+  } | null>(null);
+  const [metadataImportDocument, setMetadataImportDocument] = useState("");
+  const [metadataImportOriginalDocument, setMetadataImportOriginalDocument] = useState("");
+  const [metadataImportError, setMetadataImportError] = useState("");
+  const [metadataImportPreview, setMetadataImportPreview] = useState<ImportedModelMetadata | null>(null);
+  const modelSlugOriginsRef = useRef(modelWindowRows.map((row) => row.model.trim()));
+  useEffect(() => {
+    modelSlugOriginsRef.current = modelWindowRows.map((row) => row.model.trim());
+  }, [profile.id, profile.modelList]);
+  const importedModelMetadata = useMemo(
+    () => parseModelMetadataMap(profile.modelMetadata),
+    [profile.modelMetadata],
+  );
   // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
   const vlmUnsupportedProtocol = false;
   if (isAggregateRelayProfile(profile)) {
@@ -8561,7 +8539,7 @@ function RelayProfileEditor({
     profile.useCommonConfig,
   );
   const sub2apiBaseUrl = profile.upstreamBaseUrl.trim() || profile.baseUrl.trim();
-  const canFetchSub2ApiRate = profile.sub2apiEnabled && Boolean(sub2apiBaseUrl && profile.apiKey.trim());
+  const canFetchSub2ApiRate = !profile.noAuth && profile.sub2apiEnabled && Boolean(sub2apiBaseUrl && profile.apiKey.trim());
   const updateDraft = (patch: Partial<RelayProfile>) => {
     onProfileChange(applyRelayProfilePatchToFiles(profile, patch, { allowGenerateFiles: isNew }));
   };
@@ -8574,18 +8552,134 @@ function RelayProfileEditor({
       modelRoutes: modelRoutes.map((route, routeIndex) => (routeIndex === index ? { ...route, ...patch } : route)),
     });
   };
+  const commitModelMetadata = (modelMetadata: string) => {
+    updateDraft({ modelMetadata });
+  };
   const updateModelWindowRow = (index: number, patch: Partial<ModelWindowRow>) => {
     setModelWindowRows(
       modelWindowRows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
     );
   };
+  const resolvePendingModelSlugRenames = (
+    rows: ModelWindowRow[],
+    origins: string[],
+    modelMetadata: string,
+  ) => {
+    const slugs = rows.map((row) => row.model.trim()).filter(Boolean);
+    if (new Set(slugs).size !== slugs.length) return { modelMetadata, origins };
+    const nextOrigins = rows.map((row, index) => row.model.trim() || origins[index] || "");
+    return {
+      modelMetadata: remapModelMetadataSlugs(
+        modelMetadata,
+        rows.map((row, index) => ({
+          previousSlug: origins[index] || "",
+          nextSlug: row.model,
+        })),
+      ),
+      origins: nextOrigins,
+    };
+  };
+  const commitModelSlug = (index: number) => {
+    const nextSlug = modelWindowRows[index]?.model.trim() ?? "";
+    if (!nextSlug) return;
+    const resolved = resolvePendingModelSlugRenames(
+      modelWindowRows,
+      modelSlugOriginsRef.current,
+      profile.modelMetadata,
+    );
+    modelSlugOriginsRef.current = resolved.origins;
+    if (resolved.modelMetadata !== profile.modelMetadata) commitModelMetadata(resolved.modelMetadata);
+  };
+  const closeModelMetadataImport = () => {
+    setMetadataImportTarget(null);
+    setMetadataImportDocument("");
+    setMetadataImportOriginalDocument("");
+    setMetadataImportError("");
+    setMetadataImportPreview(null);
+  };
+  const cancelModelMetadataImport = () => {
+    if (metadataImportTarget) {
+      updateModelWindowRow(metadataImportTarget.index, {
+        window: metadataImportTarget.originalWindow,
+        autoCompact: metadataImportTarget.originalAutoCompact,
+      });
+    }
+    closeModelMetadataImport();
+  };
+  const beginModelMetadataImport = (index: number, slug: string) => {
+    const existingMetadata = importedModelMetadata[slug];
+    const existingDocument = existingMetadata
+      ? serializeModelMetadataDocument(
+          slug,
+          existingMetadata,
+          modelWindowRows[index]?.window ?? "",
+          modelWindowRows[index]?.autoCompact ?? "",
+        )
+      : "";
+    const existingPreview = existingDocument ? parseModelMetadataDocument(existingDocument, slug) : null;
+    setMetadataImportTarget({
+      index,
+      slug,
+      originalWindow: modelWindowRows[index]?.window ?? "",
+      originalAutoCompact: modelWindowRows[index]?.autoCompact ?? "",
+    });
+    setMetadataImportDocument(existingDocument);
+    setMetadataImportOriginalDocument(existingDocument);
+    setMetadataImportError("");
+    setMetadataImportPreview(existingPreview?.ok ? existingPreview.value : null);
+  };
+  const applyModelMetadataImport = () => {
+    if (!metadataImportTarget || !metadataImportPreview) return;
+    commitModelMetadata(replaceModelMetadataForSlug(
+      profile.modelMetadata,
+      metadataImportPreview.slug,
+      metadataImportPreview.metadata,
+    ));
+    updateModelWindowRow(metadataImportTarget.index, {
+      window: metadataImportPreview.contextWindow ?? metadataImportTarget.originalWindow,
+      // 空值表示明确清除该模型的自动压缩覆盖，不应恢复导入前的旧值。
+      // 模型行只展示整数百分比；预览阶段的高精度值不直接写回输入框。
+      autoCompact: metadataImportPreview.autoCompactPercent ?? DEFAULT_AUTO_COMPACT_PERCENT,
+    });
+    closeModelMetadataImport();
+  };
+  const clearImportedModelMetadata = () => {
+    if (!metadataImportTarget) return;
+    commitModelMetadata(clearModelMetadataForSlug(profile.modelMetadata, metadataImportTarget.slug));
+    closeModelMetadataImport();
+  };
   const removeModelWindowRow = (index: number) => {
+    const removedSlug = modelWindowRows[index]?.model.trim() || modelSlugOriginsRef.current[index] || "";
     const nextRows = modelWindowRows.filter((_, rowIndex) => rowIndex !== index);
-    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", window: "", imageHandling: "" }]);
+    const nextOrigins = modelSlugOriginsRef.current.filter((_, rowIndex) => rowIndex !== index);
+    const resolved = resolvePendingModelSlugRenames(nextRows, nextOrigins, profile.modelMetadata);
+    modelSlugOriginsRef.current = resolved.origins;
+    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", window: "", autoCompact: "", imageHandling: "" }]);
+    const slugStillPresent = nextRows.some((row) => row.model.trim() === removedSlug)
+      || resolved.origins.includes(removedSlug);
+    const nextMetadata = removedSlug && !slugStillPresent
+      ? clearModelMetadataForSlug(resolved.modelMetadata, removedSlug)
+      : resolved.modelMetadata;
+    if (nextMetadata !== profile.modelMetadata) commitModelMetadata(nextMetadata);
+    if (metadataImportTarget?.index === index) {
+      closeModelMetadataImport();
+    } else if (metadataImportTarget && metadataImportTarget.index > index) {
+      setMetadataImportTarget({ ...metadataImportTarget, index: metadataImportTarget.index - 1 });
+    }
   };
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
-    setModelWindowRows(mergeModelWindowRows(modelWindowRows, rows));
+    const merged = mergeModelWindowRows(modelWindowRows, rows);
+    modelSlugOriginsRef.current = merged.map((row) => {
+      const currentIndex = modelWindowRows.findIndex((current) => current.model.trim() === row.model.trim());
+      return currentIndex >= 0 ? modelSlugOriginsRef.current[currentIndex] || row.model.trim() : row.model.trim();
+    });
+    setModelWindowRows(merged);
   };
+  const appendEmptyModelRow = () => {
+    modelSlugOriginsRef.current = [...modelSlugOriginsRef.current, ""];
+    setModelWindowRows([...modelWindowRows, { model: "", window: "", autoCompact: "", imageHandling: "" }]);
+  };
+  const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
   const fetchSub2ApiRate = async () => {
     const result = await actions.fetchSub2ApiBilling(deriveRelayProfileFromFiles(profile));
     if (!result) return;
@@ -8626,19 +8720,47 @@ function RelayProfileEditor({
             ]}
           />
         </Field>
-        {profile.relayMode === "official" ? (
-          <label className="switch-row compact relay-switch-row relay-field-official-usage-alert">
+        <Field className="relay-field-config-model" label={t("配置模型")}>
+          <Input
+            value={profile.model}
+            onChange={(event) => updateDraft({ model: event.currentTarget.value })}
+            placeholder={t("例如 deepseek-v4-pro")}
+          />
+          <p className="field-hint">
+            {t("默认启动 Codex 时使用的模型名，请勿带后缀；上下文窗口请在下方「模型列表」中按模型单独配置。")}
+          </p>
+        </Field>
+        <Field className="relay-field-goals" label={t("Codex 目标")}>
+          <label className="inline-check">
             <input
-              checked={profile.hideOfficialUsageAlert}
-              onChange={(event) => updateDraft({ hideOfficialUsageAlert: event.currentTarget.checked })}
+              checked={goalsFeatureState.enabled}
+              onChange={(event) =>
+                updateDraft({
+                  configContents: setCodexGoalsFeatureInConfig(profile.configContents, event.currentTarget.checked),
+                })
+              }
               type="checkbox"
             />
-            <span>
-              <strong>{t("关闭官方低额度提示")}</strong>
-              <small>{t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}</small>
-            </span>
-            <ToggleVisual />
+            <span>{t("启用目标功能")}</span>
           </label>
+          {goalsFeatureState.inherited ? (
+            <p className="field-hint">{t("当前继承公共配置；修改后将为该供应商保存独立设置。")}</p>
+          ) : null}
+        </Field>
+        {profile.relayMode === "official" ? (
+          <Field className="relay-field-official-usage-alert" label={t("官方登录")}>
+            <label className="inline-check">
+              <input
+                checked={profile.hideOfficialUsageAlert}
+                onChange={(event) => updateDraft({ hideOfficialUsageAlert: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>{t("关闭官方低额度提示")}</span>
+            </label>
+            <p className="field-hint">
+              {t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}
+            </p>
+          </Field>
         ) : null}
         {profile.relayMode === "pureApi" ? (
           <label className="switch-row compact relay-switch-row relay-field-no-auth">
@@ -8659,19 +8781,56 @@ function RelayProfileEditor({
             <ToggleVisual />
           </label>
         ) : null}
+        <div className="relay-advanced-toggle">
+          <Button
+            aria-expanded={showAdvanced}
+            onClick={() => setShowAdvanced((current) => !current)}
+            size="sm"
+            type="button"
+            variant="secondary"
+          >
+            <Settings className="h-4 w-4" />
+            {t("更多选项")}
+          </Button>
+        </div>
+        {showAdvanced ? (
+          <div className="relay-advanced-fields">
+            <Field className="relay-field-test-model" label={t("测试模型")}>
+              <Input
+                value={profile.testModel}
+                onChange={(event) => updateDraft({ testModel: event.currentTarget.value })}
+                placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
+              />
+            </Field>
+            <Field className="relay-field-context-window" label={t("上下文大小")}>
+              <Input
+                inputMode="numeric"
+                value={profile.contextWindow}
+                onChange={(event) => updateDraft({ contextWindow: event.currentTarget.value.replace(/[^\d]/g, "") })}
+                placeholder={t("留空不改写，例如 200000")}
+              />
+            </Field>
+            <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
+              <Input
+                inputMode="numeric"
+                value={profile.autoCompactLimit}
+                onChange={(event) => updateDraft({ autoCompactLimit: event.currentTarget.value.replace(/[^\d]/g, "") })}
+                placeholder={t("留空不改写，例如 160000")}
+              />
+            </Field>
+          </div>
+        ) : null}
         {profile.relayMode === "official" ? (
-          <label className="switch-row compact relay-switch-row relay-field-official-key">
-            <input
-              checked={profile.officialMixApiKey}
-              onChange={(event) => updateDraft({ officialMixApiKey: event.currentTarget.checked })}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("混入 API KEY")}</strong>
-              <small>{t("官方登录之外再挂一份 API Key，用于额度耗尽时兜底。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
+          <Field className="relay-field-official-key" label="API Key">
+            <label className="inline-check">
+              <input
+                checked={profile.officialMixApiKey}
+                onChange={(event) => updateDraft({ officialMixApiKey: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>{t("混入 API KEY")}</span>
+            </label>
+          </Field>
         ) : null}
         {showApiFields ? (
           <div className="relay-api-fields">
@@ -8730,181 +8889,279 @@ function RelayProfileEditor({
                     : t("官方登录未混入 API 时不写入会话 provider")}
               </p>
             </Field>
-          </div>
-        ) : null}
-        <DefaultModelField
-          knownModels={modelWindowRows.map((row) => row.model)}
-          onChange={(model) => updateDraft({ model })}
-          onFetchModels={async () => {
-            const serializedRows = serializeModelWindowRows(modelWindowRows);
-            return actions.fetchRelayProfileModels({
-              ...profile,
-              modelList: serializedRows.modelList,
-              modelWindows: serializedRows.modelWindows,
-            });
-          }}
-          value={profile.model}
-        />
-        {/* 模型列表始终显示：官方模式下也要能配每模型的上下文窗口（1M），
-            以前被 showApiFields 门控住了。*/}
-        <section className="relay-config-section relay-field-model-list">
-          <div className="relay-config-section-head">
-            <div>
-              <strong>{t("模型列表")}</strong>
-              <span>
-                {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
-              </span>
-            </div>
-            <div className="relay-model-list-tools">
-              <Button
-                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
-                size="sm"
-                type="button"
-                variant="secondary"
-              >
-                <Plus className="h-4 w-4" />
-                {t("添加模型")}
-              </Button>
-              <Button
-                onClick={async () => {
-                  const serializedRows = serializeModelWindowRows(modelWindowRows);
-                  const models = await actions.fetchRelayProfileModels({
-                    ...profile,
-                    modelList: serializedRows.modelList,
-                    modelWindows: serializedRows.modelWindows,
-                  });
-                  if (models?.length) {
-                    addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
-                  }
-                }}
-                size="sm"
-                type="button"
-                variant="secondary"
-              >
-                <Download className="h-4 w-4" />
-                {t("从上游获取")}
-              </Button>
-              <Button
-                disabled={!modelWindowRows.some((row) => row.model.trim())}
-                onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
-                size="sm"
-                title={t("清空模型")}
-                type="button"
-                variant="outline"
-              >
-                <Trash2 className="h-4 w-4" />
-                {t("清空模型")}
-              </Button>
-            </div>
-          </div>
-          <div className="relay-model-row-editor">
-            <div className="relay-model-row relay-model-row-head">
-              <span>{t("模型名称")}</span>
-              <span>{t("上下文窗口")}</span>
-              <span>{t("图片处理方式")}</span>
-            </div>
-            {modelWindowRows.map((row, index) => (
-              <div className="relay-model-row" key={index}>
-                <Input
-                  value={row.model}
-                  onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
-                  placeholder="deepseek/deepseek-v4-flash"
-                />
-                <Input
-                  value={row.window}
-                  onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
-                  placeholder="1M"
-                />
-                <AppSelect
-                  className="text-xs"
-                  value={row.imageHandling}
-                  disabled={vlmUnsupportedProtocol}
-                  onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
-                  options={[
-                    { value: "", label: t("纯文本模型请配置此项"), disabled: true },
-                    { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
-                    { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
-                    { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
-                  ]}
-                  title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
-                />
+            {!profile.noAuth ? <Field className="relay-field-sub2api" label="Sub2API">
+              <div className="sub2api-field">
+                <label className="inline-check">
+                  <input
+                    checked={profile.sub2apiEnabled}
+                    onChange={(event) => {
+                      const checked = event.currentTarget.checked;
+                      updateDraft({
+                        sub2apiEnabled: checked,
+                        sub2apiMultiplier: checked ? profile.sub2apiMultiplier || "" : "",
+                      });
+                      if (checked && sub2apiBaseUrl && profile.apiKey.trim()) {
+                        void fetchSub2ApiRate();
+                      }
+                    }}
+                    type="checkbox"
+                  />
+                  <span>{t("尝试从sub2api获取倍率显示")}</span>
+                </label>
                 <Button
-                  aria-label={t("删除模型")}
-                  onClick={() => removeModelWindowRow(index)}
-                  size="icon"
-                  title={t("删除模型")}
+                  disabled={!canFetchSub2ApiRate}
+                  onClick={() => void fetchSub2ApiRate()}
+                  size="sm"
                   type="button"
-                  variant="ghost"
+                  variant="secondary"
                 >
-                  <Trash2 className="h-4 w-4" />
+                  <Download className="h-4 w-4" />
+                  {t("获取倍率")}
                 </Button>
               </div>
-            ))}
-          </div>
-        </section>
-        <label className="switch-row compact relay-switch-row relay-field-goals">
-          <input
-            checked={goalsFeatureState.enabled}
-            onChange={(event) =>
-              updateDraft({
-                configContents: setCodexGoalsFeatureInConfig(profile.configContents, event.currentTarget.checked),
-              })
-            }
-            type="checkbox"
-          />
-          <span>
-            <strong>{t("启用目标功能")}</strong>
-            <small>
-              {goalsFeatureState.inherited
-                ? t("当前继承公共配置；修改后将为该供应商保存独立设置。")
-                : t("为该供应商单独开启 Codex 目标功能。")}
-            </small>
-          </span>
-          <ToggleVisual />
-        </label>
-        {/* 开关旁边还挂着一个按钮，所以整行用 div：button 套在 label 里点了会误触开关 */}
-        {showApiFields && !profile.noAuth ? (
-          <div className="relay-switch-row relay-field-sub2api">
-            <div className="relay-switch-copy">
-              <strong>{t("尝试从sub2api获取倍率显示")}</strong>
-              <small>
+              <p className="field-hint">
                 {profile.sub2apiEnabled
                   ? profile.sub2apiMultiplier.trim()
                     ? tf("当前缓存倍率：{0}x", [profile.sub2apiMultiplier.trim()])
                     : t("保存前可先尝试从 /v1/sub2api/billing 获取上游倍率。")
                   : t("非 Sub2API 供应商不会请求或显示倍率。")}
-              </small>
-            </div>
-            <div className="relay-switch-actions">
-              <Button
-                disabled={!canFetchSub2ApiRate}
-                onClick={() => void fetchSub2ApiRate()}
-                size="sm"
-                type="button"
-                variant="outline"
-              >
-                <Download className="h-4 w-4" />
-                {t("获取倍率")}
-              </Button>
-              <label className="relay-bare-switch" title={t("尝试从sub2api获取倍率显示")}>
-                <input
-                  checked={profile.sub2apiEnabled}
-                  onChange={(event) => {
-                    const checked = event.currentTarget.checked;
-                    updateDraft({
-                      sub2apiEnabled: checked,
-                      sub2apiMultiplier: checked ? profile.sub2apiMultiplier || "" : "",
+              </p>
+            </Field> : null}
+          </div>
+        ) : null}
+        {showApiFields ? (
+          <section className="relay-config-section relay-field-model-list">
+            <div className="relay-config-section-head">
+              <div>
+                <strong>{t("模型列表")}</strong>
+                <span>
+                  {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
+                </span>
+              </div>
+              <div className="relay-model-list-tools">
+                <Button
+                  onClick={appendEmptyModelRow}
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t("添加模型")}
+                </Button>
+                <Button
+                  onClick={async () => {
+                    const serializedRows = serializeModelWindowRows(modelWindowRows);
+                    const models = await actions.fetchRelayProfileModels({
+                      ...profile,
+                      modelList: serializedRows.modelList,
+                      modelWindows: serializedRows.modelWindows,
+                      modelAutoCompact: serializedRows.modelAutoCompact,
                     });
-                    if (checked && sub2apiBaseUrl && profile.apiKey.trim()) {
-                      void fetchSub2ApiRate();
+                    if (models?.length) {
+                      addModelWindowRows(models.map((model) => ({ model, window: "", autoCompact: "", imageHandling: "" })));
                     }
                   }}
-                  type="checkbox"
-                />
-                <ToggleVisual />
-              </label>
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  <Download className="h-4 w-4" />
+                  {t("从上游获取")}
+                </Button>
+                <Button
+                  disabled={!modelWindowRows.some((row) => row.model.trim())}
+                  onClick={() => setModelWindowRows([{ model: "", window: "", autoCompact: "", imageHandling: "send-as-is" }])}
+                  size="sm"
+                  title={t("清空模型")}
+                  type="button"
+                  variant="outline"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  {t("清空模型")}
+                </Button>
+              </div>
             </div>
-          </div>
+            <div className="relay-model-row-editor">
+              <div className="relay-model-row relay-model-row-head">
+                <span>{t("模型名称")}</span>
+                <span>{t("上下文窗口")}</span>
+                <span>{t("自动压缩")}</span>
+                <span>{t("图片处理方式")}</span>
+                <span>{t("模型配置")}</span>
+                <span aria-hidden="true" />
+              </div>
+              {modelWindowRows.map((row, index) => {
+                const slug = row.model.trim();
+                const importing = metadataImportTarget?.index === index && metadataImportTarget.slug === slug;
+                const imported = Boolean(importedModelMetadata[slug]);
+                return (
+                  <div className="relay-model-entry" key={index}>
+                    <div className="relay-model-row">
+                      <Input
+                        value={row.model}
+                        onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
+                        onBlur={() => commitModelSlug(index)}
+                        placeholder="deepseek/deepseek-v4-flash"
+                      />
+                      <Input
+                        value={row.window}
+                        onChange={(event) => {
+                          const window = event.currentTarget.value;
+                          updateModelWindowRow(index, { window });
+                          // 导入面板尚未粘贴 JSON 时，只编辑模型行；不要把空文档同步失败显示成错误。
+                          if (!importing || !metadataImportDocument.trim() || !metadataImportPreview) return;
+                          const synchronized = synchronizeModelMetadataDocumentLimitsPreview(
+                            metadataImportDocument,
+                            slug,
+                            window,
+                            metadataImportPreview?.autoCompactCalculationPercent
+                              ?? metadataImportPreview?.autoCompactPercent
+                              ?? row.autoCompact,
+                          );
+                          if (!synchronized) {
+                            setMetadataImportPreview(null);
+                            setMetadataImportError(t("上下文窗口与自动压缩值无效，无法同步模型配置。"));
+                            return;
+                          }
+                          setMetadataImportDocument(synchronized.document);
+                          setMetadataImportPreview(synchronized.preview);
+                          setMetadataImportError("");
+                        }}
+                        placeholder="1M"
+                      />
+                      <Input
+                        value={row.autoCompact}
+                        onChange={(event) => {
+                          const autoCompact = normalizeAutoCompactEditing(
+                            event.currentTarget.value,
+                            row.autoCompact,
+                          );
+                          updateModelWindowRow(index, { autoCompact });
+                          // 导入面板尚未粘贴 JSON 时，只编辑模型行；不要把空文档同步失败显示成错误。
+                          if (!importing || !metadataImportDocument.trim() || !metadataImportPreview) return;
+                          const synchronized = synchronizeModelMetadataDocumentLimitsPreview(
+                            metadataImportDocument,
+                            slug,
+                            row.window,
+                            autoCompact,
+                          );
+                          if (!synchronized) {
+                            setMetadataImportPreview(null);
+                            setMetadataImportError(t("上下文窗口与自动压缩值无效，无法同步模型配置。"));
+                            return;
+                          }
+                          setMetadataImportDocument(synchronized.document);
+                          setMetadataImportPreview(synchronized.preview);
+                          setMetadataImportError("");
+                        }}
+                        onBlur={(event) => {
+                          const normalized = normalizeAutoCompactPercent(event.currentTarget.value);
+                          const effective = normalized || DEFAULT_AUTO_COMPACT_PERCENT;
+                          if (effective !== row.autoCompact) updateModelWindowRow(index, { autoCompact: effective });
+                        }}
+                        placeholder="90%"
+                      />
+                      <AppSelect
+                        className="text-xs"
+                        value={row.imageHandling}
+                        disabled={vlmUnsupportedProtocol}
+                        onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
+                        options={[
+                          { value: "", label: t("纯文本模型请配置此项"), disabled: true },
+                          { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
+                          { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
+                          { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
+                        ]}
+                        title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
+                      />
+                      <Button
+                        className="relay-model-import-button"
+                        aria-expanded={importing}
+                        disabled={!slug}
+                        onClick={() => (importing ? cancelModelMetadataImport() : beginModelMetadataImport(index, slug))}
+                        size="icon"
+                        title={imported ? t("查看或重新导入 models.json") : t("导入 models.json")}
+                        type="button"
+                        variant={importing || imported ? "secondary" : "ghost"}
+                      >
+                        <FileCode2 className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        aria-label={t("删除模型")}
+                        onClick={() => removeModelWindowRow(index)}
+                        size="icon"
+                        title={t("删除模型")}
+                        type="button"
+                        variant="ghost"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    {importing ? (
+                      <section className="relay-model-import-workbench">
+                        <Textarea
+                          autoFocus
+                          value={metadataImportDocument}
+                          onChange={(event) => {
+                            const document = event.currentTarget.value;
+                            setMetadataImportDocument(document);
+                            setMetadataImportError("");
+                            const parsed = parseModelMetadataDocument(document, slug);
+                            if (!parsed.ok) {
+                              setMetadataImportPreview(null);
+                              setMetadataImportError(t(parsed.error));
+                              return;
+                            }
+                            setMetadataImportPreview(parsed.value);
+                          }}
+                          placeholder={t("需要补充供应商模型信息时填写；不填则使用 Codex++ 默认配置（自动压缩 90%、图片原样发送）。从供应商的 models.json 或 model.json 复制，支持多个模型。")}
+                          rows={7}
+                        />
+                        {metadataImportError ? <div className="relay-model-metadata-import-error" role="alert">{metadataImportError}</div> : null}
+                        {metadataImportPreview?.ignoredFields.length ? (
+                          <div className="relay-model-metadata-import-warning" role="status">
+                            {tf("以下字段由 Codex++ 计算或维护，导入不会覆盖：{0}", [metadataImportPreview.ignoredFields.join(", ")])}
+                          </div>
+                        ) : null}
+                        <div className="relay-model-metadata-import-actions">
+                          <div className="relay-model-import-copy">
+                            <strong>{slug}</strong>
+                          </div>
+                          <div className="relay-model-metadata-import-flow">
+                            <Button onClick={cancelModelMetadataImport} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+                            {imported ? (
+                              <Button
+                                className="relay-model-metadata-reset"
+                                onClick={clearImportedModelMetadata}
+                                size="sm"
+                                title={t("清除已导入的模型字段，保留上下文窗口")}
+                                type="button"
+                                variant="ghost"
+                              >
+                                <RotateCcw className="h-4 w-4" />
+                                {t("清除导入配置")}
+                              </Button>
+                            ) : null}
+                            <Button disabled={!metadataImportPreview} onClick={applyModelMetadataImport} size="sm" type="button">
+                              {t(
+                                metadataImportDocument.trim() === metadataImportOriginalDocument.trim()
+                                  ? "保存此模型"
+                                  : "更新此模型配置",
+                              )}
+                            </Button>
+                          </div>
+                        </div>
+                      </section>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+            {modelRowsError ? <div className="relay-model-metadata-import-error" role="alert">{modelRowsError}</div> : null}
+            <p className="field-hint">
+              {t("自动压缩留空时沿用 Codex 默认行为；填写百分比后会按该模型的上下文窗口重新计算阈值。")}
+            </p>
+          </section>
         ) : null}
         {showApiFields ? (
           <section className="relay-config-section relay-field-model-routes">
@@ -9003,6 +9260,17 @@ function RelayProfileEditor({
             {modelWindowRows.some((row) => row.imageHandling === "vlm") && (!profile.vlmApiKey || !profile.vlmModel || !profile.vlmBaseUrl) ? (
               <p className="field-hint warn">{t("VLM 配置不完整：API Key、Model 和 Base URL 为必填项，否则 VLM 不会生效。")}</p>
             ) : null}
+            <div className="vlm-test-entry">
+              <Button
+                onClick={() => setVlmTestOpen((v) => !v)}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                {vlmTestOpen ? t("收起测试面板") : t("测试 VLM")}
+              </Button>
+            </div>
+            {vlmTestOpen ? <VlmTestPanel profile={profile} onClose={() => setVlmTestOpen(false)} /> : null}
           </div>
         ) : null}
         {showApiFields ? (
@@ -9014,82 +9282,6 @@ function RelayProfileEditor({
             />
           </Field>
         ) : null}
-        {/* 收起时整个盒子就是这个 button（提示文案也在里面），所以点哪儿都能展开；
-            展开后 button 只剩标题行，下面的输入框才不会被裹进按钮里。 */}
-        <div className="relay-advanced-block">
-          <button
-            aria-expanded={showAdvanced}
-            className="relay-advanced-trigger"
-            onClick={() => setShowAdvanced((current) => !current)}
-            type="button"
-          >
-            <span className="relay-advanced-trigger-head">
-              <ChevronDown className={`relay-advanced-chevron h-4 w-4${showAdvanced ? " is-open" : ""}`} />
-              <Settings className="h-4 w-4" />
-              {t("更多选项")}
-            </span>
-            {showAdvanced ? null : (
-              <span className="relay-advanced-hint">{t("包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。")}</span>
-            )}
-          </button>
-          {showAdvanced ? (
-            <div className="relay-advanced-fields">
-              <Field className="relay-field-test-model" label={t("测试模型")}>
-                <Input
-                  value={profile.testModel}
-                  onChange={(event) => updateDraft({ testModel: event.currentTarget.value })}
-                  placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
-                />
-              </Field>
-              <Field className="relay-field-context-window" label={t("上下文大小")}>
-                <Input
-                  inputMode="numeric"
-                  value={profile.contextWindow}
-                  onChange={(event) => updateDraft({ contextWindow: event.currentTarget.value.replace(/[^\d]/g, "") })}
-                  placeholder={t("留空不改写，例如 200000")}
-                />
-              </Field>
-              <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
-                <Input
-                  inputMode="numeric"
-                  value={profile.autoCompactLimit}
-                  onChange={(event) => updateDraft({ autoCompactLimit: event.currentTarget.value.replace(/[^\d]/g, "") })}
-                  placeholder={t("留空不改写，例如 160000")}
-                />
-              </Field>
-            </div>
-          ) : null}
-        </div>
-        {/* 整行是 label，点盒子任意处都能切开关；里面的「编辑通用配置」按钮自己
-            preventDefault，否则会连带触发 label 的开关。ToggleVisual 必须是
-            input 的直接同级，:checked ~ 才选得到。 */}
-        <label className="switch-row compact relay-switch-row relay-field-common-config">
-          <input
-            checked={useCommonConfig}
-            onChange={(event) => updateDraft({ useCommonConfig: event.currentTarget.checked })}
-            type="checkbox"
-          />
-          <span className="relay-switch-copy">
-            <strong>{t("应用通用配置")}</strong>
-            <small>
-              {useCommonConfig
-                ? t("切换到此供应商时，会把通用配置合并进 config.toml。")
-                : t("此供应商只写入自己的 config.toml，不合并通用配置。")}
-            </small>
-          </span>
-          <button
-            className="relay-link-button"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              onEditCommonConfig();
-            }}
-            type="button"
-          >
-            {t("编辑通用配置")}
-          </button>
-          <ToggleVisual />
-        </label>
       </div>
       {showApiFields && profile.protocol === "chatCompletions" ? (
         <div className="hint-line relay-protocol-hint">
@@ -9101,6 +9293,207 @@ function RelayProfileEditor({
         <ShieldCheck className="h-4 w-4" />
         <span>{relayProfileModeHelp(profile)}</span>
       </div>
+    </div>
+  );
+}
+
+type VlmTestState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "done"; result: TestVlmResult };
+
+type TestVlmResult = {
+  status: string;
+  message: string;
+  vlmStatus: string;
+  httpCode: number | null;
+  durationMs: number;
+  error: string | null;
+  description: string | null;
+  model: string;
+  rawRequest: string | null;
+  rawResponse: string | null;
+};
+
+const VLM_TEST_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/// 方向 C：选图即测 + 排障增强（spec §4）。
+/// 选完文件自动开跑；失败时给通俗诊断 + 复制错误 + 原始请求/响应折叠。
+function VlmTestPanel({
+  profile,
+  onClose,
+}: {
+  profile: Pick<RelayProfile, "vlmApiKey" | "vlmModel" | "vlmBaseUrl">;
+  onClose: () => void;
+}) {
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [state, setState] = useState<VlmTestState>({ kind: "idle" });
+  const [showRaw, setShowRaw] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const tr = (zh: string, params?: string[]) => (params ? tf(zh, params) : t(zh));
+
+  const runTest = async (url: string) => {
+    setState({ kind: "running" });
+    setLocalError(null);
+    try {
+      const res = await invoke<TestVlmResult>("test_vlm", {
+        request: {
+          apiKey: profile.vlmApiKey,
+          model: profile.vlmModel,
+          baseUrl: profile.vlmBaseUrl,
+          imageDataUrl: url,
+        },
+      });
+      setState({ kind: "done", result: res });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setState({
+        kind: "done",
+        result: {
+          status: "failed",
+          message: msg,
+          vlmStatus: "client_error",
+          httpCode: null,
+          durationMs: 0,
+          error: msg,
+          description: null,
+          model: profile.vlmModel,
+          rawRequest: null,
+          rawResponse: null,
+        },
+      });
+    }
+  };
+
+  // 选图即测：选完文件自动发起，无需二次点击（spec §4）。
+  const onFile = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setLocalError(t("请选择图片文件。"));
+      return;
+    }
+    if (file.size > VLM_TEST_MAX_IMAGE_BYTES) {
+      setLocalError(t("图片超过 10MB，请换一张较小的图片。"));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => setLocalError(t("读取图片失败，请重新选择"));
+    reader.onload = () => {
+      const url = typeof reader.result === "string" ? reader.result : null;
+      if (url) {
+        setDataUrl(url);
+        void runTest(url);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // 复制完整排障信息（诊断 + 原始报文，无 API Key），可直接贴 issue（spec §3）。
+  const copyError = async () => {
+    if (state.kind !== "done") return;
+    const r = state.result;
+    const text = [
+      vlmTestTranslation(r.vlmStatus, r.httpCode ?? undefined, r.durationMs, tr),
+      `model: ${r.model}`,
+      r.httpCode != null ? `HTTP ${r.httpCode}` : null,
+      r.error ? `error: ${r.error}` : null,
+      r.rawRequest ? `--- request ---\n${r.rawRequest}` : null,
+      r.rawResponse ? `--- response ---\n${r.rawResponse}` : null,
+    ]
+      .filter((x) => x !== null)
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setLocalError(t("复制失败，请从报文中手动复制。"));
+    }
+  };
+
+  const done = state.kind === "done" ? state.result : null;
+  const running = state.kind === "running";
+  const formReady = !!profile.vlmApiKey && !!profile.vlmModel && !!profile.vlmBaseUrl;
+  const canRun = !!dataUrl && formReady;
+
+  return (
+    <div className="vlm-test-panel">
+      <div className="modal-head">
+        <div>
+          <h2>{t("测试 VLM")}</h2>
+          <p className="modal-message">
+            {t("选一张图片立即验证当前 VLM 配置（使用表单当前值，无需保存）。")}
+          </p>
+        </div>
+        <button className="toast-close" aria-label={t("关闭窗口")} onClick={onClose} type="button">×</button>
+      </div>
+
+      <div className="vlm-test-upload">
+        <input
+          ref={fileInputRef}
+          accept="image/*"
+          onChange={(e) => {
+            onFile(e.currentTarget.files?.[0]);
+            e.currentTarget.value = "";
+          }}
+          type="file"
+          style={{ display: "none" }}
+        />
+        <Button disabled={running || !formReady} onClick={() => fileInputRef.current?.click()} size="sm" type="button" variant="secondary">
+          {dataUrl ? t("换图并测试") : t("选择图片并测试")}
+        </Button>
+        {dataUrl ? <img alt={t("图片预览")} className="vlm-test-preview" src={dataUrl} /> : null}
+        {running ? (
+          <p className="vlm-test-running">
+            <span className="vlm-test-spinner" aria-hidden="true" />
+            {t("正在调用 VLM…")}
+          </p>
+        ) : null}
+      </div>
+
+      {localError ? <p className="field-hint warn">{localError}</p> : null}
+
+      {done ? (
+        <div className="vlm-test-result">
+          <p className="vlm-test-summary" role="status">
+            {vlmTestTranslation(done.vlmStatus, done.httpCode ?? undefined, done.durationMs, tr)}
+          </p>
+          {done.description ? (
+            <pre className="vlm-test-description">{done.description}</pre>
+          ) : null}
+          {done.vlmStatus !== "ok" ? (
+            <button className="vlm-test-detail-toggle" onClick={() => void copyError()} type="button">
+              {t("复制错误")}
+            </button>
+          ) : null}
+          <button
+            className="vlm-test-detail-toggle"
+            aria-expanded={showRaw}
+            onClick={() => setShowRaw((v) => !v)}
+            type="button"
+          >
+            {showRaw ? t("隐藏原始报文") : t("显示原始报文")}
+          </button>
+          {showRaw ? (
+            <div className="vlm-test-raw">
+              <div className="label">{t("原始请求")}</div>
+              <pre className="vlm-test-description">{done.rawRequest ?? "-"}</pre>
+              <div className="label">{t("原始响应")}</div>
+              <pre className="vlm-test-description">{done.rawResponse ?? "-"}</pre>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <Toolbar>
+        {dataUrl ? (
+          <Button disabled={!canRun || running} onClick={() => dataUrl && void runTest(dataUrl)} type="button">
+            {t("重测")}
+          </Button>
+        ) : null}
+        <Button onClick={onClose} type="button" variant="secondary">
+          {t("收起")}
+        </Button>
+      </Toolbar>
     </div>
   );
 }
@@ -9323,14 +9716,7 @@ function RelayContextManager({
               {t("导入 JSON")}
             </Button>
           ) : null}
-          <Button
-            onClick={() => {
-              setImportOpen(false);
-              setEditor({ kind: activeKind });
-            }}
-            size="sm"
-            variant="secondary"
-          >
+          <Button onClick={() => setEditor({ kind: activeKind })} size="sm" variant="secondary">
             <Plus className="h-4 w-4" />
             {t("新增")}{label}
           </Button>
@@ -9371,15 +9757,7 @@ function RelayContextManager({
                     <span className="context-switch-thumb" />
                   </span>
                 </button>
-                <Button
-                  onClick={() => {
-                    setImportOpen(false);
-                    setEditor({ kind: entry.kind, entry });
-                  }}
-                  size="icon"
-                  title={t("编辑扩展项")}
-                  variant="ghost"
-                >
+                <Button onClick={() => setEditor({ kind: entry.kind, entry })} size="icon" title={t("编辑扩展项")} variant="ghost">
                   <Edit3 className="h-4 w-4" />
                 </Button>
                 <Button
@@ -9403,7 +9781,6 @@ function RelayContextManager({
       ) : null}
       {editor ? (
         <ContextEntryEditor
-          actions={actions}
           entry={editor.entry}
           kind={editor.kind}
           onCancel={() => setEditor(null)}
@@ -9414,13 +9791,6 @@ function RelayContextManager({
   );
 }
 
-/**
- * MCP JSON 导入。
- *
- * 社区文档里的 MCP 配置基本都是 Claude 风格的 `{"mcpServers":{…}}`，手工翻译成
- * TOML 容易出错——尤其 headers 在 codex 里叫 http_headers，写错了不报错但认证
- * 失效。这里先预览再写入，字段改写都列出来给用户看。
- */
 function McpJsonImporter({
   actions,
   onCancel,
@@ -9444,156 +9814,59 @@ function McpJsonImporter({
         <div className="modal-head">
           <div>
             <h2>{t("导入 MCP JSON")}</h2>
-            <p className="modal-message">
-              {t("支持 mcpServers / servers 包裹，也支持直接粘贴单个服务器配置。")}
-            </p>
+            <p className="modal-message">{t("支持 mcpServers / servers 包裹，也支持直接粘贴单个服务器配置。")}</p>
           </div>
           <button aria-label={t("关闭窗口")} className="toast-close" onClick={onCancel} type="button">×</button>
         </div>
-      <Field label={t("MCP 配置 JSON")}>
-        <Textarea
-          className="context-editor-textarea"
-          value={json}
-          onChange={(event) => {
-            setJson(event.currentTarget.value);
-            // 内容变了，旧预览就作废，免得用户对着过期结果点导入
-            setPreview(null);
-          }}
-          placeholder={'{\n  "mcpServers": {\n    "context7": {\n      "command": "npx",\n      "args": ["-y", "@upstash/context7-mcp"]\n    }\n  }\n}'}
-          spellCheck={false}
-        />
-      </Field>
-      {preview ? (
-        <div className="relay-context-summary">
-          <div>{tf("将导入 {0} 个：{1}", [preview.entries.length, preview.entries.map((item) => item.id).join("、")])}</div>
-          {preview.warnings.map((warning) => (
-            <div key={warning}>⚠ {warning}</div>
-          ))}
-        </div>
-      ) : null}
-      <Toolbar>
-        <Button disabled={!json.trim()} onClick={() => void runPreview()} size="sm" variant="secondary">
-          {t("预览")}
-        </Button>
-        <Button disabled={!preview} onClick={() => onImport(json)} size="sm">
-          <Download className="h-4 w-4" />
-          {t("确认导入")}
-        </Button>
-        <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
-      </Toolbar>
+        <Field label={t("MCP 配置 JSON")}>
+          <Textarea
+            className="context-editor-textarea"
+            value={json}
+            onChange={(event) => {
+              setJson(event.currentTarget.value);
+              setPreview(null);
+            }}
+            placeholder={'{\n  "mcpServers": {\n    "context7": {\n      "command": "npx",\n      "args": ["-y", "@upstash/context7-mcp"]\n    }\n  }\n}'}
+            spellCheck={false}
+          />
+        </Field>
+        {preview ? (
+          <div className="relay-context-summary">
+            <div>{tf("将导入 {0} 个：{1}", [preview.entries.length, preview.entries.map((item) => item.id).join("、")])}</div>
+            {preview.warnings.map((warning) => <div key={warning}>{warning}</div>)}
+          </div>
+        ) : null}
+        <Toolbar>
+          <Button disabled={!json.trim()} onClick={() => void runPreview()} size="sm" variant="secondary">{t("预览")}</Button>
+          <Button disabled={!preview} onClick={() => onImport(json)} size="sm">
+            <Download className="h-4 w-4" />
+            {t("确认导入")}
+          </Button>
+          <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
+        </Toolbar>
       </div>
     </div>
   );
 }
 
-/**
- * MCP / 插件条目编辑器。
- *
- * MCP 走结构化表单：codex 的字段名有坑（headers 其实叫 http_headers，type 根本
- * 不读），让用户手写 TOML 很容易踩。表单不认识的高级键（oauth、scopes 等）由
- * Rust 侧收进 extraToml 原样带着，不会因为在表单里点一下就丢掉。
- *
- * 插件仍是裸 TOML：[plugins."x@y"] 实际只有 enabled 一个键，没必要做表单。
- */
 function ContextEntryEditor({
   kind,
   entry,
   onCancel,
   onSave,
-  actions,
 }: {
   kind: ContextKind;
   entry?: CodexContextEntry;
   onCancel: () => void;
   onSave: (kind: ContextKind, id: string, tomlBody: string) => void;
-  actions: Actions;
 }) {
   const [draftKind, setDraftKind] = useState<ContextKind>(entry?.kind ?? kind);
   const [id, setId] = useState(entry?.id ?? "");
   const [tomlBody, setTomlBody] = useState(entry?.tomlBody ?? "");
-  const [form, setForm] = useState<McpServerForm>(emptyMcpForm());
-  const [rawMode, setRawMode] = useState(false);
-  const [formReady, setFormReady] = useState(false);
   const canSave = id.trim().length > 0;
-  const useForm = draftKind === "mcp";
-
-  // 打开已有 MCP 条目时把 TOML 拆进表单。解析失败（手写坏了）就退回裸 TOML，
-  // 总比把用户的内容丢掉强。
-  useEffect(() => {
-    let cancelled = false;
-    const initial = entry?.tomlBody ?? "";
-    if (!useForm || !initial.trim()) {
-      setFormReady(true);
-      return;
-    }
-    setFormReady(false);
-    void actions.parseMcpEntry(initial).then((parsed) => {
-      if (cancelled) return;
-      if (parsed) setForm(parsed);
-      else setRawMode(true);
-      setFormReady(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [entry, useForm, actions]);
-
-  const updateForm = (patch: Partial<McpServerForm>) => setForm((current) => ({ ...current, ...patch }));
-
-  // 选中预设就把 id 和配置一起填好；用户随后仍可自由改。已有条目不给选，
-  // 免得一次误触把手写的配置盖掉。
-  const applyPreset = async (presetId: string) => {
-    const preset = mcpPresetById(presetId);
-    if (!preset) return;
-    const body = preset.tomlBody({ windows: isWindowsPlatform });
-    setId(preset.id);
-    setTomlBody(body);
-    const parsed = await actions.parseMcpEntry(body);
-    if (parsed) setForm(parsed);
-  };
-
-  // 展开高级区：表单 → TOML；收起：TOML → 表单。以当前所处模式为准保存。
-  const toggleRawMode = async () => {
-    if (!rawMode) {
-      const built = await actions.buildMcpEntry(form);
-      if (built === null) return;
-      setTomlBody(built);
-      setRawMode(true);
-      return;
-    }
-    const parsed = await actions.parseMcpEntry(tomlBody);
-    if (!parsed) return;
-    setForm(parsed);
-    setRawMode(false);
-  };
-
-  const save = async () => {
-    if (!useForm || rawMode) {
-      onSave(draftKind, id.trim(), tomlBody);
-      return;
-    }
-    const built = await actions.buildMcpEntry(form);
-    if (built === null) return;
-    onSave(draftKind, id.trim(), built);
-  };
-
-  const title = entry ? t("编辑扩展项") : tf("新增{0}", [contextKindLabel(draftKind)]);
 
   return (
-    <div aria-modal="true" className="modal-backdrop" role="dialog">
-      <div className="modal-card context-modal">
-        <div className="modal-head">
-          <div>
-            <h2>{title}</h2>
-            <p className="modal-message">
-              {useForm
-                ? t("按字段填写即可；表单没覆盖的高级配置会原样保留。")
-                : t("只填写表头下面的内容。")}
-            </p>
-          </div>
-          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onCancel} type="button">×</button>
-        </div>
-      <div className="context-editor">
+    <div className="context-editor">
       <div className="context-editor-fields">
         <Field label={t("类型")}>
           <AppSelect
@@ -9603,18 +9876,6 @@ function ContextEntryEditor({
             options={contextKindOptions.map((option) => ({ value: option.kind, label: option.label }))}
           />
         </Field>
-        {!entry && useForm ? (
-          <Field label={t("从预设填充")}>
-            <AppSelect
-              value=""
-              onChange={(value) => void applyPreset(value)}
-              options={[
-                { value: "", label: t("不使用预设") },
-                ...MCP_PRESETS.map((preset) => ({ value: preset.id, label: preset.name })),
-              ]}
-            />
-          </Field>
-        ) : null}
         <Field label="ID">
           <Input
             disabled={!!entry}
@@ -9624,259 +9885,34 @@ function ContextEntryEditor({
           />
         </Field>
       </div>
-      {!entry && useForm && mcpPresetById(id) ? (
-        <div className="relay-context-summary">{mcpPresetById(id)?.description}</div>
-      ) : null}
-
-      {useForm && !rawMode && formReady ? (
-        <McpServerFormFields form={form} onChange={updateForm} />
-      ) : null}
-
-      {useForm ? (
-        <button className="context-advanced-toggle" onClick={() => void toggleRawMode()} type="button">
-          {rawMode ? "▾" : "▸"} {t("高级：直接编辑 TOML")}
-        </button>
-      ) : null}
-
-      {!useForm || rawMode ? (
-        <Field label={t("TOML 配置体")}>
-          <Textarea
-            className="context-editor-textarea"
-            value={tomlBody}
-            onChange={(event) => setTomlBody(event.currentTarget.value)}
-            placeholder={t("只填写表头下面的内容，例如：\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]")}
-            spellCheck={false}
-          />
-        </Field>
-      ) : null}
-
+      <Field label={t("TOML 配置体")}>
+        <Textarea
+          className="context-editor-textarea"
+          value={tomlBody}
+          onChange={(event) => setTomlBody(event.currentTarget.value)}
+          placeholder={t("只填写表头下面的内容，例如：\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]")}
+          spellCheck={false}
+        />
+      </Field>
       <Toolbar>
-        <Button disabled={!canSave} onClick={() => void save()} size="sm">
+        <Button disabled={!canSave} onClick={() => onSave(draftKind, id.trim(), tomlBody)} size="sm">
           <Save className="h-4 w-4" />
           {t("保存扩展项")}
         </Button>
         <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
       </Toolbar>
-      </div>
-      </div>
     </div>
   );
 }
 
-/** stdio 和 HTTP 两套字段，按传输方式切换显示。 */
-function McpServerFormFields({
-  form,
-  onChange,
-}: {
-  form: McpServerForm;
-  onChange: (patch: Partial<McpServerForm>) => void;
-}) {
-  return (
-    <>
-      <Field label={t("传输方式")}>
-        <div className="script-market-view-toggle" role="group" aria-label={t("传输方式")}>
-          {([
-            { value: "stdio" as const, label: t("本地命令 (stdio)") },
-            { value: "http" as const, label: t("远程 HTTP") },
-          ]).map((option) => (
-            <Button
-              aria-pressed={form.transport === option.value}
-              key={option.value}
-              onClick={() => onChange({ transport: option.value })}
-              size="sm"
-              variant={form.transport === option.value ? "secondary" : "ghost"}
-            >
-              {option.label}
-            </Button>
-          ))}
-        </div>
-      </Field>
-
-      {form.transport === "stdio" ? (
-        <>
-          <Field label={t("命令")}>
-            <Input
-              value={form.command}
-              onChange={(event) => onChange({ command: event.currentTarget.value })}
-              placeholder={isWindowsPlatform ? "cmd" : "npx"}
-            />
-          </Field>
-          <McpStringListField
-            label={t("参数")}
-            values={form.args}
-            onChange={(args) => onChange({ args })}
-            addLabel={t("添加参数")}
-            placeholder={t("例如 -y")}
-          />
-          <McpPairListField
-            label={t("环境变量")}
-            pairs={form.env}
-            onChange={(env) => onChange({ env })}
-            addLabel={t("添加环境变量")}
-          />
-          <Field label={t("工作目录")}>
-            <Input
-              value={form.cwd}
-              onChange={(event) => onChange({ cwd: event.currentTarget.value })}
-              placeholder={t("留空则用默认目录")}
-            />
-          </Field>
-        </>
-      ) : (
-        <>
-          <Field label="URL">
-            <Input
-              value={form.url}
-              onChange={(event) => onChange({ url: event.currentTarget.value })}
-              placeholder="https://example.com/mcp"
-            />
-          </Field>
-          <McpPairListField
-            label={t("请求头")}
-            pairs={form.httpHeaders}
-            onChange={(httpHeaders) => onChange({ httpHeaders })}
-            addLabel={t("添加请求头")}
-          />
-          <Field label={t("Bearer Token")}>
-            <Input
-              value={form.bearerToken}
-              onChange={(event) => onChange({ bearerToken: event.currentTarget.value })}
-              placeholder={t("留空则不写入")}
-            />
-          </Field>
-        </>
-      )}
-
-      <Field label={t("启动超时（秒）")}>
-        <Input
-          value={form.startupTimeoutSec}
-          onChange={(event) => onChange({ startupTimeoutSec: event.currentTarget.value })}
-          placeholder={t("留空则用 codex 默认值")}
-        />
-      </Field>
-      {form.extraToml.trim() ? (
-        <div className="relay-context-summary">
-          {t("此条目还有表单未覆盖的高级配置，保存时会原样保留。展开下方高级区可查看。")}
-        </div>
-      ) : null}
-    </>
-  );
-}
-
-function McpStringListField({
-  label,
-  values,
-  onChange,
-  addLabel,
-  placeholder,
-}: {
-  label: string;
-  values: string[];
-  onChange: (values: string[]) => void;
-  addLabel: string;
-  placeholder?: string;
-}) {
-  return (
-    <Field label={label}>
-      <div className="mcp-list-field">
-        {values.map((value, index) => (
-          <div className="mcp-list-row" key={index}>
-            <Input
-              value={value}
-              onChange={(event) => {
-                const next = [...values];
-                next[index] = event.currentTarget.value;
-                onChange(next);
-              }}
-              placeholder={placeholder}
-            />
-            <Button
-              onClick={() => onChange(values.filter((_, position) => position !== index))}
-              size="icon"
-              title={t("删除这一项")}
-              variant="ghost"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          </div>
-        ))}
-        <Button onClick={() => onChange([...values, ""])} size="sm" variant="secondary">
-          <Plus className="h-4 w-4" />
-          {addLabel}
-        </Button>
-      </div>
-    </Field>
-  );
-}
-
-function McpPairListField({
-  label,
-  pairs,
-  onChange,
-  addLabel,
-}: {
-  label: string;
-  pairs: McpKeyValue[];
-  onChange: (pairs: McpKeyValue[]) => void;
-  addLabel: string;
-}) {
-  const update = (index: number, patch: Partial<McpKeyValue>) => {
-    const next = [...pairs];
-    next[index] = { ...next[index], ...patch };
-    onChange(next);
-  };
-  return (
-    <Field label={label}>
-      <div className="mcp-list-field">
-        {pairs.map((pair, index) => (
-          <div className="mcp-list-row mcp-pair-row" key={index}>
-            <Input
-              value={pair.key}
-              onChange={(event) => update(index, { key: event.currentTarget.value })}
-              placeholder="KEY"
-            />
-            <Input
-              value={pair.value}
-              onChange={(event) => update(index, { value: event.currentTarget.value })}
-              placeholder="VALUE"
-            />
-            <Button
-              onClick={() => onChange(pairs.filter((_, position) => position !== index))}
-              size="icon"
-              title={t("删除这一项")}
-              variant="ghost"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          </div>
-        ))}
-        <Button onClick={() => onChange([...pairs, { key: "", value: "" }])} size="sm" variant="secondary">
-          <Plus className="h-4 w-4" />
-          {addLabel}
-        </Button>
-      </div>
-    </Field>
-  );
-}
-
-/**
- * 带语法着色和行号的编辑器：透明 textarea 叠在着色后的 <pre> 上。
- * 两层共用同一套字体与内边距，所以字形位置天然对齐；不换行，横向溢出交给外层滚动。
- */
-function SyncedCodeEditor({
+function SyncedTextarea({
   value,
   onValueChange,
-  language,
   className,
-  readOnly,
-  ariaLabel,
 }: {
   value: string;
   onValueChange: (value: string) => void;
-  language: CodeLanguage;
   className?: string;
-  readOnly?: boolean;
-  ariaLabel?: string;
 }) {
   const [localValue, setLocalValue] = useState(value);
   const isFocusedRef = useRef(false);
@@ -9889,70 +9925,50 @@ function SyncedCodeEditor({
     }
   }, [value]);
 
-  const lines = useMemo(() => tokenizeCode(localValue, language), [localValue, language]);
-
   return (
-    <div className={`code-editor${className ? ` ${className}` : ""}`}>
-      <div aria-hidden="true" className="code-editor-gutter">
-        {lines.map((_line, index) => (
-          <span key={index}>{index + 1}</span>
-        ))}
-      </div>
-      <div className="code-editor-scroll">
-        <pre aria-hidden="true" className="code-editor-highlight">
-          {lines.map((line, index) => (
-            <span className="code-editor-line" key={index}>
-              {line.map((token, tokenIndex) => (
-                <span className={`tok-${token.kind}`} key={tokenIndex}>{token.text}</span>
-              ))}
-              {"\n"}
-            </span>
-          ))}
-        </pre>
-        <textarea
-          aria-label={ariaLabel}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="code-editor-input"
-          onBlur={() => {
-            isFocusedRef.current = false;
-            setLocalValue(latestExternalValueRef.current);
-          }}
-          onChange={(event) => {
-            const next = event.currentTarget.value;
-            setLocalValue(next);
-            onValueChange(next);
-          }}
-          onFocus={() => {
-            isFocusedRef.current = true;
-          }}
-          readOnly={readOnly}
-          spellCheck={false}
-          value={localValue}
-          wrap="off"
-        />
-      </div>
-    </div>
+    <Textarea
+      className={className}
+      value={localValue}
+      onBlur={() => {
+        isFocusedRef.current = false;
+        setLocalValue(latestExternalValueRef.current);
+      }}
+      onChange={(event) => {
+        const next = event.currentTarget.value;
+        setLocalValue(next);
+        onValueChange(next);
+      }}
+      onFocus={() => {
+        isFocusedRef.current = true;
+      }}
+      spellCheck={false}
+    />
   );
 }
 
 function RelayFileEditors({
+  contextProfile,
   profile,
   form,
   isActive,
+  profileId,
+  onFormChange,
   onProfileChange,
+  actions,
 }: {
+  contextProfile: RelayProfile;
   profile: RelayProfile;
   form: BackendSettings;
   isActive: boolean;
+  profileId: string;
+  onFormChange: (value: BackendSettings) => void;
   onProfileChange: (value: RelayProfile) => void;
+  actions: Actions;
 }) {
-  // 「应用通用配置」开关在上面的 RelayProfileEditor 里；这里只读它来决定预览剥离什么
-  const useCommonConfig = profile.useCommonConfig !== false;
-  const configPreview = effectiveRelayConfigPreview(profile, form);
-  const entries = contextEntriesFromSettings(form);
+  const configPreview = effectiveRelayConfigPreview(profile, form, contextProfile);
+  const entries = contextEntriesForProfile(form, contextProfile);
   return (
-      <div className="relay-file-grid">
+    <div className="relay-file-grid">
       <div className="relay-file-panel">
         <div className="relay-file-head">
           <div>
@@ -9960,18 +9976,13 @@ function RelayFileEditors({
             <span>{isActive ? t("当前供应商切换后会写入的预览；上下文开关变化会立即反映") : t("切换到此供应商时会写入的预览；上下文开关变化会立即反映")}</span>
           </div>
         </div>
-        <SyncedCodeEditor
-          ariaLabel="config.toml"
+        <SyncedTextarea
           className="relay-file-textarea"
-          language="toml"
           value={configPreview}
           onValueChange={(value) => {
-            // 预览里合并了什么就剥掉什么：关掉开关时通用配置没进来，只剥上下文部分
             const withoutCommon = stripCommonConfigTextFallback(
               value,
-              useCommonConfig
-                ? relayCombinedCommonConfig(form)
-                : form.relayContextConfigContents || "",
+              relayCombinedCommonConfig(form),
             );
             const configContents = stripContextEntriesFromConfig(withoutCommon, entries);
             onProfileChange(deriveRelayProfileFromFiles({
@@ -9984,63 +9995,9 @@ function RelayFileEditors({
       <div className="relay-file-panel">
         <div className="relay-file-head">
           <div>
-            <strong>auth.json</strong>
-            <span>{isActive
-              ? profile.relayMode === "pureApi"
-                ? t("当前使用中：保留此供应商的 auth 存档，避免 Codex 登录密钥覆盖供应商密钥")
-                : t("当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档")
-              : t("切换到此供应商时会写入 ~/.codex/auth.json")}</span>
+            <strong>{t("通用配置文件")}</strong>
+            <span>{t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。")}</span>
           </div>
-        </div>
-        <SyncedCodeEditor
-          ariaLabel="auth.json"
-          className="relay-file-textarea"
-          language="json"
-          value={profile.authContents}
-          onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }))}
-        />
-      </div>
-      </div>
-  );
-}
-
-function RelayCommonConfigModal({
-  profile,
-  profileId,
-  form,
-  onClose,
-  onFormChange,
-  onProfileChange,
-  actions,
-}: {
-  profile: RelayProfile;
-  profileId: string;
-  form: BackendSettings;
-  onClose: () => void;
-  onFormChange: (value: BackendSettings) => void;
-  onProfileChange: (value: RelayProfile) => void;
-  actions: Actions;
-}) {
-  return (
-    <div aria-modal="true" className="modal-backdrop" role="dialog">
-      <div className="modal-card relay-common-config">
-        <div className="modal-head">
-          <div>
-            <h2>{t("通用配置文件")}</h2>
-            <p className="modal-message">
-              {t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。")}
-            </p>
-          </div>
-          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onClose} type="button">×</button>
-        </div>
-        <SyncedCodeEditor
-          ariaLabel={t("通用配置文件")}
-          className="relay-file-textarea"
-          language="toml"
-          value={form.relayCommonConfigContents}
-          onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
-        />
-        <Toolbar>
           <Button
             onClick={async () => {
               const extracted = await actions.extractRelayCommonConfig(profile.configContents || "");
@@ -10071,8 +10028,29 @@ function RelayCommonConfigModal({
             <Download className="h-4 w-4" />
             {t("提取当前供应商配置")}
           </Button>
-          <Button onClick={onClose} size="sm" type="button" variant="secondary">{t("关闭窗口")}</Button>
-        </Toolbar>
+        </div>
+        <SyncedTextarea
+          className="relay-file-textarea"
+          value={form.relayCommonConfigContents}
+          onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
+        />
+      </div>
+      <div className="relay-file-panel">
+        <div className="relay-file-head">
+          <div>
+            <strong>auth.json</strong>
+            <span>{isActive
+              ? profile.relayMode === "pureApi"
+                ? t("当前使用中：保留此供应商的 auth 存档，避免 Codex 登录密钥覆盖供应商密钥")
+                : t("当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档")
+              : t("切换到此供应商时会写入 ~/.codex/auth.json")}</span>
+          </div>
+        </div>
+        <SyncedTextarea
+          className="relay-file-textarea"
+          value={profile.authContents}
+          onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }))}
+        />
       </div>
     </div>
   );
@@ -10847,6 +10825,7 @@ function routeSubtitle(route: Route) {
 
 const contextKindOptions: Array<{ kind: ContextKind; label: string; tableName: string }> = [
   { kind: "mcp", label: "MCP", tableName: "mcp_servers" },
+  { kind: "skill", label: "Skills", tableName: "skills" },
   { kind: "plugin", label: t("插件"), tableName: "plugins" },
 ];
 
@@ -10858,6 +10837,7 @@ function contextEntriesFromSettings(settings: BackendSettings): CodexContextEntr
   const commonConfig = normalizeDuplicateTomlTables(settings.relayContextConfigContents || "");
   return {
     mcpServers: parseContextEntries(commonConfig, "mcp", "mcp_servers"),
+    skills: parseContextEntries(commonConfig, "skill", "skills"),
     plugins: parseContextEntries(commonConfig, "plugin", "plugins"),
   };
 }
@@ -10867,10 +10847,12 @@ function contextEntriesWithLiveEntries(settings: BackendSettings, liveEntries: C
   if (!liveEntries) return commonEntries;
   const liveByKind: Record<ContextKind, Map<string, CodexContextEntry>> = {
     mcp: new Map(liveEntries.mcpServers.map((entry) => [entry.id, entry])),
+    skill: new Map(liveEntries.skills.map((entry) => [entry.id, entry])),
     plugin: new Map(liveEntries.plugins.map((entry) => [entry.id, entry])),
   };
   return {
     mcpServers: mergeLiveContextEntries(commonEntries.mcpServers, liveByKind.mcp),
+    skills: mergeLiveContextEntries(commonEntries.skills, liveByKind.skill),
     plugins: mergeLiveContextEntries(commonEntries.plugins, liveByKind.plugin),
   };
 }
@@ -10888,23 +10870,18 @@ function mergeLiveContextEntries(entries: CodexContextEntry[], liveEntries: Map<
   return merged;
 }
 
-/**
- * 合并 live 配置里的实际状态。
- *
- * live 里有这个条目就用它的实际启停状态；**没有则保留条目自身的配置意图**。
- *
- * 不能在缺失时强制 false：供应商关掉「应用通用配置」、条目刚新增还没同步、
- * 或正处于切换过程中时，live 里都不会有它，那会让面板上所有 MCP 显示成已停用
- * ——用户看到的就是「编辑一下供应商配置，MCP 就自己关了」（#1928）。
- * 后端 context_entry_enabled 的默认同样是「没有 enabled 键即启用」，两边要一致。
- */
 function withLiveEntryState(entry: CodexContextEntry, live?: CodexContextEntry): CodexContextEntry {
   return live ? { ...entry, enabled: live.enabled } : entry;
+}
+
+function contextEntriesForProfile(settings: BackendSettings, profile: RelayProfile): CodexContextEntries {
+  return filterContextEntriesBySelection(contextEntriesFromSettings(settings), profile.contextSelection);
 }
 
 function contextEntriesFromConfig(configContents: string): CodexContextEntries {
   return {
     mcpServers: parseContextEntries(configContents, "mcp", "mcp_servers"),
+    skills: parseContextEntries(configContents, "skill", "skills"),
     plugins: parseContextEntries(configContents, "plugin", "plugins"),
   };
 }
@@ -10912,6 +10889,7 @@ function contextEntriesFromConfig(configContents: string): CodexContextEntries {
 function mergeContextEntries(primary: CodexContextEntries, secondary: CodexContextEntries): CodexContextEntries {
   return {
     mcpServers: mergeContextEntryList(primary.mcpServers, secondary.mcpServers),
+    skills: mergeContextEntryList(primary.skills, secondary.skills),
     plugins: mergeContextEntryList(primary.plugins, secondary.plugins),
   };
 }
@@ -11058,16 +11036,28 @@ function unquoteTomlKey(key: string) {
 
 function contextEntriesByKind(entries: CodexContextEntries, kind: ContextKind): CodexContextEntry[] {
   if (kind === "mcp") return dedupeContextEntryList(entries.mcpServers);
+  if (kind === "skill") return dedupeContextEntryList(entries.skills);
   return dedupeContextEntryList(entries.plugins);
 }
 
-function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSettings): string {
-  const entries = contextEntriesFromSettings(settings);
+function filterContextEntriesBySelection(entries: CodexContextEntries, selection: RelayContextSelection): CodexContextEntries {
+  const selected = {
+    mcp: new Set(selection.mcpServers.map((id) => id.trim()).filter(Boolean)),
+    skill: new Set(selection.skills.map((id) => id.trim()).filter(Boolean)),
+    plugin: new Set(selection.plugins.map((id) => id.trim()).filter(Boolean)),
+  };
+  return {
+    mcpServers: entries.mcpServers.filter((entry) => selected.mcp.has(entry.id)),
+    skills: entries.skills.filter((entry) => selected.skill.has(entry.id)),
+    plugins: entries.plugins.filter((entry) => selected.plugin.has(entry.id)),
+  };
+}
+
+function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSettings, contextProfile = profile): string {
+  const entries = contextEntriesForProfile(settings, contextProfile);
   const isolatedConfig = stripContextEntriesFromConfig(profile.configContents, entries);
   const configWithLimits = applyContextLimitPreview(isolatedConfig, profile);
-  // 与后端 relay_config.rs 保持一致：关掉「应用通用配置」的供应商不合并通用配置
-  const commonConfig = profile.useCommonConfig !== false ? settings.relayCommonConfigContents || "" : "";
-  const profileAndCommon = mergeFeaturesTableForPreview(configWithLimits, commonConfig);
+  const profileAndCommon = mergeFeaturesTableForPreview(configWithLimits, settings.relayCommonConfigContents || "");
   return joinTomlSectionsRootFirst([profileAndCommon, selectedContextConfigToml(entries)]);
 }
 
@@ -11179,6 +11169,7 @@ function splitContextConfigText(configContents: string): { common: string; conte
 function stripContextEntriesFromConfig(configContents: string, entries: CodexContextEntries): string {
   const knownIds: Record<ContextKind, Set<string>> = {
     mcp: new Set(entries.mcpServers.map((entry) => entry.id)),
+    skill: new Set(entries.skills.map((entry) => entry.id)),
     plugin: new Set(entries.plugins.map((entry) => entry.id)),
   };
   const lines = configContents.split(/\r?\n/);
@@ -11371,6 +11362,45 @@ function tomlKey(key: string): string {
   return /^[A-Za-z0-9_-]+$/.test(key) ? key : `"${tomlString(key)}"`;
 }
 
+function contextSelectionIds(selection: RelayContextSelection, kind: ContextKind): string[] {
+  if (kind === "mcp") return selection.mcpServers;
+  if (kind === "skill") return selection.skills;
+  return selection.plugins;
+}
+
+function setContextSelectionId(selection: RelayContextSelection, kind: ContextKind, id: string, checked: boolean): RelayContextSelection {
+  const next = {
+    mcpServers: [...selection.mcpServers],
+    skills: [...selection.skills],
+    plugins: [...selection.plugins],
+  };
+  const list = contextSelectionIds(next, kind);
+  const normalizedId = id.trim();
+  const exists = list.includes(normalizedId);
+  if (checked && normalizedId && !exists) list.push(normalizedId);
+  if (!checked && exists) list.splice(list.indexOf(normalizedId), 1);
+  return next;
+}
+
+function removeContextSelectionFromSettings(settings: BackendSettings, kind: ContextKind, id: string): BackendSettings {
+  return {
+    ...settings,
+    relayProfiles: settings.relayProfiles.map((profile) => ({
+      ...profile,
+      contextSelection: setContextSelectionId(profile.contextSelection, kind, id, false),
+    })),
+  };
+}
+
+function contextSelectionForAllEntries(settings: BackendSettings): RelayContextSelection {
+  const entries = contextEntriesFromSettings(settings);
+  return {
+    mcpServers: entries.mcpServers.map((entry) => entry.id),
+    skills: entries.skills.map((entry) => entry.id),
+    plugins: entries.plugins.map((entry) => entry.id),
+  };
+}
+
 function relayProfileEditorStatus(profile: RelayProfile, form: BackendSettings, isNew: boolean) {
   if (isNew) return t("新建供应商需要先保存到列表");
   if (!form.relayProfilesEnabled) return t("供应商配置总开关已关闭；当前只保存配置，不写入 Codex live 文件");
@@ -11450,10 +11480,15 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     settings.relayContextConfigContents || "",
     splitCommon.context,
   ]);
+  const defaultContextSelection = contextSelectionForAllEntries({
+    ...settings,
+    relayCommonConfigContents,
+    relayContextConfigContents,
+  });
   const profiles =
     settings.relayProfiles?.length
       ? settings.relayProfiles.map((profile) =>
-          normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id))),
+          normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id)), defaultContextSelection),
         )
       : [
           {
@@ -11473,10 +11508,14 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             configContents: "",
             authContents: "",
             useCommonConfig: true,
+            contextSelection: defaultContextSelection,
+            contextSelectionInitialized: true,
             contextWindow: "",
             autoCompactLimit: "",
             modelList: "",
             modelWindows: "",
+            modelAutoCompact: "",
+            modelMetadata: "",
             modelVlm: "",
             vlmApiKey: "",
             vlmModel: "",
@@ -11499,7 +11538,9 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     codexAppDreamSkinPaused: settings.codexAppDreamSkinPaused === true,
     codexAppDreamSkinThemeConfig: normalizeDreamSkinTheme(settings.codexAppDreamSkinThemeConfig),
     codexAppDreamSkinImagePath: (settings.codexAppDreamSkinImagePath || "").trim(),
-    codexAppStepwiseMaxItems: clampNumber(settings.codexAppStepwiseMaxItems ?? 6, 0, 6),
+    codexAppStepwiseProtocol: normalizeStepwiseProtocol(settings.codexAppStepwiseProtocol),
+    codexAppStepwiseGenerationMode: normalizeStepwiseGenerationMode(settings.codexAppStepwiseGenerationMode),
+    codexAppStepwiseMaxItems: clampNumber(settings.codexAppStepwiseMaxItems ?? 4, 0, 6),
     codexAppStepwiseMaxInputChars: clampNumber(settings.codexAppStepwiseMaxInputChars || 6000, 1000, 24000),
     codexAppStepwiseMaxOutputTokens: clampNumber(settings.codexAppStepwiseMaxOutputTokens || 500, 100, 4000),
     codexAppStepwiseTimeoutMs: clampNumber(settings.codexAppStepwiseTimeoutMs || 8000, 1000, 60000),
@@ -11510,6 +11551,14 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   });
 }
 
+function normalizeStepwiseProtocol(value: StepwiseProtocol | undefined): StepwiseProtocol {
+  return value === "auto"
+    || value === "responses"
+    || value === "anthropic_messages"
+    ? value
+    : "chat_completions";
+}
+
 function backendSettingsEqual(left: BackendSettings, right: BackendSettings): boolean {
   return JSON.stringify(normalizeSettings(left)) === JSON.stringify(normalizeSettings(right));
 }
@@ -11517,6 +11566,10 @@ function backendSettingsEqual(left: BackendSettings, right: BackendSettings): bo
 function clampNumber(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function normalizeStepwiseGenerationMode(value: StepwiseGenerationMode | undefined): StepwiseGenerationMode {
+  return value === "manual" ? "manual" : "auto";
 }
 
 function parsePort(value: string, fallback: number): number {
@@ -11538,7 +11591,7 @@ function inputToCodexExtraArgs(value: string) {
   return value === "" ? [] : value.split(/\r?\n/);
 }
 
-function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
+function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = emptyContextSelection()): RelayProfile {
   const legacyMixedApi = profile.relayMode === "mixedApi";
   if (profile.relayMode === "aggregate" || profile.aggregate) {
     return normalizeAggregateRelayProfile(
@@ -11558,10 +11611,16 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
         configContents: "",
         authContents: "",
         useCommonConfig: profile.useCommonConfig !== false,
+        contextSelection: profile.contextSelectionInitialized
+          ? normalizeContextSelection(profile.contextSelection)
+          : normalizeContextSelection(undefined, defaultContextSelection),
+        contextSelectionInitialized: true,
         contextWindow: "",
         autoCompactLimit: "",
         modelList: "",
         modelWindows: "",
+        modelAutoCompact: "",
+        modelMetadata: "",
         modelRoutes: [],
         sub2apiEnabled: false,
         sub2apiMultiplier: "",
@@ -11588,10 +11647,16 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     configContents: relayMode === "official" && !officialMixApiKey ? "" : profile.configContents || "",
     authContents: relayMode === "official" && !officialMixApiKey ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "",
     useCommonConfig: profile.useCommonConfig !== false,
+    contextSelection: profile.contextSelectionInitialized
+      ? normalizeContextSelection(profile.contextSelection)
+      : normalizeContextSelection(undefined, defaultContextSelection),
+    contextSelectionInitialized: true,
     contextWindow: profile.contextWindow || "",
     autoCompactLimit: profile.autoCompactLimit || "",
     modelList: profile.modelList || "",
     modelWindows: profile.modelWindows || "",
+    modelAutoCompact: profile.modelAutoCompact || "",
+    modelMetadata: profile.modelMetadata || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
     sub2apiEnabled: noAuth ? false : profile.sub2apiEnabled === true,
@@ -11655,6 +11720,24 @@ function relaySessionProviderFromConfig(contents: string): RelaySessionProvider 
 function relaySessionProvider(profile: Pick<RelayProfile, "configContents" | "sessionProvider">): RelaySessionProvider {
   const fromConfig = relaySessionProviderFromConfig(profile.configContents);
   return fromConfig === "openai" || profile.sessionProvider === "openai" ? "openai" : "custom";
+}
+
+function normalizeContextSelection(
+  selection?: Partial<RelayContextSelection>,
+  fallback: RelayContextSelection = emptyContextSelection(),
+): RelayContextSelection {
+  if (!selection) {
+    return {
+      mcpServers: [...fallback.mcpServers],
+      skills: [...fallback.skills],
+      plugins: [...fallback.plugins],
+    };
+  }
+  return {
+    mcpServers: Array.isArray(selection?.mcpServers) ? selection.mcpServers.map(String) : [],
+    skills: Array.isArray(selection?.skills) ? selection.skills.map(String) : [],
+    plugins: Array.isArray(selection?.plugins) ? selection.plugins.map(String) : [],
+  };
 }
 
 function relayModeLabel(mode: RelayMode): string {
@@ -11794,12 +11877,15 @@ function buildRelayConfigToml(
     sessionProvider === "openai" ? `openai_base_url = "${PROTOCOL_PROXY_BASE_URL}"` : null,
     "",
   ].filter((line): line is string => line !== null);
+  const requiresOpenAiAuthLine = options.requiresOpenAiAuth === undefined
+    ? null
+    : `requires_openai_auth = ${options.requiresOpenAiAuth ? "true" : "false"}`;
   return [
     ...rootLines,
     "[model_providers.custom]",
     'name = "custom"',
     'wire_api = "responses"',
-    options.requiresOpenAiAuth === undefined ? null : `requires_openai_auth = ${options.requiresOpenAiAuth ? "true" : "false"}`,
+    requiresOpenAiAuthLine,
     `base_url = "${tomlString(baseUrl)}"`,
     profile.noAuth
       ? `experimental_bearer_token = "${NO_AUTH_PROXY_BEARER_TOKEN}"`
@@ -12188,8 +12274,7 @@ function ensureCodexProviderDefaults(
 ): string {
   let next = contents;
   const section = `model_providers.${provider}`;
-  // name 只是展示用标签，允许与表名不同；用户改过就沿用，别覆盖回表名。
-  next = setTomlSectionStringKey(next, section, "name", resolveProviderName(next, provider));
+  next = setTomlSectionStringKey(next, section, "name", provider);
   next = setTomlSectionStringKey(next, section, "wire_api", "responses");
   return options.requiresOpenAiAuth === false ? next : setTomlSectionBoolKey(next, section, "requires_openai_auth", true);
 }
@@ -12402,6 +12487,7 @@ function updateRelayProfile(settings: BackendSettings, id: string, patch: Partia
 
 function createRelayProfile(settings: BackendSettings): RelayProfile {
   const id = `relay-${Date.now().toString(36)}`;
+  const contextSelection = contextSelectionForAllEntries(settings);
   const next = {
     id,
     name: tf("供应商 {0}", [settings.relayProfiles.length + 1]),
@@ -12419,10 +12505,14 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     configContents: "",
     authContents: "",
     useCommonConfig: true,
+    contextSelection,
+    contextSelectionInitialized: true,
     contextWindow: "",
     autoCompactLimit: "",
     modelList: "",
     modelWindows: "",
+    modelAutoCompact: "",
+    modelMetadata: "",
     modelVlm: "",
     vlmApiKey: "",
     vlmModel: "",
@@ -12437,6 +12527,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
 
 function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
   const id = `aggregate-${Date.now().toString(36)}`;
+  const contextSelection = contextSelectionForAllEntries(settings);
   const candidates = aggregateMemberCandidates(settings, id);
   return normalizeAggregateRelayProfile(
     {
@@ -12456,10 +12547,14 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
+      contextSelection,
+      contextSelectionInitialized: true,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",
       modelWindows: "",
+      modelAutoCompact: "",
+      modelMetadata: "",
       modelVlm: "",
       vlmApiKey: "",
       vlmModel: "",
