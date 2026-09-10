@@ -21,6 +21,7 @@ const THREAD_REFERENCE_TABLES: &[(&str, &str)] = &[
     ("automation_runs", "thread_id"),
     ("inbox_items", "thread_id"),
 ];
+const SIDEBAR_REFERENCE_TABLES: &[&str] = &["local_thread_catalog", "thread_timeline_ledger"];
 
 pub fn delete_local_from_paths(
     db_paths: impl IntoIterator<Item = PathBuf>,
@@ -96,6 +97,20 @@ pub fn delete_local_from_paths(
             Err(error) => {
                 result.message =
                     format!("{}；session_index.jsonl 清理失败：{error}", result.message);
+            }
+        }
+        match crate::provider_sync::remove_thread_sidebar_references(&home, &thread_id) {
+            Ok(cleanup)
+                if cleanup.global_state_entries_removed > 0 || cleanup.catalog_rows_removed > 0 =>
+            {
+                if matches!(result.status, DeleteStatus::Failed) {
+                    result.status = DeleteStatus::LocalDeleted;
+                    result.message = "已清理侧边栏索引".to_string();
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                result.message = format!("{}；侧边栏索引清理失败：{error}", result.message);
             }
         }
     }
@@ -660,6 +675,11 @@ impl SQLiteStorageAdapter {
                 result.message =
                     format!("{}；session_index.jsonl 清理失败：{error}", result.message);
             }
+            if let Err(error) =
+                crate::provider_sync::remove_thread_sidebar_references(home, &thread_id)
+            {
+                result.message = format!("{}；侧边栏索引清理失败：{error}", result.message);
+            }
         }
         result
     }
@@ -952,10 +972,14 @@ impl SQLiteStorageAdapter {
         } else {
             Vec::new()
         };
+        let mut tables = Map::new();
+        tables.insert("sessions".to_string(), Value::Array(sessions));
+        tables.insert("messages".to_string(), Value::Array(messages));
+        self.add_thread_sidebar_backups(&mut tables, &session.session_id)?;
         let token = self.backup_store.write_backup(
             &session.session_id,
             &self.db_path,
-            json!({"sessions": sessions, "messages": messages}),
+            Value::Object(tables),
         )?;
         let backup_path = self.backup_store.path_for(&token);
         let delete_result = (|| -> anyhow::Result<()> {
@@ -1036,6 +1060,7 @@ impl SQLiteStorageAdapter {
             tables.insert("__files".to_string(), Value::Array(file_backups.clone()));
         }
         self.prepare_thread_reference_backup(&thread_id, &mut tables)?;
+        self.add_thread_sidebar_backups(&mut tables, &thread_id)?;
         let token =
             self.backup_store
                 .write_backup(&thread_id, &self.db_path, Value::Object(tables))?;
@@ -1109,6 +1134,29 @@ impl SQLiteStorageAdapter {
         ))
     }
 
+    fn add_thread_sidebar_backups(
+        &self,
+        tables: &mut Map<String, Value>,
+        thread_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Ok(());
+        };
+        let session_index_lines =
+            crate::provider_sync::session_index_lines_for_thread(home, thread_id)?;
+        if !session_index_lines.is_empty() {
+            tables.insert(
+                "__session_index".to_string(),
+                Value::Array(session_index_lines.into_iter().map(Value::String).collect()),
+            );
+        }
+        tables.insert(
+            "__sidebar".to_string(),
+            crate::provider_sync::snapshot_thread_sidebar_references(home, thread_id)?,
+        );
+        Ok(())
+    }
+
     fn delete_codex_automation_run(
         &self,
         db: &mut Connection,
@@ -1130,6 +1178,7 @@ impl SQLiteStorageAdapter {
             "thread_id = ?1",
             &[&thread_id],
         )?;
+        self.add_thread_sidebar_backups(&mut tables, &thread_id)?;
         if tables.values().all(|rows| {
             rows.as_array()
                 .map(|items| items.is_empty())
@@ -1382,6 +1431,11 @@ fn restore_backups(
         preflight_global_state_restore(tables, codex_home)?;
         preflight_reference_database_restore(tables, fallback_db_path, allowed_db_paths)?;
         preflight_restore_rows(&db, tables)?;
+        if let Some(sidebar) = tables.get("__sidebar") {
+            let home = codex_home
+                .ok_or_else(|| anyhow::anyhow!("sidebar restore requires a Codex home"))?;
+            crate::provider_sync::validate_thread_sidebar_snapshot(home, sidebar)?;
+        }
     }
 
     for backup in backups {
@@ -1425,6 +1479,11 @@ fn restore_backups(
         restore_session_index(tables, codex_home)?;
         restore_global_state_files(tables, codex_home)?;
         restore_reference_databases(tables, fallback_db_path, allowed_db_paths)?;
+        if let Some(sidebar) = tables.get("__sidebar") {
+            let home = codex_home
+                .ok_or_else(|| anyhow::anyhow!("sidebar restore requires a Codex home"))?;
+            let _ = crate::provider_sync::restore_thread_sidebar_references(home, sidebar)?;
+        }
     }
     Ok(())
 }
@@ -1444,11 +1503,15 @@ fn preflight_reference_database_restore(
         let Some(reference_tables) = backup.get("tables").and_then(Value::as_object) else {
             anyhow::bail!("invalid reference database backup");
         };
-        validate_reference_restore_tables(reference_tables)?;
+        let reference_tables = filtered_reference_restore_tables(tables, reference_tables);
+        if reference_tables.is_empty() {
+            continue;
+        }
+        validate_reference_restore_tables(&reference_tables)?;
         let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
         let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        detect_restore_conflicts(&db, reference_tables)?;
-        preflight_restore_rows(&db, reference_tables)?;
+        detect_restore_conflicts(&db, &reference_tables)?;
+        preflight_restore_rows(&db, &reference_tables)?;
     }
     Ok(())
 }
@@ -1468,14 +1531,32 @@ fn restore_reference_databases(
         let Some(reference_tables) = backup.get("tables").and_then(Value::as_object) else {
             anyhow::bail!("invalid reference database backup");
         };
-        validate_reference_restore_tables(reference_tables)?;
+        let reference_tables = filtered_reference_restore_tables(tables, reference_tables);
+        if reference_tables.is_empty() {
+            continue;
+        }
+        validate_reference_restore_tables(&reference_tables)?;
         let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
         let mut db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let tx = db.transaction()?;
-        restore_rows(&tx, reference_tables)?;
+        restore_rows(&tx, &reference_tables)?;
         tx.commit()?;
     }
     Ok(())
+}
+
+fn filtered_reference_restore_tables(
+    tables: &Map<String, Value>,
+    reference_tables: &Map<String, Value>,
+) -> Map<String, Value> {
+    if !tables.contains_key("__sidebar") {
+        return reference_tables.clone();
+    }
+    reference_tables
+        .iter()
+        .filter(|(table, _)| !SIDEBAR_REFERENCE_TABLES.contains(&table.as_str()))
+        .map(|(table, rows)| (table.clone(), rows.clone()))
+        .collect()
 }
 
 fn validate_reference_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
@@ -1596,6 +1677,11 @@ fn preflight_global_state_restore(
         .ok_or_else(|| anyhow::anyhow!("Codex home is required to restore global state"))?;
     for entry in entries {
         let (path, original, cleaned) = decode_global_state_backup(home, entry)?;
+        // The upstream sidebar snapshot restores this file at thread granularity.
+        // Keep the legacy backup for the remaining global-state files only.
+        if tables.contains_key("__sidebar") && path == home.join(".codex-global-state.json") {
+            continue;
+        }
         let current = fs::read(&path)?;
         if current != original && current != cleaned {
             anyhow::bail!(
@@ -1621,6 +1707,9 @@ fn restore_global_state_files(
         .ok_or_else(|| anyhow::anyhow!("Codex home is required to restore global state"))?;
     for entry in entries {
         let (path, original, cleaned) = decode_global_state_backup(home, entry)?;
+        if tables.contains_key("__sidebar") && path == home.join(".codex-global-state.json") {
+            continue;
+        }
         let current = fs::read(&path)?;
         if current == original {
             continue;
@@ -1751,7 +1840,7 @@ fn schema_kind(db: &Connection) -> anyhow::Result<Option<SchemaKind>> {
     Ok(None)
 }
 
-fn has_table(db: &Connection, table: &str) -> anyhow::Result<bool> {
+pub(crate) fn has_table(db: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(db
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1775,7 +1864,11 @@ fn table_columns(db: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn select_dicts(db: &Connection, sql: &str, params: &[&dyn ToSql]) -> anyhow::Result<Vec<Value>> {
+pub(crate) fn select_dicts(
+    db: &Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> anyhow::Result<Vec<Value>> {
     let mut stmt = db.prepare(sql)?;
     let columns: Vec<String> = stmt
         .column_names()
@@ -1808,6 +1901,7 @@ fn validate_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
         "__session_index",
         "__global_state_files",
         "__reference_databases",
+        "__sidebar",
     ];
     for table in tables.keys() {
         if !allowed.contains(&table.as_str()) {
@@ -2136,7 +2230,7 @@ fn sql_value_to_json(value: ValueRef<'_>) -> Value {
     }
 }
 
-fn json_to_sql_value(value: &Value) -> SqlValue {
+pub(crate) fn json_to_sql_value(value: &Value) -> SqlValue {
     match value {
         Value::Null => SqlValue::Null,
         Value::Bool(value) => SqlValue::Integer(i64::from(*value)),

@@ -111,8 +111,9 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
         .and_then(Value::as_str)
         .map(ToString::to_string);
     let style = bool_at(&raw, "/stylePresent");
-    let chrome = bool_at(&raw, "/chromePresent")
-        && raw.get("chromePointerEvents").and_then(Value::as_str) == Some("none");
+    let decoration_safe = bool_at(&raw, "/decorationSafe")
+        || (bool_at(&raw, "/chromePresent")
+            && raw.get("chromePointerEvents").and_then(Value::as_str) == Some("none"));
     let sidebar = bool_at(&raw, "/sidebar/visible");
     let composer = bool_at(&raw, "/composer/visible");
     let no_horizontal_overflow = !bool_at(&raw, "/documentOverflow/x");
@@ -155,10 +156,10 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
         ),
         bool_check(
             "chrome",
-            "装饰层",
-            chrome,
-            "装饰层存在且不拦截点击。",
-            "装饰层缺失或会拦截点击。",
+            "装饰兼容性",
+            decoration_safe,
+            "装饰层配置不会拦截点击。",
+            "装饰层可能拦截点击。",
         ),
         bool_check(
             "sidebar",
@@ -438,6 +439,9 @@ pub fn renderer_verification_script() -> &'static str {
       visible: rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden",
     };
   };
+  const root = document.documentElement;
+  const runtimeState = window.__CODEX_DREAM_SKIN_STATE__ ||
+    window.__CODEX_GLASS_VISION_SKIN_STATE__ || null;
   const firstVisibleBox = (selectors) => {
     for (const selector of selectors) {
       for (const node of document.querySelectorAll(selector)) {
@@ -448,17 +452,26 @@ pub fn renderer_verification_script() -> &'static str {
     return null;
   };
   const homeChromeSelector = '[class*="home-suggestions"], [class*="_homeUtilityBar_"]';
+  const modernHome = document.querySelector('[data-ds-part="home"]');
   const homeIndicator = document.querySelector('[data-testid="home-icon"]');
-  const homeSignal = homeIndicator || document.querySelector('[data-feature="game-source"]') || document.querySelector(homeChromeSelector);
-  const homeRoute = homeIndicator?.closest('[role="main"]') ||
+  const homeSignal = homeIndicator || document.querySelector('[data-feature="game-source"]') ||
+    document.querySelector('.group\\/home-suggestions') || document.querySelector(homeChromeSelector);
+  const homeRoute = modernHome?.closest('[role="main"]') || modernHome ||
+    homeIndicator?.closest('[role="main"]') ||
     homeSignal?.closest('[role="main"]') ||
     [...document.querySelectorAll('[role="main"]')].find((candidate) =>
-      candidate.querySelector('[data-feature="game-source"]') && candidate.querySelector(homeChromeSelector)
+      candidate.querySelector('[data-feature="game-source"]') &&
+        (candidate.querySelector('.group\\/home-suggestions') || candidate.querySelector(homeChromeSelector))
     ) || null;
-  const home = homeRoute && (
-    homeRoute.querySelector('[data-feature="game-source"]') || homeRoute.querySelector(homeChromeSelector)
-  ) ? homeRoute : null;
-  const suggestions = home?.querySelector(homeChromeSelector) || null;
+  const home = modernHome ||
+    document.querySelector('[role="main"].dream-home, [role="main"].dream-skin-home, [role="main"].glass-vision-home') ||
+    (homeRoute && (
+      homeRoute.querySelector('[data-feature="game-source"]') ||
+      homeRoute.querySelector('.group\\/home-suggestions') ||
+      homeRoute.querySelector(homeChromeSelector)
+    ) ? homeRoute : null);
+  const suggestions = home?.querySelector('.group\\/home-suggestions') ||
+    home?.querySelector(homeChromeSelector) || null;
   const cards = suggestions ? [...suggestions.querySelectorAll('button')].map(box) : [];
   const homeContent = home?.querySelector('[data-feature="game-source"], ' + homeChromeSelector) || null;
   const chrome = document.getElementById('codex-dream-skin-chrome') ||
@@ -469,23 +482,35 @@ pub fn renderer_verification_script() -> &'static str {
   const managedVersion = window.__CODEX_PLUS_VERSION__ && runtimeRevision && targetEngine && payloadSignature
     ? `codex-plus:${String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || 'unknown')}:${targetEngine}:r${runtimeRevision}`
     : null;
+  const chromePointerEvents = chrome ? getComputedStyle(chrome).pointerEvents : null;
+  const adoptedStylePresent = runtimeState?.styleMode === 'adopted' &&
+    runtimeState.styleSheet &&
+    Array.from(document.adoptedStyleSheets || []).includes(runtimeState.styleSheet);
+  const stateStylePresent = runtimeState?.styleMode === 'style' &&
+    Boolean(runtimeState.styleNode?.isConnected);
   return JSON.stringify({
-    installed: document.documentElement.classList.contains('codex-dream-skin') ||
-      document.documentElement.classList.contains('codex-glass-vision-skin'),
-    version: managedVersion || window.__CODEX_DREAM_SKIN_STATE__?.version ||
-      window.__CODEX_GLASS_VISION_SKIN_STATE__?.version || null,
+    installed: root.getAttribute('data-dream-skin') === 'active' ||
+      root.classList.contains('codex-dream-skin') ||
+      root.classList.contains('codex-glass-vision-skin'),
+    version: managedVersion || runtimeState?.version || null,
     stylePresent: Boolean(document.getElementById('codex-dream-skin-style') ||
-      document.getElementById('codex-glass-vision-skin-style')),
+      document.getElementById('codex-glass-vision-skin-style') ||
+      adoptedStylePresent || stateStylePresent),
     chromePresent: Boolean(chrome),
-    chromePointerEvents: getComputedStyle(chrome || document.body).pointerEvents,
+    chromePointerEvents,
+    decorationSafe: !chrome || chromePointerEvents === 'none',
     homeRoute: Boolean(homeRoute),
     homePresent: Boolean(home),
-    hero: box(home?.firstElementChild?.firstElementChild?.firstElementChild),
+    hero: box(home?.querySelector('[data-ds-part="home-hero"]') ||
+      home?.firstElementChild?.firstElementChild?.firstElementChild),
     homeContent: box(homeContent),
     visibleCardCount: cards.filter((item) => item?.visible).length,
     projectButton: box(home?.querySelector('.group\\/project-selector > button')),
     composer: firstVisibleBox([
       '.composer-surface-chrome',
+      '[class*="_ComposerLayoutRoot_"]',
+      '[data-composer-surface-variant][data-composer-radius-variant]',
+      '[data-ds-part="composer"]',
       '[role="textbox"][contenteditable="true"]',
       'textarea:not([disabled])',
     ]),

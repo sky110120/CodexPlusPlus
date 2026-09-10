@@ -167,7 +167,7 @@ verify_app "$STAGE/Codex++ 管理工具.app"
 
 ln -s /Applications "$STAGE/Applications"
 
-MAX_ATTEMPTS="${DMG_CREATE_MAX_ATTEMPTS:-3}"
+MAX_ATTEMPTS="${DMG_CREATE_MAX_ATTEMPTS:-5}"
 CONVERT_MAX_ATTEMPTS="${DMG_CONVERT_MAX_ATTEMPTS:-5}"
 DMG_CREATED=false
 DMG_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-plus-plus-dmg.XXXXXX")"

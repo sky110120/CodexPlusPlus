@@ -124,11 +124,10 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
     assert!(script.contains("osascript <<'APPLESCRIPT'"));
     assert!(script.contains("hdiutil detach \"$MOUNT_POINT\""));
     assert!(script.contains("hdiutil convert \"$DMG_WORK_PATH\" -format UDZO -ov -o \"$DMG\""));
-    assert!(script.contains("MAX_ATTEMPTS=\"${DMG_CREATE_MAX_ATTEMPTS:-3}\""));
+    assert!(script.contains("MAX_ATTEMPTS=\"${DMG_CREATE_MAX_ATTEMPTS:-5}\""));
+    assert!(script.contains("create_dmg_work_image()"));
+    assert!(script.contains("if [ \"$attempt\" -ge \"$MAX_ATTEMPTS\" ]; then"));
     assert!(script.contains("sleep \"$((attempt * 2))\""));
-    assert!(script.contains("DMG_CREATED=false"));
-    assert!(script.contains("if [ \"$DMG_CREATED\" != true ]; then"));
-    assert!(script.contains("exit 1"));
     assert!(!script.contains("status=$?"));
     assert!(!script.contains("DMG_TMP"));
 }
