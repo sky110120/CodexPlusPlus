@@ -58,13 +58,20 @@ async fn installs_verified_market_theme_into_local_library() {
     let image = include_bytes!("../../../assets/inject/dream-skin-default.png");
     mount_theme(&server, &config, image).await;
 
-    let installed = install_market_theme_from_base(
+    let installed = match install_market_theme_from_base(
         state.path(),
         &market_theme(&config, image),
         &format!("{}/", server.uri()),
     )
     .await
-    .unwrap();
+    {
+        Ok(installed) => installed,
+        Err(error) => {
+            let requests = server.received_requests().await.unwrap();
+            eprintln!("dream_skin_market diagnostic: error={error}; requests={requests:#?}");
+            panic!("market installation failed: {error}");
+        }
+    };
 
     assert_eq!(installed.id, "market-demo");
     let stored = codex_plus_core::dream_skin_library::load_stored_dream_skin_theme(

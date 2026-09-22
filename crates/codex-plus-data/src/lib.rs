@@ -6,13 +6,15 @@ pub mod storage;
 pub use backup::BackupStore;
 pub use markdown::{MarkdownExportService, export_markdown_from_paths};
 pub use provider_sync::{
-    ProviderSyncAudit, ProviderSyncLifecycleGuard, ProviderSyncLockState, ProviderSyncResult,
+    ProviderSyncAudit, ProviderSyncLifecycleGuard, ProviderSyncLockState, ProviderSyncProgress,
+    ProviderSyncProgressPhase, ProviderSyncResult,
     ProviderSyncStatus, ProviderSyncTargetList, ProviderSyncTargetOption, ProviderSyncTargetSource,
     SessionIndexCleanupApplyError, SessionIndexCleanupCandidate, SessionIndexCleanupPreview,
     SessionIndexCleanupReason, SessionIndexCleanupResult, ThreadSidebarCleanupResult,
     apply_session_index_cleanup, inspect_provider_sync_lock, load_provider_sync_targets,
     preview_session_index_cleanup, remote_control_session_recovery_candidate_exists,
     remove_thread_sidebar_references, run_provider_sync, run_provider_sync_with_target,
+    run_provider_sync_with_target_and_progress,
     run_remote_control_session_catalog_recovery_for_thread_with_target,
     run_remote_control_session_finalization_for_thread_with_target,
     run_remote_control_session_finalization_for_thread_with_target_with_before_apply_hook,

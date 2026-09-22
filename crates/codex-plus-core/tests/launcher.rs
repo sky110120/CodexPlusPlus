@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use codex_plus_core::app_paths::{
     build_codex_executable, codex_app_version, find_bundled_codex_cli, find_latest_codex_app_dir,
-    find_latest_codex_app_dir_from_roots, find_macos_codex_app, normalize_codex_app_path,
-    packaged_app_user_model_id, resolve_codex_app_dir_with_saved, user_data_candidates_from,
+    find_latest_codex_app_dir_from_roots, find_linux_codex_app, find_macos_codex_app,
+    normalize_codex_app_path, packaged_app_user_model_id, resolve_codex_app_dir_with_saved,
+    user_data_candidates_from,
 };
 use codex_plus_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, HelperStatus, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
@@ -524,6 +525,81 @@ fn app_paths_invalid_saved_path_falls_back_instead_of_sticking() {
             .as_deref(),
         Some(standalone.as_path())
     );
+}
+
+#[test]
+fn app_paths_rejects_nonexistent_and_empty_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    // 根本不存在的路径（例如探测生成的候选）不能被误认成应用目录或退回父目录
+    let nonexistent = temp.path().join("Codex");
+    assert_eq!(normalize_codex_app_path(&nonexistent), None);
+
+    // 即使存在名为 Codex 或 ChatGPT 的空目录，若无有效可执行文件也应拒绝
+    let empty_codex = temp.path().join("empty-dir").join("Codex");
+    std::fs::create_dir_all(&empty_codex).unwrap();
+    assert_eq!(normalize_codex_app_path(&empty_codex), None);
+}
+
+/// Linux 的可执行文件名是无扩展名的 `ChatGPT` / `Codex`，而这两个名字只在
+/// Linux 构建里被 `is_supported_app_executable_name` / `executable_in_dir`
+/// 认作有效，`linux_app_candidates` 的目录扫描也在 `cfg(target_os = "linux")` 内。
+/// 因此本测试只在 Linux 上有意义——其他平台上 `normalize_codex_app_path`
+/// 正确地返回 None，断言必然失败。
+#[cfg(target_os = "linux")]
+#[test]
+fn app_paths_linux_detects_chatgpt_executable_and_builds_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("usr").join("lib").join("chatgpt");
+    std::fs::create_dir_all(&app).unwrap();
+    let bin = app.join("ChatGPT");
+    std::fs::write(&bin, "").unwrap();
+    std::fs::write(app.join("version"), "42.3.0").unwrap();
+
+    // 传入目录
+    assert_eq!(
+        normalize_codex_app_path(&app).as_deref(),
+        Some(app.as_path())
+    );
+    // 传入可执行文件本身
+    assert_eq!(
+        normalize_codex_app_path(&bin).as_deref(),
+        Some(app.as_path())
+    );
+    // 版本读取
+    assert_eq!(codex_app_version(&app).as_deref(), Some("42.3.0"));
+    assert_eq!(build_codex_executable(&app), bin);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn app_paths_linux_finds_codex_app_from_search_roots_avoiding_empty_opt() {
+    let temp = tempfile::tempdir().unwrap();
+    // 模拟 /opt（空目录）
+    let opt = temp.path().join("opt");
+    std::fs::create_dir_all(&opt).unwrap();
+
+    // 模拟 /usr/lib/chatgpt/ChatGPT
+    let usr_lib = temp.path().join("usr").join("lib");
+    let chatgpt_dir = usr_lib.join("chatgpt");
+    std::fs::create_dir_all(&chatgpt_dir).unwrap();
+    std::fs::write(chatgpt_dir.join("ChatGPT"), "").unwrap();
+
+    let roots = vec![opt, usr_lib];
+    assert_eq!(
+        find_linux_codex_app(&roots).as_deref(),
+        Some(chatgpt_dir.as_path())
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn live_system_resolves_chatgpt_on_linux_when_installed() {
+    let resolved = codex_plus_core::app_paths::resolve_codex_app_dir(None);
+    if Path::new("/usr/lib/chatgpt").is_dir() {
+        assert_eq!(resolved.as_deref(), Some(Path::new("/usr/lib/chatgpt")));
+        let exe = codex_plus_core::app_paths::build_codex_executable(&resolved.unwrap());
+        assert_eq!(exe, PathBuf::from("/usr/lib/chatgpt/ChatGPT"));
+    }
 }
 
 #[test]
@@ -1296,6 +1372,113 @@ async fn a_permanently_busy_protocol_proxy_port_reports_what_the_user_should_do(
     );
 }
 
+/// issue #2189：Windows 上 57321 被划进 Hyper-V/WSL 的动态端口排除区间（os error 10013），
+/// 和「被占用」不是一回事——重试永远失败，必须立即报错并给出能照着做的指引，
+/// 而不是像过去那样裸抛一句英文 bind 失败，用户不知道为什么混入 Responses key 后再也起不来。
+#[tokio::test]
+async fn a_windows_reserved_protocol_proxy_port_fails_fast_with_actionable_advice() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(official_mix_responses_settings())
+        .with_helper_bind_forbidden();
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap_err();
+
+    let message = format!("{error:#}");
+    // 核心契约：这是「被系统禁止绑定」而不是「被占用」——两者要走的处理路径不同。
+    // 只断言与平台无关的部分，对症文案按平台各自不同，不作为断言目标。
+    assert!(
+        message.contains("os error 10013"),
+        "raw bind error must survive into the message: {message}"
+    );
+    assert!(
+        !message.contains("被其他进程占用"),
+        "reserved port must not be reported as busy: {message}"
+    );
+    assert!(
+        !message.contains("被 Windows 保留") || cfg!(windows),
+        "Windows-only guidance must not leak onto other platforms: {message}"
+    );
+    // 保留端口重试毫无意义：只允许尝试一次 bind，不能烧完 6 秒重试预算。
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "start-helper-forbidden:57321")
+            .count(),
+        1
+    );
+    // 端口没起来就不该继续把 Codex 拉起来，否则它会连到没人监听的地址。
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("launch:"))
+    );
+}
+
+/// 与占用/保留都无关的其他 bind 失败：错误原样冒泡，不误贴「被占用」「被保留」的标签。
+#[tokio::test]
+async fn an_unrelated_helper_bind_error_is_reported_as_is() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(official_mix_responses_settings())
+        .with_helper_bind_other_error("simulated unrelated failure");
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("failed to bind helper runtime"),
+        "unexpected message: {message}"
+    );
+    assert!(
+        message.contains("simulated unrelated failure"),
+        "unexpected message: {message}"
+    );
+    assert!(!message.contains("被 Windows 保留"));
+    assert!(!message.contains("被其他进程占用"));
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "start-helper-error:57321")
+            .count(),
+        1
+    );
+}
+
 /// macOS 允许端口释放竞态的六秒重试；其他平台的浮动端口仍立即失败。
 #[tokio::test]
 async fn a_busy_floating_helper_port_respects_the_platform_retry_budget() {
@@ -1697,6 +1880,7 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            standard_openai_protocol: false,
         }],
         active_relay_id: "relay-chat".to_string(),
         ..BackendSettings::default()
@@ -1997,6 +2181,60 @@ fn paused_dream_skin_does_not_reapply_the_native_base_theme_on_launch() {
     assert!(source.contains("!settings.codex_app_dream_skin_paused"));
 }
 
+#[tokio::test]
+async fn native_browser_lifecycle_uses_one_settings_snapshot_and_stops_on_success_or_failure() {
+    for fail in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Codex.app");
+        std::fs::create_dir(&app_dir).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let settings = BackendSettings {
+            codex_app_native_browser_require_identification: true,
+            provider_sync_enabled: false,
+            ..BackendSettings::default()
+        };
+        let mut hooks = FakeHooks::new(events.clone()).with_settings(settings);
+        if fail {
+            hooks = hooks.with_launch_error("fixture launch failure");
+        }
+        let result = launch_and_inject_with_hooks(
+            LaunchOptions {
+                app_dir: Some(app_dir),
+                status_store: StatusStore::new(temp.path().join("status.json")),
+                ..LaunchOptions::default()
+            },
+            &hooks,
+        )
+        .await;
+        if fail {
+            assert!(result.is_err());
+        } else {
+            result.unwrap().wait_for_codex_exit().await.unwrap();
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "load-settings")
+                .count(),
+            1
+        );
+        let start = events
+            .iter()
+            .position(|event| event == "native-browser:start:true")
+            .unwrap();
+        let launch = events
+            .iter()
+            .position(|event| event == "launch:9229")
+            .unwrap();
+        let stop = events
+            .iter()
+            .position(|event| event == "native-browser:stop")
+            .unwrap();
+        assert!(start < launch && launch < stop);
+    }
+}
+
 #[derive(Clone)]
 struct FakeHooks {
     events: Arc<Mutex<Vec<String>>>,
@@ -2010,6 +2248,10 @@ struct FakeHooks {
     helper_status: HelperStatus,
     /// 还需要让 `start_helper` 报几次「端口被占用」，用来模拟旧 helper 尚未交还监听。
     remaining_helper_bind_conflicts: Arc<Mutex<u32>>,
+    /// 模拟「端口被 Windows 保留」（os error 10013）：bind 永远不会成功（issue #2189）。
+    helper_bind_forbidden: bool,
+    /// 模拟与占用/保留都无关的其他 bind 失败，验证错误原样冒泡。
+    helper_bind_other_error: Option<String>,
 }
 
 impl FakeHooks {
@@ -2029,11 +2271,23 @@ impl FakeHooks {
             has_pending_remote_control_session_recoveries: false,
             helper_status: HelperStatus::Missing,
             remaining_helper_bind_conflicts: Arc::new(Mutex::new(0)),
+            helper_bind_forbidden: false,
+            helper_bind_other_error: None,
         }
     }
 
     fn with_helper_bind_conflicts(self, conflicts: u32) -> Self {
         *self.remaining_helper_bind_conflicts.lock().unwrap() = conflicts;
+        self
+    }
+
+    fn with_helper_bind_forbidden(mut self) -> Self {
+        self.helper_bind_forbidden = true;
+        self
+    }
+
+    fn with_helper_bind_other_error(mut self, message: &str) -> Self {
+        self.helper_bind_other_error = Some(message.to_string());
         self
     }
 
@@ -2118,6 +2372,24 @@ impl LaunchHooks for FakeHooks {
         Ok(self.settings.clone())
     }
 
+    async fn start_native_browser_compatibility(&self, settings: &BackendSettings) {
+        if settings.codex_app_native_browser_require_identification {
+            self.event(format!(
+                "native-browser:start:{}",
+                settings.enhancements_enabled
+            ));
+        }
+    }
+
+    async fn stop_native_browser_compatibility(&self) {
+        if self
+            .settings
+            .codex_app_native_browser_require_identification
+        {
+            self.event("native-browser:stop");
+        }
+    }
+
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         self.event("provider-sync");
         if self.provider_sync_unsupported {
@@ -2178,6 +2450,24 @@ impl LaunchHooks for FakeHooks {
                     "failed to bind helper runtime on 127.0.0.1:{helper_port}"
                 )));
             }
+        }
+        if self.helper_bind_forbidden {
+            self.event(format!("start-helper-forbidden:{helper_port}"));
+            // raw_os_error(10013) 在 Windows 上是 WSAEACCES，跨平台都能命中
+            // `port_bind_forbidden` 的判定，测试行为一致。
+            return Err(
+                anyhow::Error::new(std::io::Error::from_raw_os_error(10013)).context(format!(
+                    "failed to bind helper runtime on 127.0.0.1:{helper_port}"
+                )),
+            );
+        }
+        if let Some(message) = &self.helper_bind_other_error {
+            self.event(format!("start-helper-error:{helper_port}"));
+            return Err(
+                anyhow::Error::new(std::io::Error::other(message.clone())).context(format!(
+                    "failed to bind helper runtime on 127.0.0.1:{helper_port}"
+                )),
+            );
         }
         self.event(format!("start-helper:{helper_port}"));
         Ok(())

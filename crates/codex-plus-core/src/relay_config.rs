@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use crate::settings::{
-    BackendSettings, RelayProfile, RelayProtocol, RelaySessionProvider,
-};
+use crate::settings::{BackendSettings, RelayProfile, RelayProtocol, RelaySessionProvider};
 
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
@@ -280,7 +278,7 @@ pub fn responses_proxy_configured_in_home(home: &Path) -> bool {
     provider_string_from_config(&contents, "base_url").as_deref()
         == Some(
             crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                crate::protocol_proxy::protocol_proxy_port(),
             )
             .as_str(),
         )
@@ -367,7 +365,7 @@ pub fn apply_relay_config_to_home(
         base_url,
         bearer_token,
         RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        crate::protocol_proxy::protocol_proxy_port(),
     )
 }
 
@@ -438,7 +436,7 @@ pub fn apply_pure_api_config_to_home(
         base_url,
         bearer_token,
         RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        crate::protocol_proxy::protocol_proxy_port(),
     )
 }
 
@@ -762,7 +760,7 @@ const OPENAI_BASE_URL_KEY: &str = "openai_base_url";
 
 fn managed_openai_base_url() -> String {
     crate::protocol_proxy::local_responses_proxy_base_url(
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        crate::protocol_proxy::protocol_proxy_port(),
     )
 }
 
@@ -829,6 +827,8 @@ pub fn clear_relay_config_to_home_with_auth(
         "OPENAI_API_KEY",
         "model_provider",
         "model_catalog_json",
+        "model_context_window",
+        "model_auto_compact_token_limit",
         "base_url",
         "experimental_bearer_token",
         "env_key",
@@ -923,7 +923,7 @@ pub fn backfill_relay_profile_from_home_with_common(
         && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
             == Some(
                 crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                    crate::protocol_proxy::protocol_proxy_port(),
                 )
                 .as_str(),
             )
@@ -1727,11 +1727,19 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
             merge_toml_item(&mut target_doc["desktop"], &live_desktop);
         }
     }
-    for key in ["sandbox_mode", "approval_policy", "sandbox_workspace_write"] {
+    // Windows 沙盒实现属于本机设置，切换模板时保留，避免重启后重新要求设置。
+    for key in [
+        "sandbox_mode",
+        "approval_policy",
+        "sandbox_workspace_write",
+        "windows",
+    ] {
         if let Some(live_value) = live_doc.get(key).cloned() {
             merge_toml_item(&mut target_doc[key], &live_value);
         }
     }
+    // Preserve user-managed feature flags such as multi_agent_v2 and memories.
+    preserve_missing_table_keys(&mut target_doc, &live_doc, "features");
     remove_unsupported_approval_policies(&mut target_doc);
     preserve_live_hook_state(&mut target_doc, &live_doc);
     let context_usage_configured = target_doc
@@ -1748,6 +1756,81 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
         }
     }
     Ok(normalize_optional_toml(target_doc))
+}
+
+fn preserve_missing_table_keys(
+    target_doc: &mut DocumentMut,
+    live_doc: &DocumentMut,
+    table_name: &str,
+) {
+    let Some(live_table) = live_doc.get(table_name).and_then(Item::as_table_like) else {
+        return;
+    };
+    if target_doc
+        .get(table_name)
+        .and_then(Item::as_table_like)
+        .is_none()
+    {
+        target_doc[table_name] = toml_edit::table();
+    }
+    let target_table = target_doc[table_name]
+        .as_table_like_mut()
+        .expect("table was initialized above");
+    for (key, value) in live_table.iter() {
+        if target_table.get(key).is_none() {
+            target_table.insert(key, value.clone());
+        }
+    }
+}
+
+/// Normal-user launches cannot complete the elevated native Windows sandbox
+/// setup. Downgrade only that case; an elevated process keeps the user's mode.
+pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Result<bool> {
+    if windows_process_is_elevated() {
+        return Ok(false);
+    }
+    let config_path = home.join("config.toml");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut doc = parse_toml_document(&existing)?;
+    let Some(windows) = doc.get_mut("windows").and_then(Item::as_table_mut) else {
+        return Ok(false);
+    };
+    let elevated = windows
+        .get("sandbox")
+        .and_then(Item::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("elevated"));
+    if !elevated {
+        return Ok(false);
+    }
+    windows["sandbox"] = toml_edit::value("unelevated");
+    crate::settings::atomic_write(&config_path, normalize_optional_toml(doc).as_bytes())?;
+    // 这是替用户改写了他的配置，留一条诊断记录，方便排障时回溯。
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.windows_sandbox_downgraded",
+        serde_json::json!({
+            "home": home.to_string_lossy(),
+            "from": "elevated",
+            "to": "unelevated",
+            "reason": "current process is not elevated; native sandbox setup would report updateRequired",
+        }),
+    );
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn windows_process_is_elevated() -> bool {
+    use windows::Win32::UI::Shell::IsUserAnAdmin;
+
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+
+#[cfg(not(windows))]
+fn windows_process_is_elevated() -> bool {
+    true
 }
 
 fn preserve_live_hook_state(target_doc: &mut DocumentMut, live_doc: &DocumentMut) {
@@ -1896,7 +1979,12 @@ fn apply_model_catalog_to_config(
         || entries
             .iter()
             .any(|entry| entry.suffix_window.is_some() || entry.auto_compact_percent.is_some());
-    let custom_responses = custom_responses_provider(&config_text);
+    // custom_responses_provider(&config_text) 读取的是生成后 config 里的 wire_api；
+    // 自对 Codex 恒写 "responses" 起，该信号已失真（chat 上游也会读到 responses）。
+    // catalog 是否按 Responses 语义生成取决于真实上游协议，只能由 profile.protocol 判定。
+    let custom_responses = profile.protocol == RelayProtocol::Responses
+        && active_provider_id(&parse_toml_document(&config_text)?)
+            .is_some_and(|provider_id| is_custom_provider_id(&provider_id));
     // Catalog capabilities must follow the effective config, not stale profile URLs.
     let official_deepseek_responses =
         uses_official_deepseek_responses_for_config(profile, &config_text);
@@ -1910,6 +1998,11 @@ fn apply_model_catalog_to_config(
             if is_codex_plus_managed_model_catalog(home, &existing)
                 || is_cc_switch_model_catalog(&existing)
             {
+                config_text = remove_root_key(&config_text, "model_catalog_json");
+            } else if model_catalog_pointer_has_unexpanded_variable(&existing) {
+                // `%userprofile%\.codex\codex-models.json` 这类指针 codex 不展开变量，
+                // 在任何机器上都读不到，留着会让 codex 拒绝加载整份 config.toml
+                // （#2123）。去掉它不会比现在更差——这份 catalog 反正从未生效过。
                 config_text = remove_root_key(&config_text, "model_catalog_json");
             } else {
                 if has_per_model_overrides {
@@ -1962,6 +2055,8 @@ fn apply_model_catalog_to_config(
         return Ok(normalize_optional_toml(doc));
     }
     // Known bundled metadata entries need a catalog even without a user-supplied window.
+    // 自定义 Responses provider 走 model_routes 时需要 catalog，才能给路由目标暴露模型元数据；
+    // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     if !has_metadata_overrides
         && !entries.iter().any(|entry| {
             entry.suffix_window.is_some()
@@ -1969,6 +2064,7 @@ fn apply_model_catalog_to_config(
                 || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
                 || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
         })
+        && !(custom_responses && profile.has_model_routes())
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json").as_deref()
@@ -2086,7 +2182,12 @@ fn apply_model_metadata_overrides(
             continue;
         };
         for (key, value) in user_override {
-            if matches!(key.as_str(), "slug" | "context_window" | "auto_compact_token_limit") {
+            // 窗口与压缩阈值由 model_windows / model_auto_compact 生成（issue #2191）；
+            // max_context_window 是 codex 运行时的 clamp 权威，绝不能被历史 metadata 残留值覆盖。
+            if matches!(
+                key.as_str(),
+                "slug" | "context_window" | "max_context_window" | "auto_compact_token_limit"
+            ) {
                 continue;
             }
             model_object.insert(key.clone(), value.clone());
@@ -2191,25 +2292,6 @@ fn uses_official_deepseek_responses_for_config(profile: &RelayProfile, config_te
     }
 
     uses_official_deepseek_responses(profile)
-}
-
-fn custom_responses_provider(config_text: &str) -> bool {
-    let Ok(doc) = parse_toml_document(config_text) else {
-        return false;
-    };
-    let Some(provider_id) = active_provider_id(&doc) else {
-        return false;
-    };
-    if !is_custom_provider_id(&provider_id) {
-        return false;
-    }
-    doc.get("model_providers")
-        .and_then(Item::as_table)
-        .and_then(|providers| providers.get(&provider_id))
-        .and_then(Item::as_table_like)
-        .and_then(|provider| provider.get("wire_api"))
-        .and_then(Item::as_str)
-        .is_some_and(|wire_api| wire_api.trim().eq_ignore_ascii_case("responses"))
 }
 
 fn copy_standard_responses_catalog(
@@ -2328,6 +2410,22 @@ fn sanitize_catalog_filename(id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// 这条 `model_catalog_json` 指针是否**在任何平台、任何机器上都打不开**。
+///
+/// codex 核心对读不到的 catalog 不是降级处理，而是直接拒绝加载**整份** config.toml
+/// （`os error 3`），用户侧表现为"无法加载 config.toml，因此此对话串无法继续"，
+/// 报错信息和真正的故障点毫无关系，极难自诊。所以这种指针绝不能落盘。
+///
+/// 这里只认定**未展开的 shell 变量**这一种形态：codex 自己不做变量展开，所以
+/// `%userprofile%\.codex\...` 在任何机器上都不存在，判定是确定的、不会误伤。
+/// 其余"文件恰好不存在"的路径不做处理——那可能是挂载盘未就绪、或用户自己
+/// 删掉了 catalog 但还想留着手改，按既有语义交给上层保护逻辑（#2123 建议的
+/// "保存前校验并提示"是另一个更大的改动，不在本次范围）。
+fn model_catalog_pointer_has_unexpanded_variable(pointer: &str) -> bool {
+    let pointer = pointer.trim();
+    !pointer.is_empty() && (pointer.contains('%') || pointer.contains('$'))
 }
 
 fn sync_context_limits_from_config(profile: &mut RelayProfile, config_text: &str) {
@@ -2776,7 +2874,7 @@ pub fn relay_profile_model(profile: &RelayProfile) -> String {
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     if profile.relay_mode == crate::settings::RelayMode::Aggregate {
         return crate::protocol_proxy::local_responses_proxy_base_url(
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::protocol_proxy::protocol_proxy_port(),
         );
     }
     if profile.has_model_routes() {
@@ -2786,7 +2884,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         if !profile.base_url.trim().is_empty()
             && profile.base_url.trim()
                 != crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                    crate::protocol_proxy::protocol_proxy_port(),
                 )
         {
             return profile.base_url.trim().to_string();
@@ -2811,7 +2909,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     if profile.protocol == RelayProtocol::ChatCompletions
         && provider_base_url
             == crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                crate::protocol_proxy::protocol_proxy_port(),
             )
     {
         String::new()
@@ -2911,14 +3009,11 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["name"] = toml_edit::value(transport_provider_id.as_str());
     }
-    if provider
-        .get("wire_api")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .is_none_or(str::is_empty)
-    {
-        provider["wire_api"] = toml_edit::value("responses");
-    }
+    // Codex 26.901 起不再支持 `wire_api = "chat"`（见 openai/codex discussion #7782），
+    // 一旦出现会导致整份 config.toml 被判为无效并回退内置默认模型。
+    // Chat Completions 上游由本地协议代理（protocol_proxy）负责 responses→chat 转换，
+    // 因此对 Codex 暴露的 wire_api 必须恒为 "responses"。
+    provider["wire_api"] = toml_edit::value("responses");
     if profile.relay_mode != crate::settings::RelayMode::PureApi
         && provider
             .get("requires_openai_auth")
@@ -2932,13 +3027,13 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     }
     let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
         crate::protocol_proxy::local_responses_proxy_base_url(
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::protocol_proxy::protocol_proxy_port(),
         )
     } else {
         codex_base_url_for_protocol(
             base_url.trim(),
             profile.protocol,
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::protocol_proxy::protocol_proxy_port(),
         )
     };
     if !provider_base_url.trim().is_empty() {
@@ -3468,7 +3563,9 @@ CODEX_HOME = \"/home/user/.codex\"
 ";
 
         let normalized = normalize_duplicate_toml_text(contents);
-        let doc = normalized.parse::<DocumentMut>().expect("must stay valid TOML");
+        let doc = normalized
+            .parse::<DocumentMut>()
+            .expect("must stay valid TOML");
 
         assert_eq!(
             doc["mcp_servers"]["node_repl"]["command"].as_str(),
@@ -3493,10 +3590,18 @@ cwd = \"/tmp\"
 ";
 
         let normalized = normalize_duplicate_toml_text(contents);
-        let doc = normalized.parse::<DocumentMut>().expect("must stay valid TOML");
+        let doc = normalized
+            .parse::<DocumentMut>()
+            .expect("must stay valid TOML");
 
-        assert_eq!(doc["mcp_servers"]["node_repl"]["command"].as_str(), Some("node"));
-        assert_eq!(doc["mcp_servers"]["node_repl"]["cwd"].as_str(), Some("/tmp"));
+        assert_eq!(
+            doc["mcp_servers"]["node_repl"]["command"].as_str(),
+            Some("node")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["node_repl"]["cwd"].as_str(),
+            Some("/tmp")
+        );
     }
 
     /// 重复根键：后写覆盖前写，与 TOML 对同名键重复赋值时的直觉一致。
@@ -3504,7 +3609,9 @@ cwd = \"/tmp\"
     fn normalize_duplicate_toml_text_later_root_key_wins() {
         let contents = "model = \"a\"\nmodel = \"b\"\n";
         let normalized = normalize_duplicate_toml_text(contents);
-        let doc = normalized.parse::<DocumentMut>().expect("must stay valid TOML");
+        let doc = normalized
+            .parse::<DocumentMut>()
+            .expect("must stay valid TOML");
         assert_eq!(doc["model"].as_str(), Some("b"));
     }
 

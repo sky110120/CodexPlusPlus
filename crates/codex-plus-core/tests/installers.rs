@@ -122,7 +122,8 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
     assert!(script.contains("hdiutil create -volname \"Codex++\" -srcfolder \"$STAGE\" -ov -format UDRW \"$DMG_WORK_PATH\""));
     assert!(script.contains("hdiutil attach \"$DMG_WORK_PATH\""));
     assert!(script.contains("osascript <<'APPLESCRIPT'"));
-    assert!(script.contains("hdiutil detach \"$MOUNT_POINT\""));
+    assert!(script.contains("detach_dmg \"$MOUNT_DEVICE\""));
+    assert!(script.contains("hdiutil detach \"$target\""));
     assert!(script.contains("hdiutil convert \"$DMG_WORK_PATH\" -format UDZO -ov -o \"$DMG\""));
     assert!(script.contains("MAX_ATTEMPTS=\"${DMG_CREATE_MAX_ATTEMPTS:-5}\""));
     assert!(script.contains("create_dmg_work_image()"));

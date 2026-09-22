@@ -409,6 +409,8 @@ body {
   background: hsl(var(--shell-bg));
   animation: topbar-enter var(--motion-normal) var(--motion-ease) both;
 }
+/* 注意：下面是 .topbar 的第二处定义，会覆盖上面这条（同优先级、源码更靠后）。
+   两处并存是历史遗留，实际生效的是下面那条 grid 布局。 */
 
 .topbar h1 {
   margin: 0;
@@ -423,6 +425,7 @@ body {
 .topbar-actions {
   display: flex;
   gap: 8px;
+  flex: 0 0 auto;
 }
 
 .screen {
@@ -549,6 +552,43 @@ body {
   color: hsl(var(--brand-accent));
 }
 
+/* 概览的置顶推荐位。
+   卡片内部沿用 .jojocode-overview-layout 的「左信息 / 右标签区」结构。 */
+.sponsor-board {
+  display: grid;
+  gap: 12px;
+}
+
+.sponsor-board > .panel {
+  min-width: 0;
+}
+
+/* 窄屏时「左信息 / 右标签区」并排会挤，改成上下排。 */
+@media (max-width: 1100px) {
+  .jojocode-overview-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .jojocode-overview-side {
+    justify-items: start;
+  }
+
+  .jojocode-model-tags {
+    justify-content: flex-start;
+    max-width: none;
+  }
+}
+
+/* 赞助商自带 logo 时用它替换默认的 Network 图标，尺寸对齐避免布局跳动。 */
+.sponsor-logo {
+  width: 42px;
+  height: 42px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  object-fit: contain;
+}
+
 .jojocode-overview h2 {
   margin: 2px 0 4px;
   font-size: 20px;
@@ -572,7 +612,7 @@ body {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
-  max-width: 390px;
+  max-width: 460px;
 }
 
 .jojocode-model-tags span {
@@ -3286,16 +3326,17 @@ body {
 
 .ad-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 10px;
+  align-items: start;
 }
 
 .ad-card {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto auto auto;
   gap: 10px;
-  align-content: space-between;
-  min-height: 280px;
+  /* 不再用固定 min-height + space-between：内容多的卡片会被压扁，
+     内容少的则留一大片空白。让每张卡按自己的内容撑开。 */
   width: 100%;
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
@@ -3334,18 +3375,12 @@ body {
   display: block;
   margin-bottom: 5px;
   font-size: 15px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
 }
 
 .ad-card p {
-  display: -webkit-box;
   margin: 0;
-  overflow: hidden;
   color: hsl(var(--muted-foreground));
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
   line-height: 1.5;
 }
 
@@ -3353,8 +3388,6 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  max-height: 54px;
-  overflow: hidden;
 }
 
 .ad-tags span {
@@ -5379,6 +5412,18 @@ select {
   animation-duration: 150ms;
 }
 
+/* 顶栏两栏：标题｜右侧操作。
+   工具切换条已经移到侧栏，这里不再需要给中间留位置。 */
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+.topbar > :first-child {
+  min-width: 0;
+}
+
 .topbar h1 {
   font-size: 17px;
   font-weight: 620;
@@ -5398,9 +5443,219 @@ select {
   max-width: 620px;
 }
 
-.topbar-actions {
+/* ── 工具切换条（侧栏内） ───────────────────────────────────── */
+/* 放在品牌区下方、导航之上：切换的是「整个控制台在看哪个工具」，
+   放在侧栏比放在顶栏更贴合它的语义，也不会随页面标题宽度漂移。 */
+
+.tool-switcher {
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 4px;
+  border: 1px solid hsl(var(--sidebar-border));
+  border-radius: 10px;
+  background: hsl(var(--background) / 0.45);
+}
+
+.tool-chip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   gap: 6px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.tool-chip:hover:not(:disabled) {
+  background: hsl(var(--accent) / 0.6);
+  color: hsl(var(--foreground));
+}
+
+.tool-chip.active {
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--primary) / 0.16);
+  color: hsl(var(--foreground));
+}
+
+.tool-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.tool-chip-icon {
+  width: 15px;
+  height: 15px;
   flex: 0 0 auto;
+}
+
+.tool-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-chip-note {
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: hsl(var(--muted) / 0.8);
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+}
+
+/* ── Grok 供应商页 ──────────────────────────────────────────── */
+
+/* `.panel-head` 默认是 title 左、detail 右的横排；Grok 这两块说明文字长，
+   挤在右边缘会连成一片。这里让它们上下排。 */
+.grok-panel .panel-head {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.grok-panel .panel-head p {
+  line-height: 1.5;
+}
+
+.grok-empty {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 18px 16px;
+  border: 1px dashed hsl(var(--border));
+  border-radius: 10px;
+  color: hsl(var(--muted-foreground));
+}
+
+.grok-empty strong {
+  display: block;
+  margin-bottom: 3px;
+  color: hsl(var(--foreground));
+  font-size: 13.5px;
+}
+
+.grok-empty span {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.grok-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.grok-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--background) / 0.5);
+}
+
+.grok-provider-row.active {
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--primary) / 0.1);
+}
+
+.grok-provider-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.grok-provider-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.grok-provider-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: hsl(var(--primary) / 0.2);
+  color: hsl(var(--primary-foreground));
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
+.grok-provider-url,
+.grok-provider-models {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grok-provider-models {
+  flex: 0 0 auto;
+}
+
+.grok-provider-editor {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.grok-live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.grok-live-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border) / 0.7);
+  border-radius: 8px;
+  background: hsl(var(--background) / 0.5);
+}
+
+.grok-live-label {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.grok-live-value {
+  font-size: 12.5px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.topbar-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
 }
 
 .screen {

@@ -10,8 +10,8 @@ use codex_plus_core::protocol_proxy::{
     open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_for_path, responses_compact_url,
     responses_error_from_upstream, responses_to_chat_completions,
-    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
-    upstream_stream_header_timeout,
+    responses_to_chat_completions_with_options, send_upstream_request_with_header_timeout,
+    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
 };
 use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::settings::{
@@ -309,9 +309,18 @@ fn responses_request_maps_kimi_coding_reasoning_effort_per_official_spec() {
             "input": "hi"
         }))
         .unwrap();
-        assert_eq!(converted["thinking"]["type"], "enabled", "{effort}");
+        assert_eq!(converted["thinking"]["type"], "adaptive", "{effort}");
         assert_eq!(converted["reasoning_effort"], expected, "{effort}");
     }
+
+    let kimi_k3 = responses_to_chat_completions(json!({
+        "model": "kimi-k3",
+        "reasoning": { "effort": "xhigh" },
+        "input": "hi"
+    }))
+    .unwrap();
+    assert_eq!(kimi_k3["thinking"]["type"], "adaptive");
+    assert_eq!(kimi_k3["reasoning_effort"], "max");
 
     let k2_coding = responses_to_chat_completions(json!({
         "model": "kimi-for-coding",
@@ -330,6 +339,96 @@ fn responses_request_maps_kimi_coding_reasoning_effort_per_official_spec() {
     .unwrap();
     assert_eq!(off["thinking"]["type"], "disabled");
     assert!(off.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn responses_request_standard_protocol_strips_vendor_reasoning_dialects() {
+    // standard=true 时强制走默认风格：厂商方言字段（reasoning_split / thinking /
+    // enable_thinking / openrouter reasoning）一律不注入，而标准 reasoning_effort 仍按
+    // 模型能力正常注入。面向 NVIDIA 等只认标准 OpenAI 协议、却拒绝 MiniMax 私有
+    // reasoning_split 参数的第三方网关。
+    let minimax = responses_to_chat_completions_with_options(
+        json!({
+            "model": "MiniMax-M2.7",
+            "reasoning": { "effort": "high" },
+            "input": "hi"
+        }),
+        true,
+    )
+    .unwrap();
+    assert!(minimax.get("reasoning_split").is_none());
+    assert!(minimax.get("thinking").is_none());
+    assert!(minimax.get("enable_thinking").is_none());
+    assert!(minimax.get("reasoning_effort").is_none());
+
+    let glm = responses_to_chat_completions_with_options(
+        json!({
+            "model": "glm-4.6",
+            "reasoning": { "effort": "high" },
+            "input": "hi"
+        }),
+        true,
+    )
+    .unwrap();
+    assert!(glm.get("thinking").is_none());
+    assert!(glm.get("reasoning_effort").is_none());
+
+    let qwen = responses_to_chat_completions_with_options(
+        json!({
+            "model": "qwen3-235b-a22b",
+            "reasoning": { "effort": "high" },
+            "input": "hi"
+        }),
+        true,
+    )
+    .unwrap();
+    assert!(qwen.get("enable_thinking").is_none());
+    assert!(qwen.get("reasoning_effort").is_none());
+
+    let openrouter = responses_to_chat_completions_with_options(
+        json!({
+            "model": "openrouter/deepseek/deepseek-r1",
+            "reasoning": { "effort": "max" },
+            "input": "hi"
+        }),
+        true,
+    )
+    .unwrap();
+    assert!(openrouter.get("reasoning").is_none());
+    assert!(openrouter.get("reasoning_effort").is_none());
+
+    // 标准协议下，支持推理强度控制的模型仍保留 reasoning_effort。
+    let deepseek = responses_to_chat_completions_with_options(
+        json!({
+            "model": "deepseek-reasoner",
+            "reasoning": { "effort": "xhigh" },
+            "input": "hi"
+        }),
+        true,
+    )
+    .unwrap();
+    assert_eq!(deepseek["reasoning_effort"], "xhigh");
+    assert!(deepseek.get("reasoning_split").is_none());
+
+    let gpt5 = responses_to_chat_completions_with_options(
+        json!({
+            "model": "gpt-5.4",
+            "reasoning": { "effort": "high" },
+            "input": "hi"
+        }),
+        true,
+    )
+    .unwrap();
+    assert_eq!(gpt5["reasoning_effort"], "high");
+
+    // 回归守护：默认路径仍照常注入方言字段。
+    let minimax_default = responses_to_chat_completions(json!({
+        "model": "MiniMax-M2.7",
+        "reasoning": { "effort": "high" },
+        "input": "hi"
+    }))
+    .unwrap();
+    assert_eq!(minimax_default["reasoning_split"], true);
 }
 
 #[test]
@@ -3534,4 +3633,141 @@ fn empty_image_url_is_dropped_rather_than_forwarded() {
     let messages = converted["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[2]["role"], "tool");
+}
+
+/// Codex 的 Responses 协议按 item 的 `type` 校验 `id` 前缀，不匹配就用
+/// `[ApiIdParam] [input[N].id] [invalid_id_prefix]` 拒掉整份请求。
+/// 这些前缀取自真实 rollout（`~/.codex/sessions/**/rollout-*.jsonl`）。
+#[test]
+fn responses_request_item_ids_always_match_their_type_prefix() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            // 故意给出各种错误前缀：历史会话里真实出现过的几种
+            { "type": "message", "id": "resp_019fbda4-558a_msg", "role": "user", "content": "hi" },
+            { "type": "reasoning", "id": "06b2506d2a33704f5737670841d1a928_rs", "summary": [] },
+            { "type": "function_call", "id": "item_c270d5511c7129adc7475632", "call_id": "call_a", "name": "wait", "arguments": "{}" },
+            { "type": "function_call_output", "id": "fc_call_a", "call_id": "call_a", "output": "ok" },
+            { "type": "custom_tool_call", "id": "fc_call_b", "call_id": "call_b", "name": "exec", "input": "{}" }
+        ]
+    }))
+    .unwrap();
+
+    // Chat Completions 转换会丢掉 id，所以这里只能验证转换没有因此崩掉；
+    // 前缀归一的真正断言在下面的 Responses 直连用例里。
+    assert!(converted["messages"].is_array());
+}
+
+/// 前缀归一是 Responses 出站路径的职责，直接用内部函数验证，
+/// 因为 `upstream_request_parts` 需要真实网络。
+#[test]
+fn responses_item_id_normalization_repairs_legacy_prefixes() {
+    use codex_plus_core::protocol_proxy::normalize_responses_item_ids_for_test;
+
+    let mut body = json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            { "type": "message", "id": "resp_019fbda4-558a_msg", "role": "user", "content": "hi" },
+            { "type": "message", "id": "msg_01a03855-357e-7b40-a", "role": "assistant", "content": "ok" },
+            { "type": "reasoning", "id": "06b2506d2a33704f5737670841d1a928_rs", "summary": [] },
+            { "type": "reasoning", "id": "rs_0ded2efd183d1065", "summary": [] },
+            { "type": "function_call", "id": "item_c270d5511c7129adc7475632", "call_id": "call_a", "name": "wait", "arguments": "{}" },
+            { "type": "function_call_output", "id": "fc_call_a", "call_id": "call_a", "output": "ok" },
+            { "type": "custom_tool_call", "id": "fc_call_b", "call_id": "call_b", "name": "exec", "input": "{}" },
+            { "type": "custom_tool_call_output", "id": "ctc_call_b", "call_id": "call_b", "output": "ok" },
+            { "type": "agent_message", "id": "whatever_external", "content": "x" }
+        ]
+    });
+    normalize_responses_item_ids_for_test(&mut body);
+
+    let ids: Vec<&str> = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(ids[0], "msg_019fbda4-558a_msg");
+    assert_eq!(ids[1], "msg_01a03855-357e-7b40-a", "已正确的前缀不该被改动");
+    assert_eq!(ids[2], "rs_06b2506d2a33704f5737670841d1a928_rs");
+    assert_eq!(ids[3], "rs_0ded2efd183d1065");
+    assert_eq!(ids[4], "fc_c270d5511c7129adc7475632");
+    assert_eq!(ids[5], "fco_call_a", "fco 不能被剥成 fc_");
+    assert_eq!(
+        ids[6], "ctc_call_b",
+        "fc_ 要剥掉再换成 ctc_，不能叠成 fc_ctc_"
+    );
+    assert_eq!(ids[7], "ctco_call_b");
+    assert_eq!(ids[8], "whatever_external", "未知类型必须原样通过");
+}
+
+/// id 恰好等于某个前缀时，剥完是空串，应退回 call_id 而不是产出裸前缀。
+#[test]
+fn responses_item_id_normalization_falls_back_to_call_id() {
+    use codex_plus_core::protocol_proxy::normalize_responses_item_ids_for_test;
+
+    let mut body = json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            { "type": "function_call", "id": "fc_", "call_id": "call_a", "name": "wait", "arguments": "{}" }
+        ]
+    });
+    normalize_responses_item_ids_for_test(&mut body);
+    assert_eq!(body["input"][0]["id"], "fc_call_a");
+}
+
+/// #1431 / #1781：流式转换曾把 message item 命名为 `{response_id}_msg`，
+/// 而 response_id 以 `resp_` 开头，于是产出 `resp_xxx_msg`。
+/// 这个 id 会写进 rollout，切回官方 provider 后重放时被拒（invalid_id_prefix）。
+#[test]
+fn streamed_message_item_id_uses_msg_prefix() {
+    let converted = chat_sse_to_responses_sse(
+        r#"data: {"id":"chatcmpl_abc","model":"gpt-5.4","choices":[{"delta":{"content":"hi"}}]}
+
+data: {"id":"chatcmpl_abc","model":"gpt-5.4","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+    );
+
+    assert!(
+        !converted.contains("_msg\""),
+        "message item id 不能再以 _msg 结尾：{converted}"
+    );
+    for line in converted.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if let Some(item) = event.get("item")
+            && item.get("type").and_then(Value::as_str) == Some("message")
+            && let Some(id) = item.get("id").and_then(Value::as_str)
+        {
+            assert!(
+                id.starts_with("msg_"),
+                "message item id 必须是 msg_ 前缀，实际 {id}"
+            );
+        }
+    }
+}
+
+/// 非流式路径（chat completions → responses）同样不能产出 `resp_*_msg`。
+#[test]
+fn converted_message_item_id_uses_msg_prefix() {
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_abc",
+        "model": "gpt-5.4",
+        "choices": [{ "message": { "role": "assistant", "content": "hi" } }]
+    }))
+    .unwrap();
+
+    let id = converted["output"][0]["id"].as_str().unwrap();
+    assert!(
+        id.starts_with("msg_"),
+        "message item id 必须是 msg_ 前缀，实际 {id}"
+    );
+    assert!(!id.ends_with("_msg"), "不能是 resp_*_msg 形态，实际 {id}");
 }

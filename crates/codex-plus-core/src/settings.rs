@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -8,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item};
 
+use crate::tools::{ToolConfig, ToolId};
 use crate::zed_remote::ZedOpenStrategy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -16,6 +19,10 @@ pub enum LaunchMode {
     #[default]
     Patch,
     Relay,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -110,6 +117,9 @@ pub struct RelayProfile {
     pub sub2api_multiplier: String,
     #[serde(rename = "modelRoutes", default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<RelayModelRoute>,
+    // 上游审查要求：导出 round-trip 不改变既有 provider；为 false 时不写出该字段。
+    #[serde(rename = "standardOpenaiProtocol", default, skip_serializing_if = "is_false")]
+    pub standard_openai_protocol: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -224,6 +234,7 @@ impl Default for RelayProfile {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            standard_openai_protocol: false,
         }
     }
 }
@@ -441,6 +452,8 @@ pub struct BackendSettings {
     pub codex_app_native_menu_placement: bool,
     #[serde(rename = "codexAppNativeMenuLocalization", default = "default_true")]
     pub codex_app_native_menu_localization: bool,
+    #[serde(rename = "codexAppNativeBrowserRequireIdentification", default)]
+    pub codex_app_native_browser_require_identification: bool,
     #[serde(rename = "codexAppServiceTierControls", default)]
     pub codex_app_service_tier_controls: bool,
     #[serde(rename = "codexAppPetRealMouseLook", default)]
@@ -577,6 +590,13 @@ pub struct BackendSettings {
     pub active_aggregate_relay_id: String,
     #[serde(rename = "relayTestModel", default = "default_relay_test_model")]
     pub relay_test_model: String,
+    /// 按工具分区的配置。`tools.codex` 是上面那批扁平字段的镜像（写盘时同步），
+    /// 其它工具（Grok / 后续工具）只存在这里。见 `crate::tools`。
+    #[serde(rename = "tools", default)]
+    pub tools: BTreeMap<ToolId, ToolConfig>,
+    /// UI 顶栏当前聚焦的工具。只影响管理器的展示，不影响 Codex 的启动配置。
+    #[serde(rename = "activeTool", default)]
+    pub active_tool: ToolId,
 }
 
 impl Default for BackendSettings {
@@ -608,6 +628,7 @@ impl Default for BackendSettings {
             codex_app_upstream_worktree_create: true,
             codex_app_native_menu_placement: true,
             codex_app_native_menu_localization: true,
+            codex_app_native_browser_require_identification: false,
             codex_app_service_tier_controls: false,
             codex_app_pet_real_mouse_look: false,
             codex_app_stepwise_enabled: false,
@@ -653,6 +674,8 @@ impl Default for BackendSettings {
             aggregate_relay_profiles: Vec::new(),
             active_aggregate_relay_id: String::new(),
             relay_test_model: default_relay_test_model(),
+            tools: BTreeMap::new(),
+            active_tool: ToolId::Codex,
         }
     }
 }
@@ -703,6 +726,7 @@ impl BackendSettings {
                 sub2api_enabled: false,
                 sub2api_multiplier: String::new(),
                 model_routes: Vec::new(),
+                standard_openai_protocol: false,
             };
         }
 
@@ -757,6 +781,7 @@ impl BackendSettings {
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
+            standard_openai_protocol: false,
         }
     }
 
@@ -1160,7 +1185,9 @@ impl SettingsStore {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BackendSettings::default());
+                let mut settings = BackendSettings::default();
+                settings.sync_tool_shards();
+                return Ok(settings);
             }
             Err(error) => {
                 return Err(error)
@@ -1175,9 +1202,8 @@ impl SettingsStore {
 
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {
         self.with_exclusive_lock(|| {
-            let mut settings = normalize_settings_config_sections(settings.clone());
-            settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
-            let bytes = serde_json::to_vec_pretty(&settings)?;
+            let settings = normalize_settings_for_save(settings.clone());
+            let bytes = serde_json::to_vec_pretty(&settings_value_for_merge(&settings)?)?;
             atomic_write(&self.path, &bytes)
         })
     }
@@ -1187,57 +1213,146 @@ impl SettingsStore {
         base: &BackendSettings,
         desired: &BackendSettings,
     ) -> anyhow::Result<()> {
-        let mut base = normalize_settings_config_sections(base.clone());
-        base.codex_extra_args = normalize_codex_extra_args(&base.codex_extra_args);
-        let mut desired = normalize_settings_config_sections(desired.clone());
-        desired.codex_extra_args = normalize_codex_extra_args(&desired.codex_extra_args);
-        let base = serde_json::to_value(base)?;
-        let desired = serde_json::to_value(desired)?;
-        let patch = settings_snapshot_diff(&base, &desired);
+        self.save_with_effects(base.into(), desired, |_, _| Ok(()), |_, _| Ok(()))
+            .map(|_| ())
+    }
+
+    /// Save a full or snapshot-merged settings update while exposing the exact
+    /// previous/effective values under the same settings-file lock. Both
+    /// callbacks run while that lock is held and must not recursively call a
+    /// settings write API on this store.
+    pub fn save_with_effects<Before, Rollback>(
+        &self,
+        base: Option<&BackendSettings>,
+        desired: &BackendSettings,
+        before_write: Before,
+        on_write_error: Rollback,
+    ) -> anyhow::Result<BackendSettings>
+    where
+        Before: FnOnce(&BackendSettings, &BackendSettings) -> anyhow::Result<()>,
+        Rollback: FnOnce(&BackendSettings, &BackendSettings) -> anyhow::Result<()>,
+    {
+        let desired = normalize_settings_for_save(desired.clone());
+        let desired_value = settings_value_for_merge(&desired)?;
+        let patch = if let Some(base) = base {
+            let base = normalize_settings_for_save(base.clone());
+            settings_snapshot_diff(&settings_value_for_merge(&base)?, &desired_value)
+        } else {
+            desired_value
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+        };
 
         self.with_exclusive_lock(|| {
-            let mut raw = self.load_raw_object()?;
-            merge_known_setting_fields(&mut raw, &patch);
-            let settings = serde_json::from_value(Value::Object(raw.clone()))
+            let current_raw = self.load_raw_object()?;
+            let previous = serde_json::from_value::<BackendSettings>(Value::Object(current_raw.clone()))
+                .with_context(|| format!("failed to parse settings {}", self.path.display()))
+                .map(normalize_settings_config_sections)?;
+            let mut raw = if base.is_some() {
+                let mut raw = current_raw;
+                merge_known_setting_fields(&mut raw, &patch);
+                raw
+            } else {
+                desired_value
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let effective = serde_json::from_value(Value::Object(raw.clone()))
                 .with_context(|| format!("failed to parse settings {}", self.path.display()))?;
-            let settings = normalize_settings_config_sections(settings);
-            raw.insert(
-                "relayCommonConfigContents".to_string(),
-                Value::String(settings.relay_common_config_contents.clone()),
-            );
-            raw.insert(
-                "relayContextConfigContents".to_string(),
-                Value::String(settings.relay_context_config_contents.clone()),
-            );
-            let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
-            atomic_write(&self.path, &bytes)?;
-            Ok(())
+            let effective = normalize_settings_config_sections(effective);
+            insert_normalized_settings_fields(&mut raw, &effective)?;
+            if let Err(error) = before_write(&previous, &effective) {
+                return match on_write_error(&previous, &effective) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "{error}; settings side-effect rollback failed: {rollback_error}"
+                    )),
+                };
+            }
+            let bytes = match serde_json::to_vec_pretty(&Value::Object(raw)) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return match on_write_error(&previous, &effective) {
+                        Ok(()) => Err(error.into()),
+                        Err(rollback_error) => Err(anyhow::anyhow!(
+                            "{error}; settings side-effect rollback failed: {rollback_error}"
+                        )),
+                    };
+                }
+            };
+            if let Err(error) = atomic_write(&self.path, &bytes) {
+                return match on_write_error(&previous, &effective) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "{error}; settings side-effect rollback failed: {rollback_error}"
+                    )),
+                };
+            }
+            Ok(effective)
         })
     }
 
-    pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
+    /// Both callbacks run while the settings-file lock is held; they must not
+    /// recursively call a settings write API on this store.
+    pub fn update_with_effects<Before, Rollback>(
+        &self,
+        payload: Value,
+        before_write: Before,
+        on_write_error: Rollback,
+    ) -> anyhow::Result<BackendSettings>
+    where
+        Before: FnOnce(&BackendSettings, &BackendSettings) -> anyhow::Result<()>,
+        Rollback: FnOnce(&BackendSettings, &BackendSettings) -> anyhow::Result<()>,
+    {
         let Value::Object(payload) = payload else {
             return self.load();
         };
 
         self.with_exclusive_lock(|| {
             let mut raw = self.load_raw_object()?;
+            let previous = serde_json::from_value::<BackendSettings>(Value::Object(raw.clone()))
+                .with_context(|| format!("failed to parse settings {}", self.path.display()))
+                .map(normalize_settings_config_sections)?;
             merge_known_setting_fields(&mut raw, &payload);
-            let settings = serde_json::from_value(Value::Object(raw.clone()))
+            let effective = serde_json::from_value(Value::Object(raw.clone()))
                 .with_context(|| format!("failed to parse settings {}", self.path.display()))?;
-            let settings = normalize_settings_config_sections(settings);
-            raw.insert(
-                "relayCommonConfigContents".to_string(),
-                Value::String(settings.relay_common_config_contents.clone()),
-            );
-            raw.insert(
-                "relayContextConfigContents".to_string(),
-                Value::String(settings.relay_context_config_contents.clone()),
-            );
-            let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
-            atomic_write(&self.path, &bytes)?;
-            Ok(settings)
+            let effective = normalize_settings_config_sections(effective);
+            insert_normalized_settings_fields(&mut raw, &effective)?;
+            if let Err(error) = before_write(&previous, &effective) {
+                return match on_write_error(&previous, &effective) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "{error}; settings side-effect rollback failed: {rollback_error}"
+                    )),
+                };
+            }
+            let bytes = match serde_json::to_vec_pretty(&Value::Object(raw)) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return match on_write_error(&previous, &effective) {
+                        Ok(()) => Err(error.into()),
+                        Err(rollback_error) => Err(anyhow::anyhow!(
+                            "{error}; settings side-effect rollback failed: {rollback_error}"
+                        )),
+                    };
+                }
+            };
+            if let Err(error) = atomic_write(&self.path, &bytes) {
+                return match on_write_error(&previous, &effective) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "{error}; settings side-effect rollback failed: {rollback_error}"
+                    )),
+                };
+            }
+            Ok(effective)
         })
+    }
+
+    pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
+        self.update_with_effects(payload, |_, _| Ok(()), |_, _| Ok(()))
     }
 
     fn load_raw_object(&self) -> anyhow::Result<Map<String, Value>> {
@@ -1282,6 +1397,65 @@ impl SettingsStore {
     }
 }
 
+fn normalize_settings_for_save(mut settings: BackendSettings) -> BackendSettings {
+    settings = normalize_settings_config_sections(settings);
+    settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
+    settings
+}
+
+fn settings_value_for_merge(settings: &BackendSettings) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(settings)?;
+    let Some(profiles) = value
+        .get_mut("tools")
+        .and_then(Value::as_object_mut)
+        .and_then(|tools| tools.get_mut("grok"))
+        .and_then(Value::as_object_mut)
+        .and_then(|grok| grok.get_mut("relayProfiles"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(value);
+    };
+    if let Some(grok) = settings.tools.get(&ToolId::Grok) {
+        for (serialized, profile) in profiles.iter_mut().zip(&grok.relay_profiles) {
+            if let Value::Object(serialized) = serialized {
+                serialized.insert("apiKey".to_string(), Value::String(profile.api_key.clone()));
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn insert_normalized_settings_fields(
+    raw: &mut Map<String, Value>,
+    settings: &BackendSettings,
+) -> anyhow::Result<()> {
+    raw.insert(
+        "relayCommonConfigContents".to_string(),
+        Value::String(settings.relay_common_config_contents.clone()),
+    );
+    raw.insert(
+        "relayContextConfigContents".to_string(),
+        Value::String(settings.relay_context_config_contents.clone()),
+    );
+    sync_codex_tool_shard_in_raw(raw, settings)
+}
+
+fn sync_codex_tool_shard_in_raw(
+    raw: &mut Map<String, Value>,
+    settings: &BackendSettings,
+) -> anyhow::Result<()> {
+    let tools = raw
+        .entry("tools".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(tools) = tools {
+        tools.insert(
+            "codex".to_string(),
+            serde_json::to_value(settings.tool_config(&ToolId::Codex))?,
+        );
+    }
+    Ok(())
+}
+
 fn finish_locked_action<T>(
     action_result: anyhow::Result<T>,
     _unlock_result: std::io::Result<()>,
@@ -1301,7 +1475,39 @@ fn settings_snapshot_diff(base: &Value, desired: &Value) -> Map<String, Value> {
         return patch;
     };
     desired.iter().for_each(|(key, value)| {
-        if base.get(key) != Some(value) {
+        if key == "tools" {
+            let Some(base_tools) = base.get(key) else {
+                return;
+            };
+            let (Some(base_tools), Some(desired_tools)) =
+                (base_tools.as_object(), value.as_object())
+            else {
+                return;
+            };
+            let mut tools_patch = Map::new();
+            for (tool_id, desired_shard) in desired_tools {
+                if base_tools.get(tool_id) == Some(desired_shard) {
+                    continue;
+                }
+                let shard_patch = match (base_tools.get(tool_id), desired_shard) {
+                    (Some(Value::Object(base_shard)), Value::Object(desired_shard)) => {
+                        desired_shard
+                            .iter()
+                            .filter(|(field, value)| base_shard.get(*field) != Some(*value))
+                            .map(|(field, value)| (field.clone(), value.clone()))
+                            .collect::<Map<_, _>>()
+                    }
+                    (_, Value::Object(desired_shard)) => desired_shard.clone(),
+                    _ => Map::new(),
+                };
+                if !shard_patch.is_empty() {
+                    tools_patch.insert(tool_id.clone(), Value::Object(shard_patch));
+                }
+            }
+            if !tools_patch.is_empty() {
+                patch.insert(key.clone(), Value::Object(tools_patch));
+            }
+        } else if base.get(key) != Some(value) {
             patch.insert(key.clone(), value.clone());
         }
     });
@@ -1311,6 +1517,7 @@ fn settings_snapshot_diff(base: &Value, desired: &Value) -> Map<String, Value> {
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
     target.remove("codexAppPluginAutoExpand");
     target.remove("computerUseGuardEnabled");
+    merge_tool_shard_fields(target, source);
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
         target.insert("codexAppPath".to_string(), Value::String(value.to_string()));
     }
@@ -1366,6 +1573,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppUpstreamWorktreeCreate");
     merge_bool_setting(target, source, "codexAppNativeMenuPlacement");
     merge_bool_setting(target, source, "codexAppNativeMenuLocalization");
+    merge_bool_setting(target, source, "codexAppNativeBrowserRequireIdentification");
     merge_bool_setting(target, source, "codexAppServiceTierControls");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
     merge_bool_setting(target, source, "codexAppStepwiseEnabled");
@@ -1605,6 +1813,52 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             }),
         );
     }
+    if let Some(value) = source.get("activeTool").and_then(Value::as_str) {
+        target.insert(
+            "activeTool".to_string(),
+            Value::String(ToolId::parse(value).as_str().to_string()),
+        );
+    }
+}
+
+fn merge_tool_shard_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    let Some(Value::Object(source_tools)) = source.get("tools") else {
+        return;
+    };
+    if !matches!(target.get("tools"), Some(Value::Object(_))) {
+        target.insert("tools".to_string(), Value::Object(Map::new()));
+    }
+    let Some(Value::Object(target_tools)) = target.get_mut("tools") else {
+        return;
+    };
+    merge_tool_shard_fields_into(target_tools, source_tools);
+}
+
+fn merge_tool_shard_fields_into(
+    target_tools: &mut Map<String, Value>,
+    source_tools: &Map<String, Value>,
+) {
+    for (tool_id, source_shard) in source_tools {
+        // Codex's flat fields are the only source of truth. Its shard is
+        // regenerated after the merge from those fields.
+        if tool_id == "codex" {
+            continue;
+        }
+        let Value::Object(source_shard) = source_shard else {
+            continue;
+        };
+        let target_shard = target_tools
+            .entry(tool_id.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !target_shard.is_object() {
+            *target_shard = Value::Object(Map::new());
+        }
+        if let Value::Object(target_shard) = target_shard {
+            for (field, value) in source_shard {
+                target_shard.insert(field.clone(), value.clone());
+            }
+        }
+    }
 }
 
 fn merge_bool_setting(target: &mut Map<String, Value>, source: &Map<String, Value>, key: &str) {
@@ -1795,6 +2049,10 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_stepwise_max_output_tokens(settings.codex_app_stepwise_max_output_tokens);
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
+    // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
+    // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
+    // 都会经过，两边不会漂移。
+    settings.sync_tool_shards();
     settings
 }
 
@@ -1847,14 +2105,44 @@ fn normalize_text_config(contents: String) -> String {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with(path, |file| file.write_all(bytes))
+}
+
+/// 流式原子写入：内容由 `write_contents` 直接写进临时文件，调用方不必先把
+/// 完整字节拼在内存里。大文件（如历史会话的 rollout JSONL）走这条路径。
+pub fn atomic_write_with(
+    path: &Path,
+    write_contents: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
+    // 保留原文件权限：临时文件默认权限不一定和它一致。
+    let existing_permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read permissions for {}", path.display()));
+        }
+    };
     let temp_path = temp_path_for(path);
-    fs::write(&temp_path, bytes)
-        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut temp_file = File::create(&temp_path)?;
+        write_contents(&mut temp_file)?;
+        temp_file.flush()?;
+        if let Some(permissions) = existing_permissions {
+            temp_file.set_permissions(permissions)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error)
+            .with_context(|| format!("failed to write temp file {}", temp_path.display()));
+    }
     if let Err(error) = replace_file(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error).with_context(|| {
@@ -2561,12 +2849,19 @@ experimental_bearer_token = "sk-existing""#
         assert!(!profile.auth_contents.contains("OPENAI_API_KEY"));
     }
 
+    fn normalized_default_settings() -> BackendSettings {
+        // Keep expected values independent of the production normalizer.
+        let mut expected = BackendSettings::default();
+        expected.tools.insert(ToolId::Codex, ToolConfig::default());
+        expected
+    }
+
     #[test]
     fn settings_store_load_missing_file_returns_default() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
 
-        assert_eq!(store.load().unwrap(), BackendSettings::default());
+        assert_eq!(store.load().unwrap(), normalized_default_settings());
     }
 
     #[test]
@@ -2592,7 +2887,9 @@ experimental_bearer_token = "sk-existing""#
 
         store.save(&settings).unwrap();
 
-        assert_eq!(store.load().unwrap(), settings);
+        let mut expected = settings;
+        expected.tools.insert(ToolId::Codex, ToolConfig::default());
+        assert_eq!(store.load().unwrap(), expected);
     }
 
     #[test]
@@ -2616,6 +2913,103 @@ experimental_bearer_token = "sk-existing""#
         let saved = store.load().unwrap();
         assert!(saved.provider_sync_enabled);
         assert!(saved.codex_app_thread_id_badge);
+    }
+
+    #[test]
+    fn settings_store_effective_save_preserves_concurrent_fields_for_unrelated_patch() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let base = BackendSettings {
+            active_tool: ToolId::Codex,
+            weixin_connect_codex_path: "/old/codex".to_string(),
+            ..BackendSettings::default()
+        };
+        store.save(&base).unwrap();
+        store
+            .update(json!({
+                "weixinConnectCodexPath": "/new/codex",
+                "codexAppThreadIdBadge": true
+            }))
+            .unwrap();
+
+        let desired = BackendSettings {
+            active_tool: ToolId::Grok,
+            ..base.clone()
+        };
+        let mut observed = None;
+        let effective = store
+            .save_with_effects(
+                Some(&base),
+                &desired,
+                |previous, effective| {
+                    observed = Some((previous.clone(), effective.clone()));
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(effective.active_tool, ToolId::Grok);
+        assert_eq!(effective.weixin_connect_codex_path, "/new/codex");
+        assert!(effective.codex_app_thread_id_badge);
+        assert_eq!(observed.unwrap().1, effective);
+    }
+
+    #[test]
+    fn settings_store_save_effects_reports_before_and_rollback_failures() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let base = BackendSettings::default();
+        store.save(&base).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut desired = base.clone();
+        desired.active_tool = ToolId::Grok;
+
+        let error = store
+            .save_with_effects(
+                Some(&base),
+                &desired,
+                |_, _| anyhow::bail!("before failed"),
+                |_, _| anyhow::bail!("rollback failed"),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("before failed"));
+        assert!(error.to_string().contains("rollback failed"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_store_update_effects_reports_atomic_and_rollback_failures() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let base = BackendSettings::default();
+        store.save(&base).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let original_for_rollback = original.clone();
+        let path_for_before = path.clone();
+        let path_for_rollback = path.clone();
+
+        let error = store
+            .update_with_effects(
+                json!({"activeTool": "grok"}),
+                move |_, _| {
+                    std::fs::remove_file(&path_for_before)?;
+                    std::fs::create_dir(&path_for_before)?;
+                    Ok(())
+                },
+                move |_, _| {
+                    std::fs::remove_dir_all(&path_for_rollback)?;
+                    atomic_write(&path_for_rollback, &original_for_rollback)?;
+                    anyhow::bail!("rollback failed")
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("rollback failed"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
@@ -3305,5 +3699,33 @@ experimental_bearer_token = "sk-existing""#
 
         assert!(!updated.provider_sync_enabled);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn relay_profile_standard_openai_protocol_defaults_off_for_legacy_profiles() {
+        // 旧 profile 没有该字段：反序列化后默认关闭。
+        let mut enabled = RelayProfile::default();
+        enabled.standard_openai_protocol = true;
+        let mut legacy = serde_json::to_value(&enabled).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("standardOpenaiProtocol");
+        let profile: RelayProfile = serde_json::from_value(legacy).unwrap();
+        assert!(!profile.standard_openai_protocol);
+    }
+
+    #[test]
+    fn relay_profile_standard_openai_protocol_round_trip_keeps_existing_providers() {
+        // 关闭时导出不写该字段，round-trip 不改变既有 provider。
+        let value = serde_json::to_value(RelayProfile::default()).unwrap();
+        assert!(value.get("standardOpenaiProtocol").is_none());
+
+        let mut enabled = RelayProfile::default();
+        enabled.standard_openai_protocol = true;
+        let value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["standardOpenaiProtocol"], json!(true));
+        let round_tripped: RelayProfile = serde_json::from_value(value).unwrap();
+        assert!(round_tripped.standard_openai_protocol);
     }
 }

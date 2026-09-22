@@ -3,7 +3,7 @@
 //! 后缀语法：`deepseek-v4-pro[1M]` 表示 slug=deepseek-v4-pro、context_window=1000000。
 //! 单位 K/k=1000、M/m=1000000；纯数字也接受。后缀在生成 catalog 时剥离。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,18 +291,27 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                     .unwrap_or_else(|| model_template_entry(&entry.slug))
             };
             let metadata_window = model.get("context_window").and_then(Value::as_u64);
+            let metadata_max_window = model.get("max_context_window").and_then(Value::as_u64);
             let context_window = entry
                 .suffix_window
                 .or(fallback_window)
                 .or(metadata_window)
                 .unwrap_or(272_000);
+            // 用户显式配置窗口（后缀 / 每模型窗口 / profile 全局）时两字段同值；
+            // 未显式配置时保留官方模板的 max_context_window 上限——gpt-5.6 / gpt-6
+            // 官方为 272000/872000，压平成同值会把 codex 侧 872K 能力上限写低（#2191）。
+            let max_context_window = entry
+                .suffix_window
+                .or(fallback_window)
+                .map(|window| window)
+                .unwrap_or_else(|| metadata_max_window.unwrap_or(context_window));
             model["slug"] = json!(entry.slug);
             if !has_model_metadata {
                 model["display_name"] = json!(entry.display_name);
                 model["description"] = json!(entry.display_name);
             }
             model["context_window"] = json!(context_window);
-            model["max_context_window"] = json!(context_window);
+            model["max_context_window"] = json!(max_context_window);
             // 通用自定义模型显示完整窗口；DeepSeek Responses 保留官方目录的 95%。
             if !deepseek_metadata {
                 model["effective_context_window_percent"] = json!(100);
@@ -317,6 +326,11 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
             }
             model["priority"] = json!(1000 + index);
             model["visibility"] = json!("list");
+            // Custom Responses relay catalogs must advertise the v2 multi-agent
+            // contract so Codex exposes the sub-agent tools.
+            if use_responses_lite_override.is_some() {
+                model["multi_agent_version"] = json!("v2");
+            }
             if !deepseek_metadata {
                 model["supported_in_api"] = json!(true);
             }

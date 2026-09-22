@@ -6,8 +6,8 @@ fn outline_fragments_expose_the_expected_contract() {
         .replace("\r\n", "\n");
     let feature = include_str!("../../../assets/inject/floating-panel/outline/feature.js")
         .replace("\r\n", "\n");
-    let view = include_str!("../../../assets/inject/floating-panel/outline/view.js")
-        .replace("\r\n", "\n");
+    let view =
+        include_str!("../../../assets/inject/floating-panel/outline/view.js").replace("\r\n", "\n");
 
     assert!(parser.starts_with("/* Answer Outline parser:"));
     assert!(parser.contains("function outlineCollectHeadingElements"));
@@ -24,7 +24,12 @@ fn outline_fragments_expose_the_expected_contract() {
     assert!(view.contains("function outlineHtml"));
     assert!(view.contains("function attachOutlineEvents"));
 
-    for source in [parser.as_str(), navigation.as_str(), feature.as_str(), view.as_str()] {
+    for source in [
+        parser.as_str(),
+        navigation.as_str(),
+        feature.as_str(),
+        view.as_str(),
+    ] {
         assert!(!source.contains("import "));
         assert!(!source.contains("export "));
         assert!(!source.contains("fetch("));

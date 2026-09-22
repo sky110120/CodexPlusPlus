@@ -71,10 +71,14 @@ pub fn run() {
             commands::launch_codex_plus,
             commands::restart_codex_plus,
             commands::load_settings,
+            commands::native_browser_status,
             commands::save_settings,
+            commands::list_tools,
             commands::test_vlm,
             commands::load_grok_config,
             commands::save_grok_config,
+            commands::load_grok_providers,
+            commands::apply_grok_relay_profile,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
             commands::weixin_connect_status,
@@ -422,7 +426,7 @@ async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
     debug_assert!(settings.enhancements_enabled && settings.codex_app_dream_skin_enabled);
     codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
         DREAM_SKIN_DEBUG_PORT,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
     )
     .await?;
     Ok(())

@@ -19,6 +19,7 @@ use codex_plus_core::user_scripts::UserScriptManager;
 use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tauri::Emitter;
 
 use crate::install::{self, InstallActionResult, InstallOptions};
 
@@ -59,9 +60,61 @@ pub struct OverviewPayload {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsPayload {
+    #[serde(serialize_with = "serialize_settings_with_grok_api_keys")]
     pub settings: BackendSettings,
     pub settings_path: String,
     pub user_scripts: Value,
+}
+
+fn serialize_settings_with_grok_api_keys<S>(
+    settings: &BackendSettings,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut value = serde_json::to_value(settings).map_err(serde::ser::Error::custom)?;
+    inject_grok_api_keys(&mut value, settings);
+    value.serialize(serializer)
+}
+
+fn serialize_grok_profiles_with_api_keys<S>(
+    profiles: &[RelayProfile],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut values = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let mut value = serde_json::to_value(profile).map_err(serde::ser::Error::custom)?;
+        if let Value::Object(object) = &mut value {
+            object.insert("apiKey".to_string(), Value::String(profile.api_key.clone()));
+        }
+        values.push(value);
+    }
+    Value::Array(values).serialize(serializer)
+}
+
+fn inject_grok_api_keys(value: &mut Value, settings: &BackendSettings) {
+    let Some(grok) = settings.tools.get(&codex_plus_core::tools::ToolId::Grok) else {
+        return;
+    };
+    let Some(profiles) = value
+        .get_mut("tools")
+        .and_then(Value::as_object_mut)
+        .and_then(|tools| tools.get_mut("grok"))
+        .and_then(Value::as_object_mut)
+        .and_then(|grok| grok.get_mut("relayProfiles"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for (serialized, profile) in profiles.iter_mut().zip(&grok.relay_profiles) {
+        if let Value::Object(object) = serialized {
+            object.insert("apiKey".to_string(), Value::String(profile.api_key.clone()));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +138,7 @@ struct WeixinQrSession {
 
 struct WeixinRuntime {
     stop: Arc<AtomicBool>,
+    codex_path: codex_plus_core::connect::WeixinCodexPath,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -540,6 +594,10 @@ pub struct WatcherPayload {
 pub struct AdsPayload {
     pub version: u64,
     pub ads: Vec<Value>,
+    /// 置顶赞助位。与 `ads` 是两回事：`top_ad` 是单独售卖的贵价位置，
+    /// 不参与推荐池的排序，概览页只认它。
+    #[serde(rename = "topAd", skip_serializing_if = "Option::is_none")]
+    pub top_ad: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -564,6 +622,153 @@ pub struct SkillsPayload {
 #[serde(rename_all = "camelCase")]
 pub struct StartupPayload {
     pub show_update: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrokProvidersPayload {
+    /// Grok 分区里已保存的供应商（存在 settings.json 的 tools.grok）。
+    #[serde(serialize_with = "serialize_grok_profiles_with_api_keys")]
+    pub profiles: Vec<RelayProfile>,
+    pub active_relay_id: String,
+    /// 磁盘上 Grok config.toml 的现状，用来展示「Grok 现在连的是谁」。
+    pub live: codex_plus_core::grok_config::GrokConfigPayload,
+    /// 把磁盘现状按供应商语义反推出来的 profile，供 UI 比对。
+    pub live_profile: RelayProfile,
+}
+
+/// 读取 Grok 侧的供应商列表 + 磁盘现状。
+#[tauri::command]
+pub fn load_grok_providers() -> CommandResult<GrokProvidersPayload> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let shard = settings.tool_config(&codex_plus_core::tools::ToolId::Grok);
+
+    match codex_plus_core::tools::grok::load_grok_state() {
+        Ok(live) => {
+            let live_profile = codex_plus_core::tools::grok::read_grok_profile_from_config(&live);
+            ok(
+                "Grok 供应商配置已加载。",
+                GrokProvidersPayload {
+                    profiles: shard.relay_profiles,
+                    active_relay_id: shard.active_relay_id,
+                    live,
+                    live_profile,
+                },
+            )
+        }
+        Err(error) => failed(
+            &format!("读取 Grok 配置失败：{error}"),
+            GrokProvidersPayload {
+                profiles: shard.relay_profiles,
+                active_relay_id: shard.active_relay_id,
+                live: empty_grok_config_payload(),
+                live_profile: RelayProfile::default(),
+            },
+        ),
+    }
+}
+
+/// 把 Grok 分区里当前选中的供应商写进 `~/.grok/config.toml`。
+///
+/// 这是**破坏性**操作：Grok 里所有受管的 `[model.*]` 表会被这个供应商的模型
+/// 列表整体替换（`[ui]` / `[models].web_search` 等未管理字段保留）。前端必须先
+/// 让用户确认，所以这里不做隐式调用。
+#[tauri::command]
+pub fn apply_grok_relay_profile(settings: BackendSettings) -> CommandResult<GrokProvidersPayload> {
+    let backup_root = codex_plus_core::paths::default_app_state_dir().join("backups");
+    apply_grok_relay_profile_with_backup_root(settings, &backup_root)
+}
+
+fn apply_grok_relay_profile_with_backup_root(
+    settings: BackendSettings,
+    backup_root: &Path,
+) -> CommandResult<GrokProvidersPayload> {
+    let Ok(_guard) = relay_switch_mutex().lock() else {
+        return failed(
+            "供应商切换锁已损坏，请重启管理器后再试。",
+            empty_grok_providers_payload(),
+        );
+    };
+    let store = SettingsStore::default();
+    let requested_shard = settings.tool_config(&codex_plus_core::tools::ToolId::Grok);
+    let requested_id = requested_shard.active_relay_id.trim().to_string();
+    let Some(confirmed_profile) = requested_shard
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == requested_id)
+        .cloned()
+    else {
+        return failed(
+            "Grok 选中的供应商已不存在，请刷新后重试。",
+            grok_providers_payload_from_shard(&requested_shard, empty_grok_config_payload()),
+        );
+    };
+
+    let mut live = None;
+    let mut latest_shard = None;
+    let saved = store.update_with_effects(
+        serde_json::json!({
+            "tools": { "grok": { "activeRelayId": requested_id } }
+        }),
+        |previous, _effective| {
+            let latest = previous.tool_config(&codex_plus_core::tools::ToolId::Grok);
+            latest_shard = Some(latest.clone());
+            let Some(latest_profile) = latest
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == requested_id)
+            else {
+                anyhow::bail!("Grok 供应商已被删除，请刷新后重试")
+            };
+            if latest_profile != &confirmed_profile {
+                anyhow::bail!("Grok 供应商已在其它窗口修改，请刷新后重试")
+            }
+            live = Some(codex_plus_core::tools::grok::apply_profile_to_grok(
+                latest_profile,
+                &backup_root,
+            )?);
+            Ok(())
+        },
+        |_, _| Ok(()),
+    );
+    match saved {
+        Ok(effective) => {
+            let shard = effective.tool_config(&codex_plus_core::tools::ToolId::Grok);
+            let Some(live) = live else {
+                return failed(
+                    "Grok 配置写入结果缺失，请刷新后重试。",
+                    grok_providers_payload_from_shard(&shard, empty_grok_config_payload()),
+                );
+            };
+            ok(
+                &format!("已把供应商「{}」应用到 Grok。", confirmed_profile.name),
+                grok_providers_payload_from_shard(&shard, live),
+            )
+        }
+        Err(error) => {
+            let shard = latest_shard
+                .or_else(|| {
+                    store
+                        .load()
+                        .ok()
+                        .map(|saved| saved.tool_config(&codex_plus_core::tools::ToolId::Grok))
+                })
+                .unwrap_or_default();
+            let message = if live.is_some() {
+                format!("Grok 配置已写入，但保存供应商设置失败：{error}")
+            } else {
+                format!("应用 Grok 供应商失败：{error}")
+            };
+            failed(
+                &message,
+                grok_providers_payload_from_shard(
+                    &shard,
+                    codex_plus_core::tools::grok::load_grok_state()
+                        .unwrap_or_else(|_| empty_grok_config_payload()),
+                ),
+            )
+        }
+    }
 }
 
 #[tauri::command]
@@ -607,6 +812,88 @@ fn empty_grok_config_payload() -> codex_plus_core::grok_config::GrokConfigPayloa
         models_base_url: String::new(),
         models: Vec::new(),
     }
+}
+
+fn empty_grok_providers_payload() -> GrokProvidersPayload {
+    GrokProvidersPayload {
+        profiles: Vec::new(),
+        active_relay_id: String::new(),
+        live: empty_grok_config_payload(),
+        live_profile: RelayProfile::default(),
+    }
+}
+
+fn grok_providers_payload_from_shard(
+    shard: &codex_plus_core::tools::ToolConfig,
+    live: codex_plus_core::grok_config::GrokConfigPayload,
+) -> GrokProvidersPayload {
+    let live_profile = codex_plus_core::tools::grok::read_grok_profile_from_config(&live);
+    GrokProvidersPayload {
+        profiles: shard.relay_profiles.clone(),
+        active_relay_id: shard.active_relay_id.clone(),
+        live,
+        live_profile,
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolEntry {
+    /// 工具的稳定标识，如 `codex` / `grok`。
+    pub id: String,
+    pub name: String,
+    /// 该工具的配置根目录，UI 上作为副标题展示。
+    pub home_dir: String,
+    /// 供应商 profile 的写盘能力是否已接好；未接好的工具在 UI 上显示为不可切。
+    pub switchable: bool,
+    pub active: bool,
+    /// 该工具当前选中的供应商名，没配置时为 None。
+    pub active_relay_name: Option<String>,
+    /// 该工具名下已保存的供应商数量。
+    pub relay_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsPayload {
+    pub tools: Vec<ToolEntry>,
+    pub active_tool: String,
+}
+
+/// 列出所有已注册的工具及其当前状态，供顶栏切换条渲染。
+///
+/// 注意：这里只读，不写盘。切换「当前聚焦的工具」由 save_settings 负责，
+/// 因为那只是 UI 状态，不该触发任何配置文件写入。
+#[tauri::command]
+pub fn list_tools() -> CommandResult<ToolsPayload> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let tools = codex_plus_core::tools::tool_specs()
+        .into_iter()
+        .map(|spec| {
+            let config = settings.tool_config(&spec.id);
+            let active_relay_name = config
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == config.active_relay_id)
+                .map(|profile| profile.name.clone());
+            ToolEntry {
+                id: spec.id.as_str().to_string(),
+                name: spec.name,
+                home_dir: spec.home_dir,
+                switchable: spec.switchable,
+                active: settings.active_tool == spec.id,
+                active_relay_name,
+                relay_count: config.relay_profiles.len(),
+            }
+        })
+        .collect();
+
+    let payload = ToolsPayload {
+        tools,
+        active_tool: settings.active_tool.as_str().to_string(),
+    };
+    ok("工具列表已加载。", payload)
 }
 
 #[tauri::command]
@@ -732,8 +1019,27 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
-    codex_plus_core::watcher::stop_launcher_processes_and_wait();
-    codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
+    #[cfg(windows)]
+    let launchers = match codex_plus_core::watcher::LauncherExitSnapshot::capture() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(&format!("无法确认旧启动器身份，未执行重启：{error}"), json!({})),
+    };
+    if let Err(error) = stop_codex_plus_for_restart(
+        || codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port),
+        || codex_plus_core::native_browser::wait_for_monitor_shutdown(std::time::Duration::from_secs(10)),
+        || {
+            #[cfg(windows)]
+            launchers.wait_for_exit(std::time::Duration::from_secs(10))?;
+            #[cfg(not(windows))]
+            codex_plus_core::watcher::stop_launcher_processes_and_wait();
+            Ok(())
+        },
+    ) {
+        return failed(
+            &format!("Codex 已请求停止，但原生浏览器清理或旧启动器退出未完成；未强制终止启动器或启动新实例：{error}"),
+            json!({"debugPort": request.debug_port, "helperPort": request.helper_port}),
+        );
+    }
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "manager.restart_requested",
@@ -786,6 +1092,18 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             )
         }
     }
+}
+
+fn stop_codex_plus_for_restart(
+    stop_codex: impl FnOnce(),
+    wait_native: impl FnOnce() -> anyhow::Result<()>,
+    stop_launcher: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // The launcher owns native recovery; terminating it first skips that cleanup.
+    stop_codex();
+    wait_native()?;
+    stop_launcher()?;
+    Ok(())
 }
 
 fn restart_codex_plus_after_stop<F>(
@@ -881,11 +1199,11 @@ fn sync_active_relay_to_home(
         return codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
             home,
             &codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
-                codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                codex_plus_core::protocol_proxy::protocol_proxy_port(),
             ),
             "codex-plus-aggregate",
             codex_plus_core::settings::RelayProtocol::Responses,
-            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            codex_plus_core::protocol_proxy::protocol_proxy_port(),
             aggregate.session_provider,
         );
     }
@@ -911,7 +1229,7 @@ fn sync_active_relay_to_home(
     let mut protocol = relay.protocol;
     if relay.has_model_routes() {
         base_url = codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
-            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            codex_plus_core::protocol_proxy::protocol_proxy_port(),
         );
         protocol = codex_plus_core::settings::RelayProtocol::Responses;
     }
@@ -921,7 +1239,7 @@ fn sync_active_relay_to_home(
             &base_url,
             &relay.api_key,
             protocol,
-            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            codex_plus_core::protocol_proxy::protocol_proxy_port(),
             codex_plus_core::relay_config::relay_session_provider_from_config(
                 &relay.config_contents,
             ),
@@ -937,7 +1255,7 @@ fn sync_active_relay_to_home(
         &base_url,
         &relay.api_key,
         protocol,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
         codex_plus_core::relay_config::relay_session_provider_from_config(&relay.config_contents),
     )
 }
@@ -1038,6 +1356,7 @@ fn requested_launch_status(
         helper_port: Some(request.helper_port),
         codex_app: (!request.app_path.trim().is_empty())
             .then(|| request.app_path.trim().to_string()),
+        aumid: None,
     }
 }
 
@@ -1345,8 +1664,10 @@ fn spawn_weixin_connect(
     if runtime.is_some() {
         anyhow::bail!("微信连接已在运行或正在停止");
     }
+    let codex_path = codex_plus_core::connect::WeixinCodexPath::new(&config.codex_path);
     *runtime = Some(WeixinRuntime {
         stop: Arc::clone(&stop),
+        codex_path: codex_path.clone(),
     });
     drop(runtime);
     let status = weixin_status();
@@ -1359,9 +1680,13 @@ fn spawn_weixin_connect(
     let task_status = Arc::clone(&status);
     let task_stop = Arc::clone(&stop);
     tauri::async_runtime::spawn(async move {
-        if let Err(error) =
-            codex_plus_core::connect::run_weixin_connect(config, stop, Arc::clone(&task_status))
-                .await
+        if let Err(error) = codex_plus_core::connect::run_weixin_connect_with_codex_path(
+            config,
+            stop,
+            Arc::clone(&task_status),
+            codex_path,
+        )
+        .await
             && let Ok(mut current) = task_status.lock()
         {
             current.state = "error".to_string();
@@ -1413,6 +1738,11 @@ fn empty_weixin_qr_payload(status: &str) -> WeixinQrPayload {
 }
 
 #[tauri::command]
+pub fn native_browser_status() -> codex_plus_core::native_browser::BrowserStatus {
+    codex_plus_core::native_browser::read_status()
+}
+
+#[tauri::command]
 pub fn load_settings() -> CommandResult<SettingsPayload> {
     settings_payload("设置已加载。", "设置读取失败")
 }
@@ -1437,38 +1767,38 @@ pub fn save_settings(
         );
     };
     let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
-    let dream_skin_enabled = settings.enhancements_enabled
-        && settings.codex_app_dream_skin_enabled
-        && !settings.codex_app_dream_skin_paused;
-    if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
-        dream_skin_enabled,
-        &settings.codex_app_dream_skin_theme_config,
-    ) {
-        return failed(
-            &format!("保存皮肤基础主题失败：{error}"),
-            SettingsPayload {
-                settings,
-                settings_path: codex_plus_core::paths::default_settings_path()
-                    .to_string_lossy()
-                    .to_string(),
-                user_scripts: user_script_inventory(),
-            },
-        );
-    }
-    let save_result = base_settings
-        .as_ref()
-        .map(|base| store.save_merged(base, &settings))
-        .unwrap_or_else(|| store.save(&settings));
+    let mut codex_path_changed = false;
+    let save_result = store.save_with_effects(
+        base_settings.as_ref(),
+        &settings,
+        |previous, effective| {
+            codex_path_changed = previous.weixin_connect_codex_path
+                != effective.weixin_connect_codex_path;
+            if dream_skin_sync_needed(previous, effective) {
+                sync_dream_skin_base_theme(effective)
+            } else {
+                Ok(())
+            }
+        },
+        |previous, effective| {
+            if dream_skin_sync_needed(previous, effective) {
+                sync_dream_skin_base_theme(previous)
+            } else {
+                Ok(())
+            }
+        },
+    );
     match save_result {
-        Ok(()) => settings_payload("设置已保存。", "设置保存后重新读取失败"),
+        Ok(effective) => {
+            if codex_path_changed
+                && let Ok(runtime) = weixin_runtime().lock()
+                && let Some(runtime) = runtime.as_ref()
+            {
+                runtime.codex_path.set(&effective.weixin_connect_codex_path);
+            }
+            settings_payload("设置已保存。", "设置保存后重新读取失败")
+        }
         Err(error) => {
-            let _ = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
-                previous.enhancements_enabled
-                    && previous.codex_app_dream_skin_enabled
-                    && !previous.codex_app_dream_skin_paused,
-                &previous.codex_app_dream_skin_theme_config,
-            );
             failed(
                 &format!("保存设置失败：{error}"),
                 SettingsPayload {
@@ -1481,6 +1811,28 @@ pub fn save_settings(
             )
         }
     }
+}
+
+fn dream_skin_enabled(settings: &BackendSettings) -> bool {
+    settings.enhancements_enabled
+        && settings.codex_app_dream_skin_enabled
+        && !settings.codex_app_dream_skin_paused
+}
+
+fn dream_skin_sync_needed(previous: &BackendSettings, effective: &BackendSettings) -> bool {
+    let previous_enabled = dream_skin_enabled(previous);
+    let effective_enabled = dream_skin_enabled(effective);
+    previous_enabled != effective_enabled
+        || (effective_enabled
+            && previous.codex_app_dream_skin_theme_config
+                != effective.codex_app_dream_skin_theme_config)
+}
+
+fn sync_dream_skin_base_theme(settings: &BackendSettings) -> anyhow::Result<()> {
+    codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+        dream_skin_enabled(settings),
+        &settings.codex_app_dream_skin_theme_config,
+    )
 }
 
 #[tauri::command]
@@ -2387,7 +2739,7 @@ fn empty_dream_skin_community_payload() -> DreamSkinCommunityPayload {
 }
 
 fn default_dream_skin_helper_port() -> u16 {
-    codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    codex_plus_core::protocol_proxy::protocol_proxy_port()
 }
 
 fn current_dream_skin_library(
@@ -3463,8 +3815,13 @@ pub async fn apply_session_index_cleanup(
     }
 }
 
+const PROVIDER_SYNC_PROGRESS_EVENT: &str = "provider-sync-progress";
+
 #[tauri::command]
-pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResult<Value> {
+pub async fn sync_providers_now(
+    window: tauri::WebviewWindow,
+    target_provider: Option<String>,
+) -> CommandResult<Value> {
     let target_provider = target_provider
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
@@ -3486,8 +3843,19 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
     let target_for_settings = target_provider.clone();
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
+    let progress_window = window.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_data::run_provider_sync_with_target(None, target_provider.as_deref())
+        codex_plus_data::run_provider_sync_with_target_and_progress(
+            None,
+            target_provider.as_deref(),
+            |progress| {
+                let _ = progress_window.emit_to(
+                    progress_window.label(),
+                    PROVIDER_SYNC_PROGRESS_EVENT,
+                    progress,
+                );
+            },
+        )
     })
     .await
     .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"));
@@ -3606,6 +3974,7 @@ pub async fn load_ads() -> CommandResult<AdsPayload> {
             AdsPayload {
                 version: 1,
                 ads: Vec::new(),
+                top_ad: None,
             },
         ),
     }
@@ -5578,7 +5947,7 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
         &relay.base_url,
         &relay.api_key,
         relay.protocol,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
         codex_plus_core::relay_config::relay_session_provider_from_config(&relay.config_contents),
     ) {
         Ok(result) => {
@@ -5623,11 +5992,11 @@ fn apply_aggregate_relay_injection_to_home(
     match codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
         home,
         &codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
-            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            codex_plus_core::protocol_proxy::protocol_proxy_port(),
         ),
         "codex-plus-aggregate",
         codex_plus_core::settings::RelayProtocol::Responses,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
         session_provider,
     ) {
         Ok(result) => {
@@ -5723,7 +6092,7 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
         &relay.base_url,
         &relay.api_key,
         relay.protocol,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
         codex_plus_core::relay_config::relay_session_provider_from_config(&relay.config_contents),
     ) {
         Ok(result) => {
@@ -6010,6 +6379,7 @@ fn ads_payload(payload: Value) -> AdsPayload {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        top_ad: payload.get("topAd").cloned(),
     }
 }
 
@@ -6560,12 +6930,47 @@ pub(crate) fn resume_enabled_dream_skin() -> anyhow::Result<BackendSettings> {
 mod tests {
     use super::*;
 
-    static CODEX_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 进程级全局状态的测试锁。
+    ///
+    /// 不止保护 `CODEX_HOME`：`paths::set_settings_path_for_tests`、
+    /// `GROK_HOME` 同样是进程级的，两个测试并行跑就会互相把对方的值冲掉
+    /// （表现为「单独跑过、全量跑挂」）。凡是动这几样的测试都必须先拿这把锁。
+    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock_codex_home_for_test() -> std::sync::MutexGuard<'static, ()> {
-        CODEX_HOME_TEST_LOCK
+        GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn grok_test_profile(id: &str, base_url: &str) -> RelayProfile {
+        RelayProfile {
+            id: id.to_string(),
+            name: format!("Grok {id}"),
+            relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+            upstream_base_url: base_url.to_string(),
+            api_key: format!("sk-{id}"),
+            model_list: "grok-4.5[1M]".to_string(),
+            ..RelayProfile::default()
+        }
+    }
+
+    fn grok_test_settings(profile: RelayProfile) -> BackendSettings {
+        let active_relay_id = profile.id.clone();
+        BackendSettings {
+            active_tool: codex_plus_core::tools::ToolId::Grok,
+            tools: [(
+                codex_plus_core::tools::ToolId::Grok,
+                codex_plus_core::tools::ToolConfig {
+                    relay_profiles: vec![profile],
+                    active_relay_id,
+                    ..codex_plus_core::tools::ToolConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..BackendSettings::default()
+        }
     }
 
     #[test]
@@ -6762,7 +7167,7 @@ base_url = "https://example.invalid/v1"
             "Provider sync complete",
         ));
 
-        assert_eq!(result.status, "ok");
+        assert_eq!(result.status, "ok", "{}", result.message);
         assert_eq!(result.payload["syncStatus"], "synced");
     }
 
@@ -7086,7 +7491,46 @@ base_url = "https://example.invalid/v1"
         let save = &source[start..end];
 
         assert!(save.contains("base_settings: Option<BackendSettings>"));
-        assert!(save.contains("store.save_merged(base, &settings)"));
+        assert!(save.contains("store.save_with_effects("));
+        assert!(save.contains("base_settings.as_ref()"));
+    }
+
+    #[test]
+    fn save_settings_side_effects_follow_effective_field_changes() {
+        let previous = BackendSettings {
+            codex_app_dream_skin_enabled: true,
+            codex_app_dream_skin_theme_config: codex_plus_core::settings::DreamSkinThemeConfig {
+                id: "theme-a".to_string(),
+                ..Default::default()
+            },
+            weixin_connect_codex_path: "/old/codex".to_string(),
+            ..BackendSettings::default()
+        };
+        let mut active_tool_only = previous.clone();
+        active_tool_only.active_tool = codex_plus_core::tools::ToolId::Grok;
+        assert!(!dream_skin_sync_needed(&previous, &active_tool_only));
+        assert_eq!(previous.weixin_connect_codex_path, "/old/codex");
+
+        let mut cli_changed = active_tool_only.clone();
+        cli_changed.weixin_connect_codex_path = "/new/codex".to_string();
+        assert_ne!(
+            previous.weixin_connect_codex_path,
+            cli_changed.weixin_connect_codex_path
+        );
+
+        let mut theme_changed = active_tool_only.clone();
+        theme_changed.codex_app_dream_skin_theme_config.id = "theme-b".to_string();
+        assert!(dream_skin_sync_needed(&previous, &theme_changed));
+
+        let mut disabled_theme_changed = previous.clone();
+        disabled_theme_changed.codex_app_dream_skin_enabled = false;
+        disabled_theme_changed.codex_app_dream_skin_theme_config.id = "theme-b".to_string();
+        let mut disabled_theme_again = disabled_theme_changed.clone();
+        disabled_theme_again.codex_app_dream_skin_theme_config.id = "theme-c".to_string();
+        assert!(!dream_skin_sync_needed(
+            &disabled_theme_changed,
+            &disabled_theme_again
+        ));
     }
 
     #[test]
@@ -7386,6 +7830,31 @@ base_url = "https://example.invalid/v1"
             std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
             "{\"old\":true}\n"
         );
+    }
+
+    #[test]
+    fn restart_stops_codex_then_waits_for_native_cleanup_before_launcher() {
+        let events = std::cell::RefCell::new(Vec::new());
+        stop_codex_plus_for_restart(
+            || events.borrow_mut().push("codex"),
+            || { events.borrow_mut().push("cleanup"); Ok(()) },
+            || { events.borrow_mut().push("launcher"); Ok(()) },
+        ).unwrap();
+        assert_eq!(*events.borrow(), ["codex", "cleanup", "launcher"]);
+    }
+
+    #[test]
+    fn restart_does_not_kill_launcher_when_native_cleanup_is_still_running() {
+        let stopped = std::cell::Cell::new(false);
+        let killed = std::cell::Cell::new(false);
+        let result = stop_codex_plus_for_restart(
+            || stopped.set(true),
+            || anyhow::bail!("cleanup still running"),
+            || { killed.set(true); Ok(()) },
+        );
+        assert!(result.is_err());
+        assert!(stopped.get());
+        assert!(!killed.get());
     }
 
     #[test]
@@ -7928,7 +8397,395 @@ enabled = true
     }
 
     #[test]
+    fn list_tools_reports_each_tool_with_its_own_provider_state() {
+        let _guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
+
+        let settings = BackendSettings {
+            active_relay_id: "supplier-a".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "supplier-a".to_string(),
+                name: "供应商 A".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                ..RelayProfile::default()
+            }],
+            active_tool: codex_plus_core::tools::ToolId::Grok,
+            tools: [(
+                codex_plus_core::tools::ToolId::Grok,
+                codex_plus_core::tools::ToolConfig {
+                    relay_profiles: vec![RelayProfile {
+                        id: "grok-a".to_string(),
+                        name: "Grok 供应商".to_string(),
+                        ..RelayProfile::default()
+                    }],
+                    active_relay_id: "grok-a".to_string(),
+                    ..codex_plus_core::tools::ToolConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..BackendSettings::default()
+        };
+        SettingsStore::default().save(&settings).unwrap();
+
+        let result = list_tools();
+        codex_plus_core::paths::set_settings_path_for_tests(previous);
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload.active_tool, "grok");
+
+        let codex = result
+            .payload
+            .tools
+            .iter()
+            .find(|tool| tool.id == "codex")
+            .expect("codex 必须在工具列表里");
+        assert!(codex.switchable);
+        assert!(!codex.active);
+        assert_eq!(codex.active_relay_name.as_deref(), Some("供应商 A"));
+        assert_eq!(codex.relay_count, 1);
+
+        // 两个工具各读各的分片，互不串 —— 这是分区的核心契约。
+        let grok = result
+            .payload
+            .tools
+            .iter()
+            .find(|tool| tool.id == "grok")
+            .expect("grok 必须在工具列表里");
+        assert!(grok.switchable);
+        assert!(grok.active);
+        assert_eq!(grok.active_relay_name.as_deref(), Some("Grok 供应商"));
+        assert_eq!(grok.relay_count, 1);
+        assert!(grok.home_dir.ends_with(".grok"));
+    }
+
+    /// 走一遍真实的命令链路：Grok 分区里配一个供应商 → apply 写进 config.toml。
+    ///
+    /// 全程用临时的 `GROK_HOME` / settings 路径，不碰用户真实的 ~/.grok。
+    #[test]
+    fn apply_grok_relay_profile_writes_the_selected_provider_to_disk() {
+        let _guard = lock_codex_home_for_test();
+        let previous_grok_home = std::env::var_os("GROK_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings =
+            codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
+        let grok_home = temp.path().join("grok-home");
+        std::fs::create_dir_all(&grok_home).unwrap();
+        // 用户已有配置：未管理字段必须活下来。
+        std::fs::write(
+            grok_home.join("config.toml"),
+            "[ui]\nyolo = false\n\n[models]\nweb_search = \"search-model\"\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("GROK_HOME", &grok_home);
+        }
+
+        let settings = BackendSettings {
+            active_tool: codex_plus_core::tools::ToolId::Grok,
+            codex_app_thread_id_badge: true,
+            weixin_connect_codex_path: "/kept/codex".to_string(),
+            tools: [(
+                codex_plus_core::tools::ToolId::Grok,
+                codex_plus_core::tools::ToolConfig {
+                    relay_profiles: vec![RelayProfile {
+                        id: "vendor-a".to_string(),
+                        name: "供应商 A".to_string(),
+                        relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                        upstream_base_url: "https://vendor-a.example/v1".to_string(),
+                        api_key: "sk-vendor-a".to_string(),
+                        model_list: "grok-4.5[1M]\ngrok-4.1-fast".to_string(),
+                        ..RelayProfile::default()
+                    }],
+                    active_relay_id: "vendor-a".to_string(),
+                    ..codex_plus_core::tools::ToolConfig::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..BackendSettings::default()
+        };
+
+        // The real UI saves the Grok shard before opening the destructive apply confirmation.
+        SettingsStore::default().save(&settings).unwrap();
+        let backup_root = temp.path().join("backups");
+        let result = apply_grok_relay_profile_with_backup_root(settings, &backup_root);
+        let saved_settings = SettingsStore::default().load().unwrap();
+        codex_plus_core::paths::set_settings_path_for_tests(previous_settings);
+        let written = std::fs::read_to_string(grok_home.join("config.toml"));
+        unsafe {
+            match previous_grok_home {
+                Some(value) => std::env::set_var("GROK_HOME", value),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+        }
+        let written = written.unwrap();
+
+        assert_eq!(result.status, "ok", "{}", result.message);
+        assert!(
+            written.contains("[model.\"grok-4.5\"]"),
+            "实际写出：\n{written}"
+        );
+        assert!(written.contains("base_url = \"https://vendor-a.example/v1\""));
+        assert!(written.contains("api_key = \"sk-vendor-a\""));
+        assert!(written.contains("context_window = 1000000"));
+        // 未管理字段原样保留。
+        assert!(written.contains("[ui]"));
+        assert!(written.contains("web_search = \"search-model\""));
+        assert!(saved_settings.codex_app_thread_id_badge);
+        assert_eq!(saved_settings.weixin_connect_codex_path, "/kept/codex");
+        assert_eq!(saved_settings.tools[&codex_plus_core::tools::ToolId::Grok].relay_profiles.len(), 1);
+    }
+
+    #[test]
+    fn grok_ipc_round_trip_preserves_name_key_and_rejects_later_key_clear() {
+        let _guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_settings = codex_plus_core::paths::set_settings_path_for_tests(Some(
+            temp.path().join("settings.json"),
+        ));
+        let previous_grok_home = std::env::var_os("GROK_HOME");
+        let grok_home = temp.path().join("grok-home");
+        std::fs::create_dir_all(&grok_home).unwrap();
+        let original = "[ui]\nyolo = false\n";
+        std::fs::write(grok_home.join("config.toml"), original).unwrap();
+        unsafe { std::env::set_var("GROK_HOME", &grok_home) };
+
+        let mut initial = grok_test_settings(grok_test_profile("vendor-a", "https://a.example/v1"));
+        let initial_profile = initial
+            .tools
+            .get_mut(&codex_plus_core::tools::ToolId::Grok)
+            .unwrap()
+            .relay_profiles
+            .first_mut()
+            .unwrap();
+        initial_profile.api_key = "sk-original".to_string();
+        let initial_json = serde_json::to_value(SettingsPayload {
+            settings: initial.clone(),
+            settings_path: String::new(),
+            user_scripts: Value::Null,
+        })
+        .unwrap();
+        let mut renamed: BackendSettings =
+            serde_json::from_value(initial_json["settings"].clone()).unwrap();
+        let renamed_profile = renamed
+            .tools
+            .get_mut(&codex_plus_core::tools::ToolId::Grok)
+            .unwrap()
+            .relay_profiles
+            .first_mut()
+            .unwrap();
+        assert_eq!(renamed_profile.api_key, "sk-original");
+        renamed_profile.name = "Grok renamed".to_string();
+        SettingsStore::default().save(&renamed).unwrap();
+        let after_rename = SettingsStore::default().load().unwrap();
+        assert_eq!(
+            after_rename.tools[&codex_plus_core::tools::ToolId::Grok].relay_profiles[0].api_key,
+            "sk-original"
+        );
+
+        let mut cleared = after_rename.clone();
+        cleared
+            .tools
+            .get_mut(&codex_plus_core::tools::ToolId::Grok)
+            .unwrap()
+            .relay_profiles[0]
+            .api_key
+            .clear();
+        SettingsStore::default().save(&cleared).unwrap();
+        assert!(
+            SettingsStore::default()
+                .load()
+                .unwrap()
+                .tools[&codex_plus_core::tools::ToolId::Grok]
+                .relay_profiles[0]
+                .api_key
+                .is_empty()
+        );
+
+        let confirmed_json = serde_json::to_value(SettingsPayload {
+            settings: renamed,
+            settings_path: String::new(),
+            user_scripts: Value::Null,
+        })
+        .unwrap();
+        let confirmed: BackendSettings =
+            serde_json::from_value(confirmed_json["settings"].clone()).unwrap();
+        let backup_root = temp.path().join("backups");
+        let result = apply_grok_relay_profile_with_backup_root(confirmed, &backup_root);
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("其它窗口修改"));
+        assert_eq!(std::fs::read_to_string(grok_home.join("config.toml")).unwrap(), original);
+
+        codex_plus_core::paths::set_settings_path_for_tests(previous_settings);
+        unsafe {
+            match previous_grok_home {
+                Some(value) => std::env::set_var("GROK_HOME", value),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn settings_payload_exposes_only_grok_keys_for_ipc() {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles = vec![RelayProfile {
+            id: "codex-profile".to_string(),
+            api_key: "codex-secret".to_string(),
+            ..RelayProfile::default()
+        }];
+        settings.tools.insert(
+            codex_plus_core::tools::ToolId::Grok,
+            codex_plus_core::tools::ToolConfig {
+                relay_profiles: vec![grok_test_profile("grok-profile", "https://grok.example/v1")],
+                active_relay_id: "grok-profile".to_string(),
+                ..codex_plus_core::tools::ToolConfig::default()
+            },
+        );
+
+        let encoded = serde_json::to_value(SettingsPayload {
+            settings,
+            settings_path: String::new(),
+            user_scripts: Value::Null,
+        })
+        .unwrap();
+
+        assert_eq!(
+            encoded["settings"]["tools"]["grok"]["relayProfiles"][0]["apiKey"],
+            "sk-grok-profile"
+        );
+        assert!(encoded["settings"]["relayProfiles"][0].get("apiKey").is_none());
+    }
+
+    #[test]
+    fn apply_grok_relay_profile_rejects_stale_or_deleted_confirmations_without_writing() {
+        let _guard = lock_codex_home_for_test();
+
+        let run = |saved_settings: BackendSettings, requested_settings: BackendSettings| {
+            let temp = tempfile::tempdir().unwrap();
+            let settings_path = temp.path().join("settings.json");
+            let previous_settings =
+                codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
+            let previous_grok_home = std::env::var_os("GROK_HOME");
+            let grok_home = temp.path().join("grok-home");
+            std::fs::create_dir_all(&grok_home).unwrap();
+            let original = "[ui]\nyolo = false\n\n[models]\nweb_search = \"search-model\"\n";
+            std::fs::write(grok_home.join("config.toml"), original).unwrap();
+            unsafe { std::env::set_var("GROK_HOME", &grok_home) };
+            SettingsStore::default().save(&saved_settings).unwrap();
+
+            let backup_root = temp.path().join("backups");
+            let result = apply_grok_relay_profile_with_backup_root(requested_settings, &backup_root);
+            let after = std::fs::read_to_string(grok_home.join("config.toml")).unwrap();
+            let backup_count = std::fs::read_dir(&backup_root).map(|entries| entries.count()).unwrap_or(0);
+
+            codex_plus_core::paths::set_settings_path_for_tests(previous_settings);
+            unsafe {
+                match previous_grok_home {
+                    Some(value) => std::env::set_var("GROK_HOME", value),
+                    None => std::env::remove_var("GROK_HOME"),
+                }
+            }
+            (result, original.to_string(), after, backup_count)
+        };
+
+        let saved = grok_test_settings(grok_test_profile("vendor-a", "https://a.example/v1"));
+        let mut stale = saved.clone();
+        stale.tools
+            .get_mut(&codex_plus_core::tools::ToolId::Grok)
+            .unwrap()
+            .relay_profiles[0]
+            .upstream_base_url = "https://stale.example/v1".to_string();
+        let (result, original, after, backup_count) = run(saved.clone(), stale);
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("其它窗口修改"));
+        assert_eq!(after, original);
+        assert_eq!(backup_count, 0);
+
+        let mut deleted = saved.clone();
+        let deleted_shard = deleted
+            .tools
+            .get_mut(&codex_plus_core::tools::ToolId::Grok)
+            .unwrap();
+        deleted_shard.relay_profiles.clear();
+        deleted_shard.active_relay_id.clear();
+        let (result, original, after, backup_count) = run(deleted, saved.clone());
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("已被删除"));
+        assert_eq!(after, original);
+        assert_eq!(backup_count, 0);
+    }
+
+    #[test]
+    fn apply_grok_relay_profile_rejects_an_unknown_confirmed_id_without_writing() {
+        let _guard = lock_codex_home_for_test();
+        let saved = grok_test_settings(grok_test_profile("vendor-a", "https://a.example/v1"));
+        let mut requested = saved.clone();
+        requested
+            .tools
+            .get_mut(&codex_plus_core::tools::ToolId::Grok)
+            .unwrap()
+            .active_relay_id = "missing".to_string();
+
+        let temp = tempfile::tempdir().unwrap();
+        let previous_settings = codex_plus_core::paths::set_settings_path_for_tests(Some(
+            temp.path().join("settings.json"),
+        ));
+        let previous_grok_home = std::env::var_os("GROK_HOME");
+        let grok_home = temp.path().join("grok-home");
+        std::fs::create_dir_all(&grok_home).unwrap();
+        let original = "[ui]\nyolo = false\n";
+        std::fs::write(grok_home.join("config.toml"), original).unwrap();
+        unsafe { std::env::set_var("GROK_HOME", &grok_home) };
+        SettingsStore::default().save(&saved).unwrap();
+
+        let backup_root = temp.path().join("backups");
+        let result = apply_grok_relay_profile_with_backup_root(requested, &backup_root);
+        let after = std::fs::read_to_string(grok_home.join("config.toml")).unwrap();
+
+        codex_plus_core::paths::set_settings_path_for_tests(previous_settings);
+        unsafe {
+            match previous_grok_home {
+                Some(value) => std::env::set_var("GROK_HOME", value),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+        }
+        assert_eq!(result.status, "failed");
+        assert_eq!(after, original);
+        assert_eq!(std::fs::read_dir(&backup_root).map(|entries| entries.count()).unwrap_or(0), 0);
+    }
+
+    /// 还没填模型列表的供应商不允许应用。
+    ///
+    /// 这里用默认的 Grok 分区：它带着一个默认 profile，但 `model_list` 是空的。
+    /// 应用它会把 Grok 里所有受管的 `[model.*]` 表清空，所以必须被拦下来。
+    #[test]
+    fn apply_grok_relay_profile_rejects_a_provider_without_models() {
+        let _guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings =
+            codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
+
+        let backup_root = temp.path().join("backups");
+        let result = apply_grok_relay_profile_with_backup_root(BackendSettings::default(), &backup_root);
+        codex_plus_core::paths::set_settings_path_for_tests(previous_settings);
+
+        assert_eq!(result.status, "failed");
+        assert!(
+            result.message.contains("没有配置模型列表"),
+            "实际消息：{}",
+            result.message
+        );
+        assert_eq!(std::fs::read_dir(&backup_root).map(|entries| entries.count()).unwrap_or(0), 0);
+    }
+
+    #[test]
     fn reset_image_overlay_settings_preserves_supplier_settings() {
+        let _guard = lock_codex_home_for_test();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
         let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
