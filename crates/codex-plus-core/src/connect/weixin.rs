@@ -127,7 +127,11 @@ struct WeixinSendResponse {
 impl WeixinClient {
     pub fn new(base_url: &str, token: &str, route_tag: &str) -> anyhow::Result<Self> {
         let base_url = normalize_base_url(base_url);
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        if should_bypass_system_proxy(&base_url) {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("无法创建微信 HTTP 客户端")?;
@@ -436,6 +440,23 @@ fn normalize_base_url(value: &str) -> String {
     }
 }
 
+fn should_bypass_system_proxy(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn random_wechat_uin() -> String {
     let bytes = Uuid::new_v4().into_bytes();
     let number = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -509,5 +530,42 @@ mod tests {
         let svg = render_qr_svg("https://example.test/login").unwrap();
         assert!(svg.starts_with("<?xml"));
         assert!(svg.contains("<svg"));
+    }
+
+    #[tokio::test]
+    async fn loopback_updates_request_bypasses_system_proxy() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/getupdates"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({ "ret": 0, "errcode": 0 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = WeixinClient::new(&server.uri(), "token", "").unwrap();
+        let updates = client.get_updates("", 1_000).await.unwrap();
+
+        assert_eq!(updates.ret, 0);
+        assert_eq!(updates.errcode, 0);
+    }
+
+    #[test]
+    fn system_proxy_is_bypassed_only_for_loopback_urls() {
+        assert!(should_bypass_system_proxy("http://127.0.0.1:8080/v1"));
+        assert!(should_bypass_system_proxy("http://127.0.0.2:8080/v1"));
+        assert!(should_bypass_system_proxy("http://[::1]:8080/v1"));
+        assert!(should_bypass_system_proxy("http://localhost:8080/v1"));
+        assert!(!should_bypass_system_proxy("http://192.168.1.10:8080/v1"));
+        assert!(!should_bypass_system_proxy("https://api.example.com/v1"));
+        assert!(!should_bypass_system_proxy("not a URL"));
+    }
+
+    #[test]
+    fn invalid_base_url_still_fails_when_endpoint_is_built() {
+        let client = WeixinClient::new("not a URL", "token", "").unwrap();
+        assert!(client.endpoint("ilink/bot/getupdates").is_err());
     }
 }

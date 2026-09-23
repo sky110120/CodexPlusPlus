@@ -157,6 +157,91 @@ pub struct SanitizeModelSuffixResult {
     pub updated: usize,
 }
 
+fn connection_has_table(db: &Connection, table: &str) -> bool {
+    db.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        [table],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn connection_has_column(db: &Connection, table: &str, column: &str) -> bool {
+    db.query_row(
+        &format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1 LIMIT 1"),
+        [column],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// 读出「未归档目标模式任务」对应 thread 的持久化模型（取 updated_at 最新一条）。
+/// 用于重启后把 config.toml 的默认 model 对齐到长线目标任务实际使用的模型，
+/// 防止恢复任务静默回落到 model_list 第一条（issue #2264）。
+/// 任何 schema 不匹配 / 库不可读都返回 None，由调用端回落旧行为。
+pub fn latest_unarchived_goal_thread_model(home: &Path) -> Option<String> {
+    const UNIX_MILLISECONDS_THRESHOLD: f64 = 100_000_000_000.0;
+
+    let mut latest: Option<(f64, String)> = None;
+    for db_path in codex_session_db_paths_from_home(home) {
+        if !db_path.exists() {
+            continue;
+        }
+        let Ok(db) = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            continue;
+        };
+        if !connection_has_table(&db, "automation_runs") || !connection_has_table(&db, "threads") {
+            continue;
+        }
+        if !connection_has_column(&db, "automation_runs", "updated_at")
+            || !connection_has_column(&db, "automation_runs", "archived_reason")
+            || !connection_has_column(&db, "automation_runs", "thread_id")
+            || !connection_has_column(&db, "threads", "id")
+            || !connection_has_column(&db, "threads", "model")
+        {
+            continue;
+        }
+        let Ok((updated_at, model)) = db.query_row(
+            "SELECT updated_at_jd, model FROM (\
+                 SELECT CASE \
+                     WHEN typeof(a.updated_at) = 'text' THEN julianday(a.updated_at) \
+                     WHEN typeof(a.updated_at) IN ('integer', 'real') THEN \
+                         julianday(\
+                             CASE \
+                                 WHEN abs(CAST(a.updated_at AS REAL)) >= ?1 \
+                                     THEN CAST(a.updated_at AS REAL) / 1000.0 \
+                                 ELSE CAST(a.updated_at AS REAL) \
+                             END, \
+                             'unixepoch'\
+                         ) \
+                     ELSE NULL \
+                 END AS updated_at_jd, \
+                 a.thread_id AS thread_id, TRIM(t.model) AS model \
+                 FROM automation_runs a \
+                 JOIN threads t ON t.id = a.thread_id \
+                 WHERE COALESCE(a.archived_reason, '') = '' \
+                     AND TRIM(COALESCE(t.model, '')) != ''\
+             ) \
+             WHERE updated_at_jd IS NOT NULL \
+             ORDER BY updated_at_jd DESC, thread_id ASC LIMIT 1",
+            [UNIX_MILLISECONDS_THRESHOLD],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?)),
+        ) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|(latest_updated_at, _)| updated_at > *latest_updated_at)
+        {
+            latest = Some((updated_at, model));
+        }
+    }
+    latest.map(|(_, model)| model)
+}
+
 /// 扫描 codex session 数据库中的 threads 表，把 model 字段里带合法后缀的
 /// 记录改写为剥离后缀的 slug，使 codex 模型选择器不再显示带后缀的历史项。
 pub fn sanitize_thread_model_suffixes(home: &Path) -> anyhow::Result<SanitizeModelSuffixResult> {
@@ -334,6 +419,7 @@ mod tests {
     use super::codex_session_db_paths_from_home;
     use super::codex_session_db_paths_in_home;
     use super::codex_thread_reference_db_paths_from_home;
+    use super::latest_unarchived_goal_thread_model;
     use super::resolve_sqlite_home;
     use super::resolve_sqlite_home_from_env;
     use super::resolve_sqlite_home_home_or_default;
@@ -342,6 +428,78 @@ mod tests {
     use std::sync::Mutex;
 
     static SQLITE_HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn write_goal_thread_fixture_db(
+        home: &std::path::Path,
+        name: &str,
+        thread_id: &str,
+        model: &str,
+        updated_at: &str,
+    ) {
+        let sqlite_dir = home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).expect("create sqlite dir");
+        let connection =
+            rusqlite::Connection::open(sqlite_dir.join(name)).expect("create goal thread database");
+        connection
+            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model TEXT)", [])
+            .expect("create threads table");
+        connection
+            .execute(
+                "CREATE TABLE automation_runs (thread_id TEXT, updated_at TEXT, archived_reason TEXT)",
+                [],
+            )
+            .expect("create automation_runs table");
+        connection
+            .execute(
+                "INSERT INTO threads (id, model) VALUES (?1, ?2)",
+                rusqlite::params![thread_id, model],
+            )
+            .expect("insert thread");
+        connection
+            .execute(
+                "INSERT INTO automation_runs (thread_id, updated_at, archived_reason) \
+                 VALUES (?1, ?2, '')",
+                rusqlite::params![thread_id, updated_at],
+            )
+            .expect("insert automation run");
+    }
+
+    fn write_integer_goal_thread_fixture_db(
+        home: &std::path::Path,
+        name: &str,
+        runs: &[(&str, &str, i64, Option<&str>)],
+    ) {
+        let sqlite_dir = home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).expect("create sqlite dir");
+        let connection =
+            rusqlite::Connection::open(sqlite_dir.join(name)).expect("create goal thread database");
+        connection
+            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model TEXT)", [])
+            .expect("create threads table");
+        connection
+            .execute(
+                "CREATE TABLE automation_runs (\
+                    thread_id TEXT, updated_at INTEGER, archived_reason TEXT\
+                 )",
+                [],
+            )
+            .expect("create automation_runs table");
+        for (thread_id, model, updated_at, archived_reason) in runs {
+            connection
+                .execute(
+                    "INSERT INTO threads (id, model) VALUES (?1, ?2)",
+                    rusqlite::params![thread_id, model],
+                )
+                .expect("insert thread");
+            connection
+                .execute(
+                    "INSERT INTO automation_runs (thread_id, updated_at, archived_reason) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![thread_id, updated_at, archived_reason],
+                )
+                .expect("insert automation run");
+        }
+    }
 
     fn with_sqlite_home_env<T, F: FnOnce() -> T>(value: Option<&std::path::Path>, action: F) -> T {
         let _guard = SQLITE_HOME_MUTEX.lock().unwrap();
@@ -356,6 +514,116 @@ mod tests {
             None => unsafe { std::env::remove_var("CODEX_SQLITE_HOME") },
         }
         result
+    }
+
+    #[test]
+    fn latest_unarchived_goal_thread_model_selects_newest_across_databases() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        write_goal_thread_fixture_db(
+            temp.path(),
+            "codex-dev.db",
+            "t-older",
+            "gpt-5.5",
+            "2026-09-20T01:00:00Z",
+        );
+        write_goal_thread_fixture_db(
+            temp.path(),
+            "codex-other.db",
+            "t-newer",
+            "gpt-5.6",
+            "2026-09-21T02:00:00Z",
+        );
+
+        assert_eq!(
+            latest_unarchived_goal_thread_model(temp.path()).as_deref(),
+            Some("gpt-5.6")
+        );
+    }
+
+    #[test]
+    fn latest_unarchived_goal_thread_model_compares_iso_seconds_and_milliseconds() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        write_goal_thread_fixture_db(
+            temp.path(),
+            "codex-dev.db",
+            "t-iso",
+            "gpt-5.5",
+            "2026-09-20T01:00:00Z",
+        );
+        write_integer_goal_thread_fixture_db(
+            temp.path(),
+            "codex-other.db",
+            &[("t-seconds", "gpt-5.6", 1_800_000_000, None)],
+        );
+        write_integer_goal_thread_fixture_db(
+            temp.path(),
+            "codex-zulu.db",
+            &[
+                ("t-milliseconds", "gpt-5.7", 1_800_086_400_000, None),
+                ("t-archived", "gpt-5.8", 1_900_000_000_000, Some("completed")),
+            ],
+        );
+
+        assert_eq!(
+            latest_unarchived_goal_thread_model(temp.path()).as_deref(),
+            Some("gpt-5.7")
+        );
+    }
+
+    #[test]
+    fn latest_unarchived_goal_thread_model_breaks_timestamp_ties_by_database_order() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let updated_at = "2026-09-21T02:00:00Z";
+        write_goal_thread_fixture_db(
+            temp.path(),
+            "codex-dev.db",
+            "t-dev",
+            "gpt-5.5",
+            updated_at,
+        );
+        write_goal_thread_fixture_db(
+            temp.path(),
+            "codex-other.db",
+            "t-other",
+            "gpt-5.6",
+            updated_at,
+        );
+
+        assert_eq!(
+            latest_unarchived_goal_thread_model(temp.path()).as_deref(),
+            Some("gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn latest_unarchived_goal_thread_model_skips_database_with_missing_columns() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let sqlite_dir = temp.path().join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).expect("create sqlite dir");
+        let connection = rusqlite::Connection::open(sqlite_dir.join("codex-dev.db"))
+            .expect("create incomplete database");
+        connection
+            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model TEXT)", [])
+            .expect("create threads table");
+        connection
+            .execute(
+                "CREATE TABLE automation_runs (thread_id TEXT, updated_at TEXT)",
+                [],
+            )
+            .expect("create incomplete automation_runs table");
+        drop(connection);
+        write_goal_thread_fixture_db(
+            temp.path(),
+            "codex-other.db",
+            "t-valid",
+            "gpt-5.6",
+            "2026-09-21T02:00:00Z",
+        );
+
+        assert_eq!(
+            latest_unarchived_goal_thread_model(temp.path()).as_deref(),
+            Some("gpt-5.6")
+        );
     }
 
     #[test]

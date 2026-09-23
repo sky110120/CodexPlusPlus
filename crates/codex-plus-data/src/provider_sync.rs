@@ -472,7 +472,24 @@ struct CatalogRepairThread {
 #[derive(Debug)]
 struct CatalogRepairObservedThread {
     thread: CatalogRepairThread,
-    eligible: bool,
+    status: CatalogRepairStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogRepairStatus {
+    Eligible,
+    Ineligible,
+    Unverified,
+}
+
+impl CatalogRepairStatus {
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Unverified => 0,
+            Self::Eligible => 1,
+            Self::Ineligible => 2,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -4808,11 +4825,17 @@ fn collect_catalog_repair_plan(
         let git_branch = text_expr(&columns, "git_branch", "NULL");
         let thread_source = text_expr(&columns, "thread_source", "NULL");
         let archived = text_expr(&columns, "archived", "0");
-        let has_user_event = text_expr(&columns, "has_user_event", "1");
+        // Current app-server listing uses preview; paginated histories can retain a zero
+        // legacy user-event flag even when they contain real user messages.
+        let has_user_content = if columns.contains("preview") {
+            "CASE WHEN COALESCE(preview, '') <> '' THEN 1 ELSE 0 END".to_string()
+        } else {
+            text_expr(&columns, "has_user_event", "1")
+        };
         let agent_role = text_expr(&columns, "agent_role", "''");
         let subagent_filter = subagent_filter(&db, "threads.id")?;
         let sql = format!(
-            "SELECT id, {display_title}, {source_created_at}, {source_updated_at}, {cwd}, {source_kind}, {source_detail}, {git_branch}, {thread_source}, {archived}, {has_user_event}, {agent_role} FROM threads WHERE COALESCE(id, '') <> ''{subagent_filter}"
+            "SELECT id, {display_title}, {source_created_at}, {source_updated_at}, {cwd}, {source_kind}, {source_detail}, {git_branch}, {thread_source}, {archived}, {has_user_content}, {agent_role} FROM threads WHERE COALESCE(id, '') <> ''{subagent_filter}"
         );
         let mut stmt = db.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
@@ -4837,7 +4860,7 @@ fn collect_catalog_repair_plan(
             ))
         })?;
         for item in rows {
-            let (thread, archived, has_user_event, agent_role) = item?;
+            let (thread, archived, has_user_content, agent_role) = item?;
             let marked_non_user = columns.contains("thread_source")
                 && thread.thread_source.as_deref().is_some_and(|value| {
                     let value = value.trim();
@@ -4845,29 +4868,53 @@ fn collect_catalog_repair_plan(
                 });
             let non_root = is_catalog_non_root_agent(&thread, &spawned_child_ids);
             let source_is_exec = thread.source_kind.trim().eq_ignore_ascii_case("exec");
-            let rollout_exists = catalog_rollout_path_exists(home, &thread.source_detail);
-            let eligible = archived == 0
-                && has_user_event == 1
-                && agent_role.trim().is_empty()
-                && !marked_non_user
-                && !source_is_exec
-                && !non_root
-                && rollout_exists;
+            let definitely_excluded = archived != 0
+                || !agent_role.trim().is_empty()
+                || marked_non_user
+                || source_is_exec
+                || non_root;
+            let rollout_classified_subagent = subagent_thread_ids
+                .is_some_and(|ids| ids.contains(&thread.id))
+                && !thread_source_is_user(thread.thread_source.as_deref());
+            let status = if definitely_excluded {
+                CatalogRepairStatus::Ineligible
+            } else if rollout_classified_subagent {
+                // The full rollout scan already classified this thread. Keep it unknown here so
+                // explicit-user precedence is resolved after duplicate DB observations merge.
+                CatalogRepairStatus::Unverified
+            } else {
+                let rollout_exists = catalog_rollout_path_exists(home, &thread.source_detail);
+                let user_content = if has_user_content == 1 {
+                    Some(true)
+                } else if columns.contains("preview") {
+                    rollout_has_user_content(home, &thread.source_detail)
+                } else {
+                    Some(false)
+                };
+                if user_content == Some(true) && rollout_exists {
+                    CatalogRepairStatus::Eligible
+                } else if user_content == Some(false)
+                    || (user_content == Some(true) && !rollout_exists)
+                {
+                    CatalogRepairStatus::Ineligible
+                } else {
+                    CatalogRepairStatus::Unverified
+                }
+            };
             let replace = observed_threads
                 .get(&thread.id)
                 .map(|current: &CatalogRepairObservedThread| {
-                    // Copies can share a timestamp; an ineligible observation wins the tie so
-                    // an archived or agent-owned thread cannot be resurrected by a stale copy.
+                    // Copies can share a timestamp; a definite exclusion wins, while an
+                    // unverified copy must not override an eligible observation.
                     thread.source_updated_at > current.thread.source_updated_at
                         || (thread.source_updated_at == current.thread.source_updated_at
-                            && !eligible
-                            && current.eligible)
+                            && status.precedence() > current.status.precedence())
                 })
                 .unwrap_or(true);
             if replace {
                 observed_threads.insert(
                     thread.id.clone(),
-                    CatalogRepairObservedThread { thread, eligible },
+                    CatalogRepairObservedThread { thread, status },
                 );
             }
         }
@@ -4895,13 +4942,14 @@ fn collect_catalog_repair_plan(
     }
     let ineligible_thread_ids = observed_threads
         .values()
-        .filter(|observed| !observed.eligible)
+        .filter(|observed| observed.status == CatalogRepairStatus::Ineligible)
         .map(|observed| observed.thread.id.clone())
         .collect::<HashSet<_>>();
     let threads = observed_threads
         .into_iter()
         .filter_map(|(thread_id, observed)| {
-            observed.eligible.then_some((thread_id, observed.thread))
+            (observed.status == CatalogRepairStatus::Eligible)
+                .then_some((thread_id, observed.thread))
         })
         .collect::<HashMap<_, _>>();
     // Catalog-only evidence stays path-scoped so one stale database cannot remove another's row.
@@ -4920,6 +4968,105 @@ fn collect_catalog_repair_plan(
         ineligible_thread_ids,
         catalog_non_root_thread_ids,
     })
+}
+
+/// Inspects only empty-preview candidates. `None` means the rollout cannot establish whether
+/// the thread has user content, so callers must neither insert nor prune its catalog row.
+fn rollout_has_user_content(home: &Path, rollout_path: &str) -> Option<bool> {
+    let rollout_path = rollout_path.trim();
+    if rollout_path.is_empty() {
+        return None;
+    }
+    let rollout_path = Path::new(rollout_path);
+    let path = if rollout_path.is_absolute() {
+        rollout_path.to_path_buf()
+    } else {
+        home.join(rollout_path)
+    };
+    let file = File::open(path).ok()?;
+    let mut saw_record = false;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<Value>(&line).ok()?;
+        let kind = record.get("type").and_then(Value::as_str)?;
+        let payload = record.get("payload");
+        match kind {
+            "event_msg" => {
+                let event_type = payload?.get("type").and_then(Value::as_str)?;
+                if matches!(event_type, "user_message" | "user_input") {
+                    return Some(true);
+                }
+                if !matches!(
+                    event_type,
+                    "task_started"
+                        | "task_complete"
+                        | "turn_aborted"
+                        | "token_count"
+                        | "agent_reasoning"
+                        | "exec_command_begin"
+                        | "exec_command_end"
+                        | "patch_apply_begin"
+                        | "patch_apply_end"
+                        | "mcp_tool_call_begin"
+                        | "mcp_tool_call_end"
+                        | "web_search_begin"
+                        | "web_search_end"
+                        | "warning"
+                        | "undo_started"
+                        | "undo_completed"
+                ) {
+                    return None;
+                }
+            }
+            "response_item" => {
+                let item = payload?;
+                let item_type = item.get("type").and_then(Value::as_str)?;
+                match item_type {
+                    "message" => {
+                        let role = item.get("role").and_then(Value::as_str)?;
+                        match role {
+                            "user" => return Some(true),
+                            "assistant" | "developer" | "system" | "tool" => {}
+                            _ => return None,
+                        }
+                    }
+                    "function_call"
+                    | "function_call_output"
+                    | "reasoning"
+                    | "web_search_call"
+                    | "web_search_result"
+                    | "image_generation_call"
+                    | "image_generation_result"
+                    | "local_shell_call"
+                    | "shell_command"
+                    | "shell_result"
+                    | "custom_tool_call"
+                    | "custom_tool_call_output"
+                    | "mcp_tool_call"
+                    | "mcp_tool_call_output"
+                    | "computer_call"
+                    | "computer_call_output"
+                    | "code_interpreter_call"
+                    | "code_interpreter_call_output"
+                    | "tool_search_call"
+                    | "compaction"
+                    | "ghost_snapshot"
+                    | "apply_patch"
+                    | "open_image" => {}
+                    _ => return None,
+                }
+            }
+            "session_meta" | "turn_context" => {
+                payload?.as_object()?;
+            }
+            _ => return None,
+        }
+        saw_record = true;
+    }
+    saw_record.then_some(false)
 }
 
 fn catalog_rollout_path_exists(home: &Path, rollout_path: &str) -> bool {

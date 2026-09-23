@@ -86,6 +86,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { codexGoalsFeatureState, setCodexGoalsFeatureInConfig } from "./goals-config";
 import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
+import { reconcileRelayModelDraft, relayModelFieldsChanged } from "./relay-profile-model";
 import { DEFAULT_AUTO_COMPACT_PERCENT, normalizeAutoCompactEditing, normalizeAutoCompactPercent } from "./auto-compact";
 import { mergeGrokProviderSnapshot, mergeSettingsDraft, runSingleFlight } from "./settings-draft";
 import {
@@ -1474,6 +1475,15 @@ export function App() {
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
     }
     return result;
+  };
+
+  const reloadUserScripts = async () => {
+    const result = await run(() => call<SettingsResult>("reload_user_scripts"));
+    if (result) {
+      setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
+      setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+      showResultNotice(t("本地脚本"), result);
+    }
   };
 
   const installMarketScript = async (id: string) => {
@@ -3840,6 +3850,7 @@ export function App() {
       refreshAds,
       refreshScriptMarket,
       refreshUserScriptInventory,
+      reloadUserScripts,
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
@@ -4302,6 +4313,7 @@ type Actions = {
   refreshAds: () => Promise<void>;
   refreshScriptMarket: () => Promise<void>;
   refreshUserScriptInventory: () => Promise<SettingsResult | null>;
+  reloadUserScripts: () => Promise<void>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
@@ -7386,6 +7398,16 @@ function SkillBackupManager({ backups, actions }: { backups: SkillBackup[]; acti
 }
 
 function UserScriptsScreen({ settings, market, actions }: { settings: SettingsResult | null; market: ScriptMarketResult | null; actions: Actions }) {
+  const [reloading, setReloading] = useState(false);
+  const reload = async () => {
+    if (reloading) return;
+    setReloading(true);
+    try {
+      await actions.reloadUserScripts();
+    } finally {
+      setReloading(false);
+    }
+  };
   const inventory = settings?.user_scripts;
   const scripts = inventory?.scripts ?? [];
   const marketScripts = market?.market.scripts ?? [];
@@ -7433,6 +7455,10 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
             <Button onClick={() => void actions.refreshCurrent()} variant="secondary">
               <RefreshCw className="h-4 w-4" />
               {t("刷新本地")}
+            </Button>
+            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地脚本及开关；旧脚本可能需要刷新 Codex 页面")}>
+              <RefreshCw className={reloading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+              {t("热重载脚本")}
             </Button>
           </Toolbar>
         </CardContent>
@@ -8639,6 +8665,8 @@ function RelayProfileDetail({
   actions: Actions;
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
+  const draftRef = useRef(draft);
+  const modelFieldsTouchedRef = useRef(false);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact),
   );
@@ -8649,8 +8677,11 @@ function RelayProfileDetail({
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
   useEffect(() => {
+    modelFieldsTouchedRef.current = false;
+  }, [profile.id]);
+  useEffect(() => {
     const useLiveFiles = isActive && profileUsesLiveFiles && relayFiles;
-    const liveDraft = isAggregateRelayProfile(profile)
+    const derivedLiveDraft = isAggregateRelayProfile(profile)
       ? normalizeAggregateRelayProfile(profile, form)
       : deriveRelayProfileFromFiles(
           useLiveFiles
@@ -8661,13 +8692,40 @@ function RelayProfileDetail({
             }
             : profile,
         );
+    const modelListHead = profile.modelList
+      .split(/[\r\n,]+/)
+      .map((model) => model.trim())
+      .find(Boolean);
+    const modelHeadSlug = modelListHead ? parseModelSuffix(modelListHead).slug : "";
+    const liveDraft = useLiveFiles && !isAggregateRelayProfile(profile)
+      ? reconcileRelayModelDraft(
+        profile,
+        draftRef.current,
+        derivedLiveDraft,
+        {
+          liveModel: codexModelFromConfig(derivedLiveDraft.configContents),
+          modelListHead: modelHeadSlug,
+        },
+        modelFieldsTouchedRef.current,
+        codexModelFromConfig,
+        (contents, model) => setRootTomlStringKey(contents, "model", parseModelSuffix(model).slug),
+      )
+      : derivedLiveDraft;
     const storedApiKey = useLiveFiles ? profile.apiKey.trim() : "";
     const nextDraft = useLiveFiles && !isAggregateRelayProfile(liveDraft)
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
+    draftRef.current = nextDraft;
     setDraft(nextDraft);
     setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact));
-  }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelMetadata, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
+  }, [profile.id, profile.model, profile.configContents, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelMetadata, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
+  const updateDraftProfile = (next: RelayProfile) => {
+    if (relayModelFieldsChanged(draftRef.current, next, codexModelFromConfig)) {
+      modelFieldsTouchedRef.current = true;
+    }
+    draftRef.current = next;
+    setDraft(next);
+  };
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
   const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
@@ -8791,7 +8849,7 @@ function RelayProfileDetail({
           profile={draft}
           form={form}
           isNew={isNew}
-          onProfileChange={setDraft}
+          onProfileChange={updateDraftProfile}
           actions={actions}
           modelWindowRows={modelWindowRows}
           setModelWindowRows={setModelWindowRows}
@@ -8804,7 +8862,7 @@ function RelayProfileDetail({
           isActive={isActive}
           profileId={profile.id}
           onFormChange={onFormChange}
-          onProfileChange={setDraft}
+          onProfileChange={updateDraftProfile}
           actions={actions}
         />
         )}

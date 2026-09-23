@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use crate::settings::{BackendSettings, RelayProfile, RelayProtocol, RelaySessionProvider};
+use crate::settings::{
+    BackendSettings, RelayMode, RelayProfile, RelayProtocol, RelaySessionProvider,
+};
 
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
@@ -294,24 +296,65 @@ pub fn ensure_active_protocol_proxy_config_in_home(
         == RelaySessionProvider::Openai
         || (profile.relay_mode == crate::settings::RelayMode::Official
             && profile.official_mix_api_key);
-    if !transport_uses_proxy && !openai_identity_uses_proxy {
-        return Ok(false);
-    }
 
     let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("读取 {} 失败", config_path.display()))?;
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(existing) => existing,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !transport_uses_proxy
+                && !openai_identity_uses_proxy =>
+        {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 {} 失败", config_path.display()));
+        }
+    };
     let mut doc = parse_toml_document(&existing)?;
     let managed = managed_openai_base_url();
     let mut changed = false;
+    let session_provider_id = active_session_provider_id(&doc);
+    let transport_provider_id = if session_provider_id == "openai" {
+        RELAY_PROVIDER.to_string()
+    } else {
+        active_or_default_provider_id(&doc)
+    };
+
+    // Existing configs can retain the built-in OpenAI display name after an
+    // upgrade. Codex uses that name to enable remote compaction v2, which
+    // third-party relays do not implement, so repair it before launch.
+    let provider_name_needs_repair = session_provider_id != "openai"
+        && doc
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(&transport_provider_id))
+            .and_then(Item::as_table)
+            .and_then(|provider| provider.get("name"))
+            .and_then(Item::as_str)
+            .map(str::trim)
+            == Some("OpenAI");
+    if provider_name_needs_repair {
+        let provider = doc
+            .get_mut("model_providers")
+            .and_then(Item::as_table_mut)
+            .and_then(|providers| providers.get_mut(&transport_provider_id))
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "活动 provider 需要修复 model_providers.{transport_provider_id}.name"
+                )
+            })?;
+        provider["name"] = toml_edit::value(transport_provider_id.as_str());
+        changed = true;
+    }
+
+    if !transport_uses_proxy && !openai_identity_uses_proxy && !changed {
+        return Ok(false);
+    }
 
     if transport_uses_proxy {
-        let session_provider_id = active_session_provider_id(&doc);
-        let transport_provider_id = if session_provider_id == "openai" {
-            RELAY_PROVIDER.to_string()
-        } else {
-            active_or_default_provider_id(&doc)
-        };
         let provider = doc
             .get_mut("model_providers")
             .and_then(Item::as_table_mut)
@@ -445,13 +488,26 @@ pub fn apply_relay_files_to_home(
     config_contents: &str,
     auth_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
+    apply_relay_files_to_home_with_live_mcp_policy(home, config_contents, auth_contents, true)
+}
+
+fn apply_relay_files_to_home_with_live_mcp_policy(
+    home: &Path,
+    config_contents: &str,
+    auth_contents: &str,
+    preserve_live_mcp: bool,
+) -> anyhow::Result<RelayApplyResult> {
     if config_contents.trim().is_empty() {
         anyhow::bail!("config.toml 内容不能为空");
     }
     std::fs::create_dir_all(home)?;
 
-    let backup_path =
-        write_codex_live_atomic(home, Some(config_contents), Some(auth_contents.as_bytes()))?;
+    let backup_path = write_codex_live_atomic_with_live_mcp_policy(
+        home,
+        Some(config_contents),
+        Some(auth_contents.as_bytes()),
+        preserve_live_mcp,
+    )?;
 
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
@@ -485,7 +541,12 @@ pub fn apply_relay_files_to_home_with_context(
         preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
     let config_with_limits =
         apply_context_limits_to_config(&config_with_common, context_window, auto_compact_limit)?;
-    apply_relay_files_to_home(home, &config_with_limits, auth_contents)
+    apply_relay_files_to_home_with_live_mcp_policy(
+        home,
+        &config_with_limits,
+        auth_contents,
+        false,
+    )
 }
 
 pub fn apply_relay_profile_files_to_home_with_context(
@@ -512,8 +573,174 @@ pub fn apply_relay_profile_files_to_home_with_context(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-        apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+        apply_relay_files_to_home_with_live_mcp_policy(
+            home,
+            &compatible_config,
+            &profile.auth_contents,
+            false,
+        )
     })
+}
+
+/// issue #2264：用户未声明默认模型时，重启后 Codex 会把默认 model 回落到
+/// model_list 第一条，目标模式任务自动继续时被静默换模型。这里在 apply 时把
+/// 未归档目标任务的持久化模型注入 profile.model；已有 config_contents model
+/// 声明不覆盖，仅在确认是工具写入的隐式 model 时剥离，形成回落链
+/// profile.model → 目标任务模型 → model_list 第一条。
+/// 显式配置了默认模型的用户不受影响。无法从现有持久化格式可靠区分“显式首项”
+/// 与历史工具污染首项，因此宁可保留非空声明，也不以首项相等作为覆盖依据。
+fn align_profile_model_with_active_goal_thread(home: &Path, profile: &RelayProfile) -> RelayProfile {
+    if profile.model_list.trim().is_empty() {
+        return profile.clone();
+    }
+    let Some(goal_model) = crate::codex_sqlite::latest_unarchived_goal_thread_model(home)
+        .filter(|model| !model.trim().is_empty())
+        .map(|model| model.trim().to_string())
+    else {
+        return profile.clone();
+    };
+    let goal_model = crate::model_suffix::parse_model_suffix(&goal_model).0;
+    if !model_list_contains(profile, &goal_model) {
+        return profile.clone();
+    }
+    let declared = relay_profile_model(profile).trim().to_string();
+    if !declared.is_empty() {
+        return profile.clone();
+    }
+    let mut next = profile.clone();
+    next.model = goal_model;
+    // 只有原 profile 未声明 model 时，工具写入的 model 行才会盖过注入值；
+    // strip helper 会据原模板意图判断是否允许剥离。
+    next.config_contents = strip_tool_written_model_from_config(
+        home,
+        profile,
+        &profile.config_contents,
+        &next.config_contents,
+    );
+    next
+}
+
+/// model_list 第一条（剥 catalog 后缀），与写入 config.toml 时的隐式默认一致。
+fn model_list_head(profile: &RelayProfile) -> String {
+    profile
+        .model_list
+        .split(['\r', '\n', ','])
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(|first| crate::model_suffix::parse_model_suffix(first).0)
+        .unwrap_or_default()
+}
+
+fn model_list_contains(profile: &RelayProfile, model: &str) -> bool {
+    let model = crate::model_suffix::parse_model_suffix(model.trim()).0;
+    !model.is_empty()
+        && profile
+            .model_list
+            .split(['\r', '\n', ','])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(crate::model_suffix::parse_model_suffix)
+            .any(|(slug, _)| slug == model)
+}
+
+/// issue #2264：config.toml 根部的 `model =` 可能是工具写入的隐式默认——
+/// model_list 第一条，或目标任务对齐值——而非用户显式意图。backfill 时这类
+/// 值不得固化进 profile（config_contents / profile.model），否则会反过来挡住
+/// 后续的目标任务对齐，模型漂移重现。值与当前目标任务模型相等时视为工具
+/// 写入是安全的：apply 每次都会按最新目标模型重新注入，不需要 backfill 保存。
+fn live_model_is_tool_written(home: &Path, profile: &RelayProfile, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    if model == model_list_head(profile) {
+        return true;
+    }
+    crate::codex_sqlite::latest_unarchived_goal_thread_model(home)
+        .map(|goal_model| crate::model_suffix::parse_model_suffix(goal_model.trim()).0)
+        .map(|goal_model| goal_model == model)
+        .unwrap_or(false)
+}
+
+/// backfill 场景下剥掉 config 文本里工具写入的隐式默认 `model =` 根键。
+/// `template_config` 必须是回填前的原 profile 配置；backfill_with_common 会先
+/// 用 live config 替换 profile.config_contents，不能再从替换后的内容判断用户意图。
+fn strip_tool_written_model_from_config(
+    home: &Path,
+    profile: &RelayProfile,
+    template_config: &str,
+    config_text: &str,
+) -> String {
+    if !profile.model.trim().is_empty()
+        || root_key_string(template_config, "model").is_some()
+    {
+        return config_text.to_string();
+    }
+    let Some(model) = root_key_string(config_text, "model") else {
+        return config_text.to_string();
+    };
+    if !live_model_is_tool_written(home, profile, &model) {
+        return config_text.to_string();
+    }
+    match parse_toml_document(config_text) {
+        Ok(mut doc) => {
+            doc.as_table_mut().remove("model");
+            normalize_optional_toml(doc)
+        }
+        Err(_) => config_text.to_string(),
+    }
+}
+
+/// issue #2264：重启链路上的模型漂移修复点。launcher 启动时不重放完整 apply
+/// （避免覆盖 Codex 在 UI 选择后回写的 live 值），但 config.toml 里若还是
+/// 「工具写入的隐式默认」——为空、等于 profile 模板声明值、或等于 model_list
+/// 第一条——且存在未归档目标任务，就把根 model 改写为目标任务模型。返回是否
+/// 发生了改写。profile 已有明确 model 字段时一律保留，避免把显式首项当污染。
+pub fn align_live_config_model_with_goal_thread(
+    home: &Path,
+    profile: &RelayProfile,
+) -> anyhow::Result<bool> {
+    let config_path = home.join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return Ok(false);
+    };
+    let live_model = root_key_string(&text, "model").unwrap_or_default();
+    let live = live_model.trim();
+    if !profile.model.trim().is_empty() {
+        return Ok(false);
+    }
+    let declared = relay_profile_model(profile).trim().to_string();
+    if !declared.is_empty() {
+        return Ok(false);
+    }
+    let head = model_list_head(profile);
+    if !live.is_empty() && live != head {
+        return Ok(false);
+    }
+    let Some(goal_model) = crate::codex_sqlite::latest_unarchived_goal_thread_model(home)
+        .filter(|model| !model.trim().is_empty())
+        .map(|model| model.trim().to_string())
+    else {
+        return Ok(false);
+    };
+    let goal_model = crate::model_suffix::parse_model_suffix(&goal_model).0;
+    if !model_list_contains(profile, &goal_model) {
+        return Ok(false);
+    }
+    if goal_model == live {
+        return Ok(false);
+    }
+    let mut doc = parse_toml_document(&text)?;
+    doc["model"] = toml_edit::value(goal_model.as_str());
+    crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.goal_thread_model_aligned",
+        serde_json::json!({
+            "from": live,
+            "to": goal_model,
+        }),
+    );
+    Ok(true)
 }
 
 pub fn apply_relay_profile_to_home_with_switch_rules(
@@ -521,6 +748,8 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     profile: &RelayProfile,
     common_config_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
+    let profile = align_profile_model_with_active_goal_thread(home, profile);
+    let profile = &profile;
     let selected_common = if profile.use_common_config {
         prepare_common_config_for_apply(common_config_contents)?
     } else {
@@ -542,10 +771,20 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
         if profile.relay_mode == crate::settings::RelayMode::PureApi {
-            apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+            apply_relay_files_to_home_with_live_mcp_policy(
+                home,
+                &compatible_config,
+                &profile.auth_contents,
+                false,
+            )
         } else {
             let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
-            apply_relay_files_to_home(home, &compatible_config, &auth_contents)
+            apply_relay_files_to_home_with_live_mcp_policy(
+                home,
+                &compatible_config,
+                &auth_contents,
+                false,
+            )
         }
     })
 }
@@ -815,14 +1054,23 @@ pub fn clear_relay_config_to_home_with_auth(
     };
     let config_path = home.join("config.toml");
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let mut without_tables = existing;
+    // 必须在删除 model_provider 之前读：下面的根键清理会把判断依据删掉。
+    // 用它决定要不要连 model 一起清——中转站选的模型名留在官方模式下，
+    // 模型选择器仍会显示它（issue #2216）。
+    let active_provider = parse_toml_document(&existing)
+        .ok()
+        .and_then(|doc| active_provider_id(&doc));
+    let mut doc = parse_toml_document(&existing)?;
+    // 中转站与旧版 provider 的整段配置一律移除，不看它是否当前激活：
+    // 只删认证字段会留下 base_url（切回官方后请求仍发往中转站，issue #2216），
+    // 而「未被激活就跳过」会让切走时残留的 token 继续留在文件里。
+    // 这里清的是 Codex++ 自己管理的 provider（custom / 旧版名），
+    // 用户自定义的其它 provider（如 custom1）不受影响。
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
-        without_tables = remove_table(
-            &without_tables,
-            &format!("model_providers.{legacy_provider}"),
-        );
+        remove_provider_table(&mut doc, legacy_provider);
     }
-    let mut updated = without_tables;
+    remove_provider_table(&mut doc, RELAY_PROVIDER);
+    let mut updated = normalize_optional_toml(doc);
     for key in [
         "OPENAI_API_KEY",
         "model_provider",
@@ -836,7 +1084,14 @@ pub fn clear_relay_config_to_home_with_auth(
     ] {
         updated = remove_root_key(&updated, key);
     }
-    updated = remove_model_provider_auth_fields(&updated, RELAY_PROVIDER)?;
+    // 只用在中转站 provider 名下时才清 model；用户手写的官方模型名要保留。
+    if active_provider.as_deref() == Some(RELAY_PROVIDER)
+        || active_provider
+            .as_deref()
+            .is_some_and(|provider| LEGACY_RELAY_PROVIDERS.contains(&provider))
+    {
+        updated = remove_root_key(&updated, "model");
+    }
     updated = remove_managed_remote_control_openai_base_url(&updated)?;
     let backup_path = write_codex_live_atomic(home, Some(&updated), auth_bytes.as_deref())?;
     let status = relay_config_status_from_home(home);
@@ -845,25 +1100,6 @@ pub fn clear_relay_config_to_home_with_auth(
         backup_path,
         configured: status.configured,
     })
-}
-
-fn remove_model_provider_auth_fields(contents: &str, provider_id: &str) -> anyhow::Result<String> {
-    let mut doc = parse_toml_document(contents)?;
-    if let Some(provider) = doc
-        .get_mut("model_providers")
-        .and_then(Item::as_table_mut)
-        .and_then(|providers| providers.get_mut(provider_id))
-        .and_then(Item::as_table_mut)
-    {
-        for key in [
-            "experimental_bearer_token",
-            "env_key",
-            "requires_openai_auth",
-        ] {
-            provider.remove(key);
-        }
-    }
-    Ok(normalize_optional_toml(doc))
 }
 
 fn pure_api_auth_json_removed(home: &Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -890,12 +1126,19 @@ pub fn backfill_relay_profile_from_home(
     home: &Path,
     profile: &mut RelayProfile,
 ) -> anyhow::Result<()> {
-    profile.config_contents = read_optional_text(&home.join("config.toml"))?;
+    let live_contents = read_optional_text(&home.join("config.toml"))?;
+    let template_config = profile.config_contents.clone();
+    profile.config_contents = strip_tool_written_model_from_config(
+        home,
+        profile,
+        &template_config,
+        &live_contents,
+    );
     profile.auth_contents = read_optional_text(&home.join("auth.json"))?;
     let live_config = profile.config_contents.clone();
     sync_context_limits_from_config(profile, &live_config);
     if profile.model.trim().is_empty() {
-        if let Some(model) = root_key_string(&profile.config_contents, "model") {
+        if let Some(model) = root_key_string(&live_config, "model") {
             profile.model = model;
         }
     }
@@ -919,6 +1162,12 @@ pub fn backfill_relay_profile_from_home_with_common(
     };
     profile.config_contents =
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
+    profile.config_contents = strip_tool_written_model_from_config(
+        home,
+        profile,
+        &template_config,
+        &profile.config_contents,
+    );
     if profile.protocol == RelayProtocol::Responses
         && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
             == Some(
@@ -945,8 +1194,11 @@ pub fn backfill_relay_profile_from_home_with_common(
     )?;
     sync_profile_mode_from_backfilled_live(profile);
     sync_context_limits_from_config(profile, &live_config);
+    // 回填源用剥离工具写入 model 后的 config_contents：live_config 里的
+    // `model =` 可能是 apply 写入的隐式默认/目标任务对齐值，固化进
+    // profile.model 会挡住后续对齐（issue #2264）。
     if profile.model.trim().is_empty() {
-        if let Some(model) = root_key_string(&live_config, "model") {
+        if let Some(model) = root_key_string(&profile.config_contents, "model") {
             profile.model = model;
         }
     }
@@ -1245,6 +1497,15 @@ fn write_codex_live_atomic(
     config_text: Option<&str>,
     auth_bytes: Option<&[u8]>,
 ) -> anyhow::Result<Option<String>> {
+    write_codex_live_atomic_with_live_mcp_policy(home, config_text, auth_bytes, true)
+}
+
+fn write_codex_live_atomic_with_live_mcp_policy(
+    home: &Path,
+    config_text: Option<&str>,
+    auth_bytes: Option<&[u8]>,
+    preserve_live_mcp: bool,
+) -> anyhow::Result<Option<String>> {
     std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let auth_path = home.join("auth.json");
@@ -1255,7 +1516,11 @@ fn write_codex_live_atomic(
 
     let config_text = match config_text {
         Some(config_text) => {
-            let config_text = preserve_live_app_settings(home, config_text)?;
+            let config_text = preserve_live_app_settings_with_live_mcp_policy(
+                home,
+                config_text,
+                preserve_live_mcp,
+            )?;
             Some(preserve_live_marketplace_configs(home, &config_text)?)
         }
         None => None,
@@ -1711,7 +1976,21 @@ fn normalize_config_text_for_write(config_text: &str) -> String {
     config_text.trim_start_matches('\u{feff}').to_string()
 }
 
+/// 供集成测试直接验证 live 设置保留逻辑。
+#[doc(hidden)]
+pub fn preserve_live_app_settings_for_test(home: &Path, config_text: &str) -> anyhow::Result<String> {
+    preserve_live_app_settings(home, config_text)
+}
+
 fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<String> {
+    preserve_live_app_settings_with_live_mcp_policy(home, config_text, true)
+}
+
+fn preserve_live_app_settings_with_live_mcp_policy(
+    home: &Path,
+    config_text: &str,
+    preserve_live_mcp: bool,
+) -> anyhow::Result<String> {
     let normalized = normalize_config_text_for_write(config_text);
     let mut target_doc = parse_toml_document(&normalized)?;
     remove_unsupported_approval_policies(&mut target_doc);
@@ -1728,15 +2007,15 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
         }
     }
     // Windows 沙盒实现属于本机设置，切换模板时保留，避免重启后重新要求设置。
-    for key in [
-        "sandbox_mode",
-        "approval_policy",
-        "sandbox_workspace_write",
-        "windows",
-    ] {
+    for key in ["sandbox_mode", "approval_policy", "sandbox_workspace_write", "windows"] {
         if let Some(live_value) = live_doc.get(key).cloned() {
             merge_toml_item(&mut target_doc[key], &live_value);
         }
+    }
+    if preserve_live_mcp {
+        // 普通 raw 写入保留用户/Codex 桌面端直接管理的 MCP；context 链路已经
+        // 按 enabled 和模板归属完成筛选，不能在最终写入阶段把 live 条目补回来。
+        preserve_missing_table_keys(&mut target_doc, &live_doc, "mcp_servers");
     }
     // Preserve user-managed feature flags such as multi_agent_v2 and memories.
     preserve_missing_table_keys(&mut target_doc, &live_doc, "features");
@@ -1988,6 +2267,14 @@ fn apply_model_catalog_to_config(
     // Catalog capabilities must follow the effective config, not stale profile URLs.
     let official_deepseek_responses =
         uses_official_deepseek_responses_for_config(profile, &config_text);
+    // Lite 线格式只有 ChatGPT 产品后端支持；官方登录态才可能走该通道，
+    // 其余上游（公开 API / 中转）一律标准 Responses。判定基于生成后的
+    // 有效 config 而非 profile 陈旧 URL，与 deepseek 判定同一模式。
+    let official_login = profile.relay_mode == RelayMode::Official;
+    let lite_supported = upstream_supports_responses_lite(
+        effective_provider_base_url(&config_text).as_deref(),
+        official_login,
+    );
     let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
     // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）。
     // Codex++ 管理的 catalog 必须随当前 profile 切换；否则前一个供应商的模型列表会残留。
@@ -2020,6 +2307,7 @@ fn apply_model_catalog_to_config(
                         &catalog_relative,
                         &entries,
                         fallback,
+                        lite_supported,
                     )?
                 {
                     let mut doc = parse_toml_document(&config_text)?;
@@ -2046,6 +2334,7 @@ fn apply_model_catalog_to_config(
                 &catalog_relative,
                 &entries,
                 fallback,
+                lite_supported,
             )?
         {
             doc["model_catalog_json"] = toml_edit::value(catalog_relative);
@@ -2078,13 +2367,13 @@ fn apply_model_catalog_to_config(
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Only custom Responses providers need the standard Responses tool wire format. Official
-    // profiles and custom Chat Completions retain the model template's original Lite behavior.
+    // Lite 线格式跟随上游能力：仅官方登录态 + ChatGPT 后端保留模板原值，
+    // 公开 API / 第三方中转一律关闭（标准 Responses），不再以 provider id 近似判断。
     let catalog_json = crate::model_suffix::build_model_catalog_json_with_capabilities(
         &entries,
         fallback,
         None,
-        custom_responses.then_some(false),
+        (!lite_supported).then_some(false),
         official_deepseek_responses,
     );
     let catalog_json = apply_model_metadata_overrides(&catalog_json, &model_metadata)?;
@@ -2227,6 +2516,57 @@ fn deepseek_api_base_url(base_url: &str) -> bool {
     host == "deepseek.com" || host.ends_with(".deepseek.com")
 }
 
+/// Responses Lite 线格式（X-OpenAI-Internal-Codex-Responses-Lite 头）只有
+/// ChatGPT 产品后端实现；官方公开 API（api.openai.com）与第三方中转均只支持
+/// 标准 Responses（判定锚点对齐 sub2api accountCodexToolCapabilities：
+/// 认证模式 + 有效 base_url 主机名，而非 provider id）。
+///
+/// false 是安全默认：declared false 而上游其实支持，损失的只是 Lite 降级优化；
+/// declared true 而上游不支持，是运行时不可预期的线格式错配。
+/// URL 解析失败一律 false，不猜测。
+fn upstream_supports_responses_lite(effective_base_url: Option<&str>, official_login: bool) -> bool {
+    if !official_login {
+        return false;
+    }
+    let Some(base_url) = effective_base_url else {
+        return false;
+    };
+    let host = base_url
+        .trim()
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host == "chatgpt.com" || host.ends_with(".chatgpt.com")
+}
+
+/// 从生成后的有效 config 读取 active transport provider 的 base_url。
+/// 注意会话身份（model_provider）可能是保留 id（openai），但 base_url 实际
+/// 写在传输表 [model_providers.custom]；故用 active_or_default_provider_id
+/// 定位，openai 身份回落 custom 表。仍查不到时回落顶层 base_url。
+fn effective_provider_base_url(config_text: &str) -> Option<String> {
+    let doc = parse_toml_document(config_text).ok()?;
+    let provider_id = active_or_default_provider_id(&doc);
+    if let Some(base_url) = doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+    {
+        return Some(base_url.to_string());
+    }
+    root_key_string(config_text, "base_url")
+}
+
 pub fn apply_deepseek_responses_compatibility(
     profile: &RelayProfile,
     config_text: &str,
@@ -2300,6 +2640,7 @@ fn copy_standard_responses_catalog(
     target_relative: &str,
     entries: &[crate::model_suffix::ModelCatalogEntry],
     fallback_window: Option<u64>,
+    lite_supported: bool,
 ) -> anyhow::Result<bool> {
     let source_path = {
         let path = Path::new(source);
@@ -2324,7 +2665,12 @@ fn copy_standard_responses_catalog(
         .map(|entry| (entry.slug.as_str(), entry.suffix_window.or(fallback_window)))
         .collect::<std::collections::HashMap<_, _>>();
     for model in models {
-        if model.get("use_responses_lite").and_then(Value::as_bool) == Some(true) {
+        // Lite 能力跟随上游：官方登录 + ChatGPT 后端保留原值，
+        // 其余上游强制关闭（外部目录的 Lite 标记可能照抄官方目录，
+        // 与实际上游能力无关，见 upstream_supports_responses_lite）。
+        if !lite_supported
+            && model.get("use_responses_lite").and_then(Value::as_bool) == Some(true)
+        {
             model["use_responses_lite"] = Value::Bool(false);
             changed = true;
         }
@@ -3009,6 +3355,19 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["name"] = toml_edit::value(transport_provider_id.as_str());
     }
+    // codex 用 `name == "OpenAI"` 的严格匹配判定 provider 是否走 v2 远程压缩
+    // （RemoteCompactionSupport::V2，见 openai/codex issue #42313），第三方中转
+    // 顶着这个名字会被要求返回 `compaction` 输出项而稳定报错（issue #2217）。
+    // 只有真正的 OpenAI 会话身份（官方 OAuth / 混合模式）可以保留该名称，
+    // 其余情况一律改写成 provider id，让 codex 回退到本地压缩。
+    if !uses_openai_provider
+        && provider
+            .get("name")
+            .and_then(Item::as_str)
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case("OpenAI"))
+    {
+        provider["name"] = toml_edit::value(transport_provider_id.as_str());
+    }
     // Codex 26.901 起不再支持 `wire_api = "chat"`（见 openai/codex discussion #7782），
     // 一旦出现会导致整份 config.toml 被判为无效并回退内置默认模型。
     // Chat Completions 上游由本地协议代理（protocol_proxy）负责 responses→chat 转换，
@@ -3120,11 +3479,23 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
     }
     let source_base_url = relay_profile_base_url(profile);
     let source_api_key = relay_profile_api_key(profile);
+    let has_declared_model = !profile.model.trim().is_empty()
+        || root_key_string(&profile.config_contents, "model")
+            .is_some_and(|model| !model.trim().is_empty());
     if !profile.config_contents.trim().is_empty()
         || profile.relay_mode == crate::settings::RelayMode::PureApi
         || profile.official_mix_api_key
     {
         profile.config_contents = complete_relay_profile_config(profile)?;
+        if !has_declared_model && !profile.model_list.trim().is_empty() {
+            // Keep the model-list fallback runtime-generated. Persisting it here
+            // would make it indistinguishable from an explicit profile choice.
+            let mut doc = parse_toml_document(&profile.config_contents)?;
+            doc.as_table_mut().remove("model");
+            profile.config_contents = move_model_providers_before_profiles(
+                &ensure_trailing_newline(doc.to_string()),
+            );
+        }
     }
     // PureApi 模式下 `complete_relay_profile_config` 会移除 config.toml 里的
     // `experimental_bearer_token`，auth.json 是 key 唯一的落点。
@@ -3673,6 +4044,80 @@ cwd = \"/tmp\"
         assert!(!profile.config_contents.contains("[model_providers.custom]"));
     }
 
+    fn explicit_config_backfill_profile(model: &str) -> RelayProfile {
+        RelayProfile {
+            relay_mode: crate::settings::RelayMode::PureApi,
+            protocol: crate::settings::RelayProtocol::Responses,
+            model_list: "astra-6-high\ngpt-5.6-luna-max".to_string(),
+            config_contents: format!(
+                "model = \"{model}\"\nmodel_provider = \"ai\"\n\n[model_providers.ai]\nname = \"ai\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://ahg.codes\"\n"
+            ),
+            auth_contents: "{}\n".to_string(),
+            ..RelayProfile::default()
+        }
+    }
+
+    fn write_live_backfill_config(home: &Path, model: &str) {
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "model = \"{model}\"\nmodel_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://ahg.codes\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(home.join("auth.json"), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn backfill_preserves_explicit_config_model_for_head_and_goal() {
+        for model in ["astra-6-high", "gpt-5.6-luna-max"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_live_backfill_config(temp.path(), model);
+            if model == "gpt-5.6-luna-max" {
+                write_goal_thread_fixture_db(
+                    temp.path(),
+                    &[("t-goal", model)],
+                    &[("t-goal", "2026-09-21T02:00:00Z", None)],
+                );
+            }
+
+            let mut profile = explicit_config_backfill_profile(model);
+            backfill_relay_profile_from_home(temp.path(), &mut profile).unwrap();
+
+            let expected_model = format!("model = \"{model}\"");
+            assert!(profile.config_contents.contains(expected_model.as_str()));
+            assert_eq!(profile.model, model);
+        }
+    }
+
+    #[test]
+    fn backfill_with_common_preserves_explicit_config_model_for_head_and_goal() {
+        for model in ["astra-6-high", "gpt-5.6-luna-max"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_live_backfill_config(temp.path(), model);
+            if model == "gpt-5.6-luna-max" {
+                write_goal_thread_fixture_db(
+                    temp.path(),
+                    &[("t-goal", model)],
+                    &[("t-goal", "2026-09-21T02:00:00Z", None)],
+                );
+            }
+
+            let mut profile = explicit_config_backfill_profile(model);
+            let mut common = String::new();
+            backfill_relay_profile_from_home_with_common(
+                temp.path(),
+                &mut profile,
+                &mut common,
+            )
+            .unwrap();
+
+            let expected_model = format!("model = \"{model}\"");
+            assert!(profile.config_contents.contains(expected_model.as_str()));
+            assert_eq!(profile.model, model);
+        }
+    }
+
     #[test]
     fn relay_profile_model_prefers_config_then_field_then_empty() {
         // 1. 供應商測試的回退第一級：config.toml 的 model = 優先
@@ -3699,6 +4144,610 @@ cwd = \"/tmp\"
             ..RelayProfile::default()
         };
         assert!(relay_profile_model(&empty).trim().is_empty());
+    }
+
+    /// 伪造一个带 threads / automation_runs 表的 Codex 会话库。
+    /// 列名与真实 Codex schema 对齐（threads: id+model；automation_runs 至少含
+    /// thread_id / updated_at / archived_reason）。
+    fn write_goal_thread_fixture_db(home: &Path, threads: &[(&str, &str)], runs: &[(&str, &str, Option<&str>)]) {
+        let sqlite_dir = home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let conn = rusqlite::Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, model TEXT)",
+            [],
+        )
+        .unwrap();
+        for (id, model) in threads {
+            conn.execute(
+                "INSERT OR REPLACE INTO threads (id, model) VALUES (?1, ?2)",
+                [id, model],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS automation_runs (\
+                thread_id TEXT, automation_id TEXT, status TEXT, read_at TEXT, \
+                thread_title TEXT, source_cwd TEXT, inbox_title TEXT, inbox_summary TEXT, \
+                created_at TEXT, updated_at TEXT, archived_user_message TEXT, \
+                archived_assistant_message TEXT, archived_reason TEXT\
+             )",
+            [],
+        )
+        .unwrap();
+        for (thread_id, updated_at, archived_reason) in runs {
+            conn.execute(
+                "INSERT INTO automation_runs (thread_id, updated_at, archived_reason) VALUES (?1, ?2, ?3)",
+                rusqlite::params![thread_id, updated_at, archived_reason],
+            )
+            .unwrap();
+        }
+    }
+
+    fn goal_drift_test_profile() -> RelayProfile {
+        RelayProfile {
+            relay_mode: crate::settings::RelayMode::PureApi,
+            protocol: crate::settings::RelayProtocol::Responses,
+            config_contents: "model_provider = \"ai\"\n\n[model_providers.ai]\nname = \"ai\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://ahg.codes\"\n"
+                .to_string(),
+            auth_contents: "{}\n".to_string(),
+            model_list: "astra-6-high\ngpt-5.6-luna-max\nkimi-k3".to_string(),
+            ..RelayProfile::default()
+        }
+    }
+
+    fn apply_and_read_model(home: &Path, profile: &RelayProfile) -> String {
+        apply_relay_profile_to_home_with_switch_rules(home, profile, "").unwrap();
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix("model = "))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// issue #2264：重启后目标模式任务自动继续，但默认 model 回落到
+    /// model_list 第一条（astra-6-high），长线任务被静默换模型烧额度。
+    /// 修复预期：profile 未声明默认模型时，优先对齐未归档目标任务的持久化模型。
+    #[test]
+    fn apply_aligns_default_model_with_unarchived_goal_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max"), ("t-old", "astra-6-high")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(
+            model, "\"gpt-5.6-luna-max\"",
+            "未归档目标任务的模型应优先于 model_list 第一条"
+        );
+    }
+
+    /// 对照组：没有未归档目标任务时保持旧行为（model_list 第一条），
+    /// 无目标任务的用户不受本次修复影响。
+    #[test]
+    fn apply_keeps_model_list_head_without_unarchived_goal_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", Some("done"))],
+        );
+
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(model, "\"astra-6-high\"");
+    }
+
+    /// 用户显式声明的默认模型优先级最高，不被目标任务模型覆盖。
+    #[test]
+    fn apply_keeps_explicit_profile_model_over_goal_thread_model() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let mut profile = goal_drift_test_profile();
+        profile.model = "my-explicit-model".to_string();
+        let model = apply_and_read_model(temp.path(), &profile);
+        assert_eq!(model, "\"my-explicit-model\"");
+    }
+
+    /// threads 表缺 model 列（schema 漂移）时静默回落旧行为。
+    #[test]
+    fn apply_falls_back_when_threads_table_lacks_model_column() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        let sqlite_dir = temp.path().join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let conn = rusqlite::Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE automation_runs (thread_id TEXT, updated_at TEXT, archived_reason TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs VALUES ('t-goal', '2026-09-21T02:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(model, "\"astra-6-high\"");
+    }
+
+    /// 完全没有会话库时回落旧行为。
+    #[test]
+    fn apply_falls_back_without_session_db() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(model, "\"astra-6-high\"");
+    }
+
+    /// 目标任务的持久化模型带 catalog 后缀语法时，写入 config 前剥掉后缀。
+    #[test]
+    fn apply_strips_suffix_from_goal_thread_model() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max[1M]")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(model, "\"gpt-5.6-luna-max\"");
+    }
+
+    /// 多条未归档目标任务时取 updated_at 最新的一条。
+    #[test]
+    fn apply_prefers_most_recent_unarchived_goal_run() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-old", "qwen4-max"), ("t-new", "gpt-5.6-luna-max")],
+            &[
+                ("t-old", "2026-09-20T01:00:00Z", None),
+                ("t-new", "2026-09-21T02:00:00Z", None),
+            ],
+        );
+
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(model, "\"gpt-5.6-luna-max\"");
+    }
+
+    /// 显式首项与历史污染在现有持久化格式中不可可靠区分；保守规则是
+    /// 非空声明一律视为用户意图，不因目标任务存在而覆盖。
+    #[test]
+    fn apply_preserves_explicit_model_list_head() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let mut explicit_field = goal_drift_test_profile();
+        explicit_field.model = "astra-6-high".to_string();
+        assert_eq!(
+            apply_and_read_model(temp.path(), &explicit_field),
+            "\"astra-6-high\""
+        );
+
+        let mut explicit_config = goal_drift_test_profile();
+        explicit_config.config_contents = format!(
+            "model = \"astra-6-high\"\n{}",
+            explicit_config.config_contents
+        );
+        let model = apply_and_read_model(temp.path(), &explicit_config);
+        assert_eq!(
+            model, "\"astra-6-high\"",
+            "无法区分历史污染时不得猜测覆盖显式首项"
+        );
+    }
+
+    #[test]
+    fn apply_does_not_align_goal_model_from_other_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "other-provider-model")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let model = apply_and_read_model(temp.path(), &goal_drift_test_profile());
+        assert_eq!(
+            model, "\"astra-6-high\"",
+            "目标任务模型不属于当前 profile 时应保持当前供应商首项"
+        );
+    }
+
+    /// 完整时间线（issue #2264 的长期使用形态）：apply 对齐写入目标任务模型 →
+    /// 切换供应商触发 backfill → 用户把目标任务换到新模型 → 再次 apply。
+    /// backfill 不得把工具写入的目标任务模型固化进 profile，否则第二次 apply
+    /// 会被固化值挡住、漂移重现。
+    #[test]
+    fn apply_realigns_after_backfill_when_goal_model_changed() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let mut profile = goal_drift_test_profile();
+        // 第一次 apply：对齐写入 gpt-5.6-luna-max
+        assert_eq!(
+            apply_and_read_model(temp.path(), &profile),
+            "\"gpt-5.6-luna-max\""
+        );
+
+        // 切换供应商：backfill 把 live config 固化回 profile
+        let mut common = String::new();
+        backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common)
+            .unwrap();
+
+        // 目标任务换到新模型继续跑
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max"), ("t-goal-2", "kimi-k3")],
+            &[("t-goal-2", "2026-09-21T23:00:00Z", None)],
+        );
+
+        // 第二次 apply：必须对齐到新目标任务模型
+        let model = apply_and_read_model(temp.path(), &profile);
+        assert_eq!(
+            model, "\"kimi-k3\"",
+            "backfill 固化的旧目标任务模型不应挡住重新对齐"
+        );
+    }
+
+    /// launcher 启动时的 live config 对齐：issue #2264 的漂移发生在重启链路上，
+    /// 而 manager apply 不在重启路径里（launcher 不重放完整 apply，避免覆盖
+    /// Codex 回写的 live 值）。这一步只接管「工具写入的隐式默认」——live model
+    /// 为空、等于 profile 模板声明值、或等于 model_list 第一条——且有未归档
+    /// 目标任务时，把 config.toml 根 model 改写为目标任务模型。用户/Codex 在
+    /// UI 选择后回写的 live 值（不属于以上集合）一律不动。
+    #[test]
+    fn align_live_config_rewrites_tool_written_default_to_goal_model() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let profile = goal_drift_test_profile();
+        assert!(align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+        let model = apply_and_read_model_config_line(temp.path());
+        assert_eq!(model, "\"gpt-5.6-luna-max\"");
+    }
+
+    #[test]
+    fn settings_roundtrip_keeps_generated_model_list_head_alignable() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            &home,
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let profile = RelayProfile {
+            id: "goal-drift-roundtrip".to_string(),
+            relay_mode: crate::settings::RelayMode::PureApi,
+            protocol: crate::settings::RelayProtocol::Responses,
+            base_url: "https://relay.example/v1".to_string(),
+            api_key: "sk-test-redacted".to_string(),
+            model_list: "astra-6-high\ngpt-5.6-luna-max".to_string(),
+            ..RelayProfile::default()
+        };
+        assert!(profile.model.is_empty());
+        assert!(profile.config_contents.is_empty());
+
+        let store = crate::settings::SettingsStore::new(temp.path().join("settings.json"));
+        let settings = crate::settings::BackendSettings {
+            active_relay_id: profile.id.clone(),
+            relay_profiles: vec![profile],
+            ..crate::settings::BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+        let first_profile = loaded.active_relay_profile();
+        assert!(first_profile.model.is_empty());
+        assert!(root_key_string(&first_profile.config_contents, "model").is_none());
+
+        store.save(&loaded).unwrap();
+        let loaded_again = store.load().unwrap();
+        let loaded_profile = loaded_again.active_relay_profile();
+        assert!(loaded_profile.model.is_empty());
+        assert!(root_key_string(&loaded_profile.config_contents, "model").is_none());
+
+        assert!(
+            align_live_config_model_with_goal_thread(&home, &loaded_profile).unwrap(),
+            "launcher should replace the normalized model-list fallback"
+        );
+
+        assert_eq!(
+            root_key_string(
+                &std::fs::read_to_string(home.join("config.toml")).unwrap(),
+                "model"
+            )
+            .as_deref(),
+            Some("gpt-5.6-luna-max"),
+            "model 列表首项由归一化自动生成，不应阻挡目标任务模型对齐"
+        );
+    }
+
+    #[test]
+    fn settings_roundtrip_preserves_explicit_config_model_over_goal_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            &home,
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let profile = RelayProfile {
+            id: "explicit-config-model".to_string(),
+            relay_mode: crate::settings::RelayMode::PureApi,
+            protocol: crate::settings::RelayProtocol::Responses,
+            base_url: "https://relay.example/v1".to_string(),
+            api_key: "sk-test-redacted".to_string(),
+            config_contents: "model = \"astra-6-high\"\n".to_string(),
+            model_list: "astra-6-high\ngpt-5.6-luna-max".to_string(),
+            ..RelayProfile::default()
+        };
+        assert!(profile.model.is_empty());
+        let store = crate::settings::SettingsStore::new(temp.path().join("settings.json"));
+        let settings = crate::settings::BackendSettings {
+            active_relay_id: profile.id.clone(),
+            relay_profiles: vec![profile],
+            ..crate::settings::BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        let loaded_profile = store.load().unwrap().active_relay_profile();
+
+        assert_eq!(
+            root_key_string(&loaded_profile.config_contents, "model").as_deref(),
+            Some("astra-6-high")
+        );
+        assert!(
+            !align_live_config_model_with_goal_thread(&home, &loaded_profile).unwrap(),
+            "explicit config.toml model must not be aligned away"
+        );
+        assert_eq!(
+            root_key_string(
+                &std::fs::read_to_string(home.join("config.toml")).unwrap(),
+                "model"
+            )
+            .as_deref(),
+            Some("astra-6-high")
+        );
+    }
+
+    #[test]
+    fn settings_roundtrip_preserves_explicit_ui_model_over_goal_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            &home,
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let profile = RelayProfile {
+            id: "explicit-ui-model".to_string(),
+            relay_mode: crate::settings::RelayMode::PureApi,
+            protocol: crate::settings::RelayProtocol::Responses,
+            base_url: "https://relay.example/v1".to_string(),
+            api_key: "sk-test-redacted".to_string(),
+            model: "astra-6-high".to_string(),
+            model_list: "astra-6-high\ngpt-5.6-luna-max".to_string(),
+            ..RelayProfile::default()
+        };
+        let store = crate::settings::SettingsStore::new(temp.path().join("settings.json"));
+        let settings = crate::settings::BackendSettings {
+            active_relay_id: profile.id.clone(),
+            relay_profiles: vec![profile],
+            ..crate::settings::BackendSettings::default()
+        };
+        store.save(&settings).unwrap();
+        let loaded_profile = store.load().unwrap().active_relay_profile();
+
+        assert!(
+            !align_live_config_model_with_goal_thread(&home, &loaded_profile).unwrap(),
+            "explicit UI model must not be aligned away"
+        );
+        assert_eq!(
+            root_key_string(
+                &std::fs::read_to_string(home.join("config.toml")).unwrap(),
+                "model"
+            )
+            .as_deref(),
+            Some("astra-6-high")
+        );
+    }
+
+    /// Codex 在 UI 选择后回写的 live 值（不属于工具写入集合）必须保留。
+    #[test]
+    fn align_live_config_preserves_user_written_live_model() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"gpt-5.6-sol\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let profile = goal_drift_test_profile();
+        assert!(!align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+        let model = apply_and_read_model_config_line(temp.path());
+        assert_eq!(model, "\"gpt-5.6-sol\"");
+    }
+
+    #[test]
+    fn align_live_config_preserves_explicit_model_list_head() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        let mut profile = goal_drift_test_profile();
+        profile.model = "astra-6-high".to_string();
+        assert!(!align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+        assert_eq!(
+            apply_and_read_model_config_line(temp.path()),
+            "\"astra-6-high\""
+        );
+    }
+
+    #[test]
+    fn align_live_config_preserves_explicit_config_model_list_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut profile = goal_drift_test_profile();
+        profile.config_contents = format!(
+            "model = \"astra-6-high\"\n{}",
+            profile.config_contents
+        );
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "gpt-5.6-luna-max")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+
+        assert!(!align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+        assert_eq!(
+            apply_and_read_model_config_line(temp.path()),
+            "\"astra-6-high\""
+        );
+    }
+
+    /// 无未归档目标任务时不改写；live 值已等于目标任务模型时也不改写。
+    #[test]
+    fn align_live_config_noop_without_goal_or_when_matching() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"astra-6-high\"\nmodel_provider = \"ai\"\n",
+        )
+        .unwrap();
+        let profile = goal_drift_test_profile();
+        assert!(!align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "astra-6-high")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+        assert!(!align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+    }
+
+    fn apply_and_read_model_config_line(home: &Path) -> String {
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix("model = "))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn upstream_supports_responses_lite_matches_only_chatgpt_host() {
+        // 官方登录态下，仅 chatgpt.com 及其子域判 true
+        let official = true;
+        assert!(upstream_supports_responses_lite(
+            Some("https://chatgpt.com/backend-api/codex"),
+            official
+        ));
+        assert!(upstream_supports_responses_lite(
+            Some("https://ab.chatgpt.com/backend-api/codex"),
+            official
+        ));
+        assert!(upstream_supports_responses_lite(
+            Some("HTTPS://ChatGPT.com"),
+            official
+        ));
+        assert!(upstream_supports_responses_lite(
+            Some("https://chatgpt.com:443/backend-api"),
+            official
+        ));
+        assert!(!upstream_supports_responses_lite(
+            Some("https://api.openai.com/v1"),
+            official
+        ));
+        assert!(!upstream_supports_responses_lite(
+            Some("https://chatgpt.com.evil.example/v1"),
+            official
+        ));
+        assert!(!upstream_supports_responses_lite(
+            Some("https://notchatgpt.com/v1"),
+            official
+        ));
+        assert!(!upstream_supports_responses_lite(
+            Some("https://relay.example/v1"),
+            official
+        ));
+        // 非官方登录态一律 false
+        assert!(!upstream_supports_responses_lite(Some("https://chatgpt.com"), false));
+        // URL 缺失/无 scheme 一律 false（安全默认，不猜测）
+        assert!(!upstream_supports_responses_lite(None, official));
+        assert!(!upstream_supports_responses_lite(Some(""), official));
     }
 }
 
@@ -3769,26 +4818,6 @@ fn upsert_model_provider_config_with_session_provider(
     Ok(move_model_providers_before_profiles(
         &ensure_trailing_newline(doc.to_string()),
     ))
-}
-
-fn remove_table(contents: &str, table: &str) -> String {
-    let header = format!("[{table}]");
-    let mut lines = Vec::new();
-    let mut skipping = false;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed == header {
-                skipping = true;
-                continue;
-            }
-            skipping = false;
-        }
-        if !skipping {
-            lines.push(line.to_string());
-        }
-    }
-    lines.join("\n")
 }
 
 fn remove_root_key(contents: &str, key: &str) -> String {
