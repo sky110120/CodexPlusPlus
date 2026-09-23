@@ -456,9 +456,10 @@ pub fn apply_relay_config_to_home_with_session_provider(
         true,
         session_provider,
     )?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
+    // 保留 live auth.json 里已有的其它凭据（尤其是官方 OAuth `tokens`）：
+    // 整体覆盖成只含代理 Key 的 JSON 会清掉登录态，重启后 Codex 退回登录页
+    // （issue #1604 / PR #1813 的数据完整性风险）。
+    let auth_contents = auth_contents_with_proxy_key(home, "", bearer_token)?;
     let backup_path =
         write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
     let status = relay_config_status_from_home(home);
@@ -573,10 +574,21 @@ pub fn apply_relay_profile_files_to_home_with_context(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+        // 聚合 profile 的快照里没有凭据，必须现生成一份含代理 token 的合法 JSON，
+        // 否则会把 auth.json 写成空文件（issue #1604）。
+        let auth_contents = if profile.relay_mode == crate::settings::RelayMode::Aggregate {
+            auth_contents_with_proxy_key(
+                home,
+                &profile.auth_contents,
+                &relay_profile_api_key(profile),
+            )?
+        } else {
+            profile.auth_contents.clone()
+        };
         apply_relay_files_to_home_with_live_mcp_policy(
             home,
             &compatible_config,
-            &profile.auth_contents,
+            &auth_contents,
             false,
         )
     })
@@ -777,6 +789,21 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
                 &profile.auth_contents,
                 false,
             )
+        } else if profile.relay_mode == crate::settings::RelayMode::Aggregate {
+            // 聚合模式的实际请求发往本地代理，它需要 API 模式的凭据。
+            // 不能走 Official 分支删 OPENAI_API_KEY，否则 auth.json 会被清成空文件/空对象，
+            // Codex 判定未登录而弹登录页（issue #1604）。
+            let auth_contents = auth_contents_with_proxy_key(
+                home,
+                &profile.auth_contents,
+                &relay_profile_api_key(profile),
+            )?;
+            apply_relay_files_to_home_with_live_mcp_policy(
+                home,
+                &compatible_config,
+                &auth_contents,
+                false,
+            )
         } else {
             let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
             apply_relay_files_to_home_with_live_mcp_policy(
@@ -920,14 +947,9 @@ pub async fn test_relay_profile(
     }
 
     let payload = relay_profile_test_payload(profile.protocol, test_model);
-    let mut request = client
-        .post(&endpoint)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&payload);
-    if !profile.uses_no_auth() {
-        request = request.bearer_auth(api_key);
-    }
-    let response = request.send().await?;
+    let response = relay_test_request(&client, &endpoint, profile, api_key, &payload)
+        .send()
+        .await?;
     let http_status = response.status().as_u16();
 
     // 如果 404 且 base_url 末尾没有 /v1，尝试自动补 /v1 后再发一次。
@@ -939,14 +961,9 @@ pub async fn test_relay_profile(
             RelayProtocol::Responses => format!("{v1_url}/responses"),
             RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
         };
-        let mut request = client
-            .post(&v1_endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload);
-        if !profile.uses_no_auth() {
-            request = request.bearer_auth(api_key);
-        }
-        let v1_response = request.send().await?;
+        let v1_response = relay_test_request(&client, &v1_endpoint, profile, api_key, &payload)
+            .send()
+            .await?;
         let v1_status = v1_response.status().as_u16();
         if v1_status < 400 {
             let response_text = v1_response.text().await.unwrap_or_default();
@@ -967,6 +984,26 @@ pub async fn test_relay_profile(
         endpoint,
         response_preview: response_text.chars().take(320).collect(),
     })
+}
+
+/// 供应商测试请求：Content-Type + 认证 + 供应商自定义请求头。
+///
+/// 自定义头走 `relay_headers`，与协议代理、模型列表共用同一套优先级与过滤规则，
+/// 避免三处行为不一致（issue #1685）。
+fn relay_test_request(
+    client: &reqwest::Client,
+    endpoint: &str,
+    profile: &RelayProfile,
+    api_key: &str,
+    payload: &Value,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if !profile.uses_no_auth() && !crate::relay_headers::has_authorization(&profile.custom_headers) {
+        request = request.bearer_auth(api_key);
+    }
+    crate::relay_headers::apply_headers(request, &profile.custom_headers).json(payload)
 }
 
 fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
@@ -1150,7 +1187,11 @@ pub fn backfill_relay_profile_from_home_with_common(
     profile: &mut RelayProfile,
     common_config_contents: &mut String,
 ) -> anyhow::Result<()> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+    // Normalize before backfilling: the live config may carry a corrupted shape
+    // (for example two [mcp_servers.node_repl] headers under one parent), and
+    // copying it verbatim into the profile template would freeze that forever.
+    let live_config =
+        normalize_duplicate_toml_text(&read_optional_text(&home.join("config.toml"))?);
     let template_config = profile.config_contents.clone();
     let template_auth = profile.auth_contents.clone();
     let template_api_key = relay_profile_api_key(profile);
@@ -1807,17 +1848,47 @@ fn merge_duplicate_toml_blocks(contents: &str) -> Option<DocumentMut> {
     let mut current = String::new();
     let mut current_in_root = true;
     let mut current_root_keys: HashSet<String> = HashSet::new();
+    // 当前块的表头路径。父表头与它的真子表必须留在同一块里一起解析：子表
+    // 如果单独成块，toml_edit 会把父级数组表隐式降级成普通表，合并阶段整棵
+    // 数组表被覆盖，外层表头随之不再打印。
+    let mut current_header_path: Option<String> = None;
+    // 当前块内已声明过的标准表（非数组表）路径。同一个块里重复声明同一个
+    // 标准表会让整块 TOML 解析失败，随后整体退回逐行去重、丢掉后出现的字段。
+    let mut current_declared_headers: HashSet<String> = HashSet::new();
 
     for line in contents.lines() {
         let trimmed = line.trim();
         let is_new_table_header = trimmed.starts_with('[') && trimmed.ends_with(']');
 
         if is_new_table_header {
-            if !current.trim().is_empty() {
-                blocks.push(std::mem::take(&mut current));
+            let header_path = toml_header_path_of_line(trimmed);
+            let is_strict_child = match (current_header_path.as_deref(), header_path) {
+                (Some(parent), Some(child)) => is_strict_toml_child_path(parent, child),
+                _ => false,
+            };
+            let is_array_table = trimmed.starts_with("[[");
+            // 同一块里重复声明同一个标准表会让整块解析失败（真实故障：两个
+            // [mcp_servers.node_repl] 各写一部分键），随后整体退回逐行去重，
+            // 把后出现的那段字段整段丢掉。数组表允许重复声明，不参与判定。
+            let is_repeated_standard_table = match header_path {
+                Some(path) if !is_array_table => current_declared_headers.contains(path),
+                _ => false,
+            };
+
+            if !is_strict_child || is_repeated_standard_table {
+                if !current.trim().is_empty() {
+                    blocks.push(std::mem::take(&mut current));
+                }
+                current_in_root = false;
+                current_root_keys.clear();
+                current_declared_headers.clear();
+                current_header_path = header_path.map(str::to_string);
             }
-            current_in_root = false;
-            current_root_keys.clear();
+            if let Some(path) = header_path {
+                if !is_array_table {
+                    current_declared_headers.insert(path.to_string());
+                }
+            }
         } else if current_in_root && !trimmed.is_empty() && !trimmed.starts_with('#') {
             if let Some((key, _)) = trimmed.split_once('=') {
                 let key = key.trim().to_string();
@@ -1841,10 +1912,63 @@ fn merge_duplicate_toml_blocks(contents: &str) -> Option<DocumentMut> {
 
     let mut merged = DocumentMut::new();
     for block in blocks {
-        let block_doc: DocumentMut = block.parse().ok()?;
+        if let Ok(block_doc) = block.parse::<DocumentMut>() {
+            merge_toml_table_like(merged.as_table_mut(), block_doc.as_table());
+            continue;
+        }
+        // 单块解析失败时只降级这一块（块内逐行去重后再试），而不是让整体退回
+        // 全局逐行去重，避免一处坏块把其它块里已经解析好的字段一起丢掉。
+        let repaired = dedupe_duplicate_headers_within_block(&block);
+        let block_doc: DocumentMut = repaired.parse().ok()?;
         merge_toml_table_like(merged.as_table_mut(), block_doc.as_table());
     }
     Some(merged)
+}
+
+/// 单块级别的降级：在这一个块内部按整行表头字符串去重，保留首次出现的表头
+/// 及其表体，丢弃重复表头与它后面的表体。只在整块解析失败时对该块使用，
+/// 不改变其它块已经解析好的结果。
+fn dedupe_duplicate_headers_within_block(block: &str) -> String {
+    let mut seen_headers = HashSet::new();
+    let mut kept = Vec::new();
+    let mut skipping_duplicate_table = false;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skipping_duplicate_table = !seen_headers.insert(trimmed.to_string());
+            if skipping_duplicate_table {
+                continue;
+            }
+            kept.push(line);
+            continue;
+        }
+        if skipping_duplicate_table {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+/// 取出表头行括号里的路径；不是表头行时返回 None。
+fn toml_header_path_of_line(trimmed: &str) -> Option<&str> {
+    let inner = if let Some(rest) = trimmed.strip_prefix("[[") {
+        rest.strip_suffix("]]")?
+    } else if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.strip_suffix(']')?
+    } else {
+        return None;
+    };
+    let path = inner.trim();
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// 子表路径判定必须按点分段多出一级，而不是字符串前缀。
+fn is_strict_toml_child_path(parent: &str, child: &str) -> bool {
+    match child.strip_prefix(parent) {
+        Some(rest) => rest.strip_prefix('.').is_some_and(|tail| !tail.is_empty()),
+        None => false,
+    }
 }
 
 /// 逐块合并失败时的保底路径：原历史实现，逐行文本去重（丢弃后出现的重复表头/
@@ -1976,6 +2100,78 @@ fn normalize_config_text_for_write(config_text: &str) -> String {
     config_text.trim_start_matches('\u{feff}').to_string()
 }
 
+/// 用 live 的键补齐 target 里缺的键，不覆盖 target 已有的值。
+fn fill_missing_toml_item(target: &mut Item, source: &Item) {
+    if let Some(source_table) = source.as_table_like() {
+        if let Some(target_table) = target.as_table_like_mut() {
+            for (key, source_item) in source_table.iter() {
+                match target_table.get_mut(key) {
+                    Some(target_item) => fill_missing_toml_item(target_item, source_item),
+                    None => {
+                        target_table.insert(key, source_item.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// mcp_servers 的形状权威在 live。模板里可能留着被压平的残形（启动键缺失、
+/// env 键混进父表），这里在写盘前用 live 补齐缺键，并把与 env 子表重复的父表键移除。
+fn repair_mcp_servers_from_live(
+    target_doc: &mut DocumentMut,
+    live_doc: &DocumentMut,
+    preserve_missing_servers: bool,
+) {
+    let Some(live_servers) = live_doc.get("mcp_servers").and_then(Item::as_table_like) else {
+        return;
+    };
+    if target_doc
+        .get("mcp_servers")
+        .and_then(Item::as_table_like)
+        .is_none()
+    {
+        if !preserve_missing_servers {
+            return;
+        }
+        target_doc["mcp_servers"] = toml_edit::table();
+    }
+    let Some(target_servers) = target_doc["mcp_servers"].as_table_like_mut() else {
+        return;
+    };
+    for (id, live_item) in live_servers.iter() {
+        match target_servers.get_mut(id) {
+            Some(existing) => fill_missing_toml_item(existing, live_item),
+            None if preserve_missing_servers => {
+                target_servers.insert(id, live_item.clone());
+            }
+            None => {}
+        }
+    }
+    let ids: Vec<String> = target_servers
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    for id in ids {
+        let Some(table) = target_servers
+            .get_mut(id.as_str())
+            .and_then(Item::as_table_like_mut)
+        else {
+            continue;
+        };
+        let env_keys: Vec<String> = table
+            .get("env")
+            .and_then(Item::as_table_like)
+            .map(|env| env.iter().map(|(key, _)| key.to_string()).collect())
+            .unwrap_or_default();
+        for key in env_keys {
+            if key != "env" {
+                table.remove(key.as_str());
+            }
+        }
+    }
+}
+
 /// 供集成测试直接验证 live 设置保留逻辑。
 #[doc(hidden)]
 pub fn preserve_live_app_settings_for_test(home: &Path, config_text: &str) -> anyhow::Result<String> {
@@ -2012,13 +2208,14 @@ fn preserve_live_app_settings_with_live_mcp_policy(
             merge_toml_item(&mut target_doc[key], &live_value);
         }
     }
-    if preserve_live_mcp {
-        // 普通 raw 写入保留用户/Codex 桌面端直接管理的 MCP；context 链路已经
-        // 按 enabled 和模板归属完成筛选，不能在最终写入阶段把 live 条目补回来。
-        preserve_missing_table_keys(&mut target_doc, &live_doc, "mcp_servers");
-    }
+    // 两种写入都修复 target 已选中的条目；普通 raw 写入还会补回 live 中缺失的
+    // server，context/profile 写入则不能插入条目，以免复活已禁用的 MCP。
+    repair_mcp_servers_from_live(&mut target_doc, &live_doc, preserve_live_mcp);
     // Preserve user-managed feature flags such as multi_agent_v2 and memories.
     preserve_missing_table_keys(&mut target_doc, &live_doc, "features");
+    // hooks 的定义部分（除 state 外的键）同样由用户/桌面端管理，模板里没有时
+    // 从 live 补回，否则切换供应商会把定义整段丢掉，只剩 hooks.state。
+    preserve_live_hook_definitions(&mut target_doc, &live_doc);
     remove_unsupported_approval_policies(&mut target_doc);
     preserve_live_hook_state(&mut target_doc, &live_doc);
     let context_usage_configured = target_doc
@@ -2110,6 +2307,34 @@ fn windows_process_is_elevated() -> bool {
 #[cfg(not(windows))]
 fn windows_process_is_elevated() -> bool {
     true
+}
+
+/// hooks 的定义部分（UserPromptSubmit / Stop / SessionEnd 等数组表）属于
+/// 用户/桌面端管理的本机设置。模板里没有时从 live 补回，只补缺、不覆盖，
+/// 避免切换供应商后 hooks 定义整段消失、只剩 hooks.state。
+fn preserve_live_hook_definitions(target_doc: &mut DocumentMut, live_doc: &DocumentMut) {
+    let Some(live_hooks) = live_doc.get("hooks").and_then(Item::as_table_like) else {
+        return;
+    };
+    if target_doc.get("hooks").and_then(Item::as_table_like).is_none() {
+        target_doc["hooks"] = toml_edit::table();
+    }
+    let Some(target_hooks) = target_doc["hooks"].as_table_like_mut() else {
+        return;
+    };
+    for (key, value) in live_hooks.iter() {
+        if key == "state" {
+            continue;
+        }
+        // 只搬运定义类子表（hooks.X 形式），不搬运 live 独有的标量键，
+        // 否则会把本机个性化设置带进 profile 模板。
+        if value.as_table_like().is_none() && !matches!(value, Item::ArrayOfTables(_)) {
+            continue;
+        }
+        if target_hooks.get(key).is_none() {
+            target_hooks.insert(key, value.clone());
+        }
+    }
 }
 
 fn preserve_live_hook_state(target_doc: &mut DocumentMut, live_doc: &DocumentMut) {
@@ -2258,12 +2483,18 @@ fn apply_model_catalog_to_config(
         || entries
             .iter()
             .any(|entry| entry.suffix_window.is_some() || entry.auto_compact_percent.is_some());
-    // custom_responses_provider(&config_text) 读取的是生成后 config 里的 wire_api；
-    // 自对 Codex 恒写 "responses" 起，该信号已失真（chat 上游也会读到 responses）。
-    // catalog 是否按 Responses 语义生成取决于真实上游协议，只能由 profile.protocol 判定。
-    let custom_responses = profile.protocol == RelayProtocol::Responses
-        && active_provider_id(&parse_toml_document(&config_text)?)
-            .is_some_and(|provider_id| is_custom_provider_id(&provider_id));
+    // Codex 侧 wire_api 恒为 Responses，真实上游协议仍以 profile 为准。
+    // API 传输的外部目录副本和模型路由不能随会话身份改变。
+    let managed_api_mode = matches!(
+        profile.relay_mode,
+        crate::settings::RelayMode::PureApi | crate::settings::RelayMode::MixedApi
+    ) || (profile.relay_mode == crate::settings::RelayMode::Official
+        && profile.official_mix_api_key);
+    // 保留仅配置 custom provider、未同步模式字段的旧调用方及既有聚合策略。
+    let standard_responses = profile.protocol == RelayProtocol::Responses
+        && (managed_api_mode
+            || active_provider_id(&parse_toml_document(&config_text)?)
+                .is_some_and(|provider_id| is_custom_provider_id(&provider_id)));
     // Catalog capabilities must follow the effective config, not stale profile URLs.
     let official_deepseek_responses =
         uses_official_deepseek_responses_for_config(profile, &config_text);
@@ -2300,7 +2531,7 @@ fn apply_model_catalog_to_config(
                 if official_deepseek_responses {
                     return Ok(config_text.to_string());
                 }
-                if custom_responses
+                if standard_responses
                     && copy_standard_responses_catalog(
                         home,
                         &existing,
@@ -2327,7 +2558,7 @@ fn apply_model_catalog_to_config(
             );
         }
         let mut doc = parse_toml_document(&config_text)?;
-        if custom_responses
+        if standard_responses
             && copy_standard_responses_catalog(
                 home,
                 &external_catalog,
@@ -2344,7 +2575,7 @@ fn apply_model_catalog_to_config(
         return Ok(normalize_optional_toml(doc));
     }
     // Known bundled metadata entries need a catalog even without a user-supplied window.
-    // 自定义 Responses provider 走 model_routes 时需要 catalog，才能给路由目标暴露模型元数据；
+    // 托管 Responses 传输走 model_routes 时需要 catalog，与会话身份无关；
     // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     if !has_metadata_overrides
         && !entries.iter().any(|entry| {
@@ -2353,7 +2584,7 @@ fn apply_model_catalog_to_config(
                 || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
                 || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
         })
-        && !(custom_responses && profile.has_model_routes())
+        && !(standard_responses && profile.has_model_routes())
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json").as_deref()
@@ -2381,6 +2612,16 @@ fn apply_model_catalog_to_config(
     let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_relative);
     Ok(normalize_optional_toml(doc))
+}
+
+/// 保存前规范化自定义请求头：去掉空行、压缩首尾空白、并做结构校验。
+///
+/// 校验规则统一在 `relay_headers` 里，测试连接 / 模型列表 / 协议代理三处共用。
+fn normalize_relay_headers(
+    headers: &mut Vec<crate::settings::RelayHeaderKeyValue>,
+) -> anyhow::Result<()> {
+    *headers = crate::relay_headers::normalized(headers);
+    crate::relay_headers::validate(headers)
 }
 
 fn parse_model_string_map(
@@ -3200,6 +3441,63 @@ fn official_profile_auth_for_switch(home: &Path, auth_contents: &str) -> anyhow:
     remove_openai_api_key_from_auth_contents(&source)
 }
 
+/// 生成写入 live 的 auth.json 内容：把本地代理的 bearer token 放进 `OPENAI_API_KEY`，
+/// 同时保留已有凭据（官方 OAuth `tokens` 等）。聚合切换与代理注入共用（issue #1604）。
+///
+/// 来源优先级：**live 优先**，profile 快照只在 live 为空或损坏时回退——Codex 运行中可能
+/// 刚刷新过 OAuth token，用旧快照回退会静默覆盖更新的凭据。
+/// 因此：1) 不清掉 live 里已有的其它凭据；2) 输出永远是合法 JSON 对象，绝不写空文件
+/// （Codex 解析空文件会报 EOF 并退回登录页）；3) live 与快照都不可用时直接报错中止，
+/// 不静默覆盖用户凭据。
+fn auth_contents_with_proxy_key(
+    home: &Path,
+    auth_contents: &str,
+    bearer_token: &str,
+) -> anyhow::Result<String> {
+    let auth_path = home.join("auth.json");
+    let live = read_optional_text(&auth_path)?;
+    if let Some(merged) = merge_proxy_key_into_auth_json(&live, bearer_token) {
+        return Ok(merged);
+    }
+    // live 为空或损坏时才退回已验证的 profile 快照。
+    if let Some(merged) = merge_proxy_key_into_auth_json(auth_contents, bearer_token) {
+        return Ok(merged);
+    }
+    if !live.trim().is_empty() {
+        anyhow::bail!(
+            "{} 不是有效 JSON 对象，已停止切换以避免覆盖当前登录凭据",
+            auth_path.display()
+        );
+    }
+    if !auth_contents.trim().is_empty() {
+        anyhow::bail!(
+            "供应商快照里的 auth.json 不是有效 JSON 对象，已停止切换以避免写入损坏内容"
+        );
+    }
+    // 两边都没有凭据：生成只含代理 token 的合法 JSON，绝不产出空文件。
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&json!({ "OPENAI_API_KEY": bearer_token }))?
+    ))
+}
+
+/// 把代理 token 合进一份 auth.json 文本；来源为空或不是 JSON 对象时返回 None，
+/// 由调用方决定是报错还是换一份来源。
+fn merge_proxy_key_into_auth_json(source: &str, bearer_token: &str) -> Option<String> {
+    if source.trim().is_empty() {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(source).ok()?;
+    let object = value.as_object_mut()?;
+    object.insert(
+        "OPENAI_API_KEY".to_string(),
+        Value::String(bearer_token.to_string()),
+    );
+    serde_json::to_string_pretty(&value)
+        .ok()
+        .map(|text| format!("{text}\n"))
+}
+
 fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
     let auth: Value = serde_json::from_str(auth_contents).ok()?;
     auth.get("OPENAI_API_KEY")
@@ -3437,6 +3735,8 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
             }
         })
         .collect();
+    normalize_relay_headers(&mut profile.custom_headers)?;
+
     if profile.model_list.contains('[') {
         let (clean_list, migrated_windows) =
             crate::model_suffix::migrate_model_list_with_suffixes(&profile.model_list);
@@ -3916,6 +4216,71 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn context_apply_does_not_restore_disabled_live_mcp_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[mcp_servers.disabled]\ncommand = \"live-command\"\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        let profile = RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://relay.example/v1\"\n".to_string(),
+            auth_contents: "{}\n".to_string(),
+            ..RelayProfile::default()
+        };
+        let common = "[mcp_servers.disabled]\nenabled = false\ncommand = \"disabled-command\"\n";
+
+        apply_relay_profile_files_to_home_with_context(temp.path(), &profile, common).unwrap();
+
+        let applied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        assert!(
+            !applied.contains("[mcp_servers.disabled]"),
+            "disabled MCP entry was restored from live config: {applied}"
+        );
+    }
+
+    /// 回归 09-23 现场故障：裸的 [mcp_servers] 父表头把切块锚点钉在 mcp_servers，
+    /// 之后两个重复的 [mcp_servers.node_repl] 落在同一块里，整块解析失败后退回
+    /// 逐行去重，后出现的那段四键被整段丢掉。修复后重复标准表头必须触发切块。
+    #[test]
+    fn normalize_duplicate_toml_text_keeps_node_repl_keys_under_repeated_header() {
+        let contents = r#"[mcp_servers]
+[mcp_servers.search]
+command = "search"
+
+[mcp_servers.node_repl]
+NODE_REPL_NODE_PATH = "n"
+
+[mcp_servers.node_repl.env]
+CODEX_HOME = "h"
+
+[mcp_servers.node_repl]
+args = []
+command = "node_repl"
+env_vars = ["CODEX_WINDOWS_REGISTERED_CORE"]
+startup_timeout_sec = 120
+
+[mcp_servers.cua_repl]
+command = "cua"
+"#;
+
+        let normalized = normalize_duplicate_toml_text(contents);
+        let doc = normalized
+            .parse::<DocumentMut>()
+            .expect("normalized output must stay valid TOML");
+
+        let node = &doc["mcp_servers"]["node_repl"];
+        assert_eq!(node["command"].as_str(), Some("node_repl"));
+        assert_eq!(node["startup_timeout_sec"].as_integer(), Some(120));
+        assert_eq!(node["env_vars"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(node["NODE_REPL_NODE_PATH"].as_str(), Some("n"));
+        assert_eq!(node["env"]["CODEX_HOME"].as_str(), Some("h"));
+        assert_eq!(doc["mcp_servers"]["cua_repl"]["command"].as_str(), Some("cua"));
+    }
+
     /// 回归真实故障：`[mcp_servers.node_repl]`（带正确的 `.env` 子表）之后又混入
     /// 一个裸的空 `[mcp_servers]` 表头。行级去重会把两者当成互不相干的字符串，
     /// 原样保留进输出——空表头在 TOML 语义上会与已有子表冲突，Codex 加载时报
@@ -3984,6 +4349,46 @@ cwd = \"/tmp\"
             .parse::<DocumentMut>()
             .expect("must stay valid TOML");
         assert_eq!(doc["model"].as_str(), Some("b"));
+    }
+
+    /// 回归真实故障：数组表父表头与它的子表头被切块逻辑拆开后，子表片段单独解析
+    /// 会把父级隐式降级成普通表，合并时整棵数组表被覆盖，外层表头不再打印。
+    #[test]
+    fn normalize_duplicate_toml_text_keeps_array_table_parent_headers() {
+        let contents = "\
+[hooks]
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = \"command\"
+command = \"pwsh -File ups.ps1\"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = \"command\"
+command = \"pwsh -File stop.ps1\"
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = \"command\"
+command = \"pwsh -File end.ps1\"
+";
+
+        let normalized = normalize_duplicate_toml_text(contents);
+        let doc = normalized
+            .parse::<DocumentMut>()
+            .expect("normalized output must stay valid TOML");
+
+        let hooks = doc["hooks"].as_table().expect("hooks must stay a table");
+        for key in ["UserPromptSubmit", "Stop", "SessionEnd"] {
+            let tables = hooks[key]
+                .as_array_of_tables()
+                .unwrap_or_else(|| panic!("hooks.{key} must stay an array of tables"));
+            assert_eq!(tables.len(), 1, "hooks.{key} must have exactly one element");
+        }
+
+        for header in ["[[hooks.UserPromptSubmit]]", "[[hooks.Stop]]", "[[hooks.SessionEnd]]"] {
+            assert!(normalized.contains(header), "missing outer array-table header {header}");
+        }
     }
 
     #[test]

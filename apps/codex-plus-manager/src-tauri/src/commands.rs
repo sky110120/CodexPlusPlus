@@ -1646,16 +1646,82 @@ pub fn find_desktop_codex_cli() -> CommandResult<Value> {
         ) else {
             return failed("未找到 Codex Desktop 应用。", json!({ "path": null }));
         };
-        let Some(path) = codex_plus_core::app_paths::find_bundled_codex_cli(&app_dir) else {
+        // 包内 CLI 可能存在于受系统保护的目录而无法执行（#2028 同类问题），
+        // 因此先验证能真正启动，失败时回退到用户目录中的独立 CLI。
+        let bundled = codex_plus_core::app_paths::find_bundled_codex_cli(&app_dir);
+        let standalone = codex_plus_core::app_paths::find_standalone_codex_cli_candidates();
+        let Some((path, source)) = first_startable_codex_cli(bundled, standalone) else {
             return failed(
-                "已找到 Codex Desktop，但包内没有可用的 Codex CLI。",
+                "已找到 Codex Desktop，但没有可用的 Codex CLI；请安装或指定用户目录中的 Codex CLI。",
                 json!({ "path": null }),
             );
         };
         ok(
-            "已填入桌面版内置 Codex CLI。",
+            codex_cli_source_message(source),
             json!({ "path": path.to_string_lossy() }),
         )
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy)]
+enum CodexCliSource {
+    DesktopBundled,
+    Standalone,
+}
+
+#[cfg(not(windows))]
+fn codex_cli_source_message(source: CodexCliSource) -> &'static str {
+    match source {
+        CodexCliSource::DesktopBundled => "已填入桌面版内置 Codex CLI。",
+        CodexCliSource::Standalone => "已填入独立安装的 Codex CLI。",
+    }
+}
+
+#[cfg(not(windows))]
+fn first_startable_codex_cli(
+    bundled: Option<std::path::PathBuf>,
+    standalone: Vec<std::path::PathBuf>,
+) -> Option<(std::path::PathBuf, CodexCliSource)> {
+    bundled
+        .into_iter()
+        .map(|path| (path, CodexCliSource::DesktopBundled))
+        .chain(
+            standalone
+                .into_iter()
+                .map(|path| (path, CodexCliSource::Standalone)),
+        )
+        .find(|(path, _)| codex_cli_can_start(path))
+}
+
+fn codex_cli_can_start(path: &std::path::Path) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut command = Command::new(path);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(codex_plus_core::windows_create_no_window());
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -7005,6 +7071,35 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_cli_success_message_matches_candidate_source() {
+        assert_eq!(
+            codex_cli_source_message(CodexCliSource::DesktopBundled),
+            "已填入桌面版内置 Codex CLI。"
+        );
+        assert_eq!(
+            codex_cli_source_message(CodexCliSource::Standalone),
+            "已填入独立安装的 Codex CLI。"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_cli_search_skips_unstartable_candidate() {
+        let selected = first_startable_codex_cli(
+            None,
+            vec![
+                std::path::PathBuf::from("/usr/bin/false"),
+                std::path::PathBuf::from("/usr/bin/true"),
+            ],
+        )
+        .expect("second standalone candidate should start");
+
+        assert_eq!(selected.0, std::path::PathBuf::from("/usr/bin/true"));
+        assert!(matches!(selected.1, CodexCliSource::Standalone));
+    }
+
     fn grok_test_profile(id: &str, base_url: &str) -> RelayProfile {
         RelayProfile {
             id: id.to_string(),
@@ -7857,6 +7952,42 @@ base_url = "https://example.invalid/v1"
         let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
         assert!(config.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+    }
+
+    /// 回归（issue #1604）：用户点「重启 Codex++」走的就是这条同步路径。
+    /// 现场遗留的 0 字节 auth.json 必须被修复成合法 JSON，否则仍然停在登录页。
+    #[test]
+    fn active_aggregate_sync_repairs_empty_auth_json() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "").unwrap();
+        let settings = BackendSettings {
+            active_relay_id: "aggregate".to_string(),
+            active_aggregate_relay_id: "aggregate".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "aggregate".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::Aggregate,
+                ..RelayProfile::default()
+            }],
+            aggregate_relay_profiles: vec![codex_plus_core::settings::AggregateRelayProfile {
+                id: "aggregate".to_string(),
+                name: "Aggregate".to_string(),
+                session_provider: codex_plus_core::settings::RelaySessionProvider::Custom,
+                strategy: codex_plus_core::settings::AggregateRelayStrategy::Failover,
+                members: Vec::new(),
+                routes: Vec::new(),
+            }],
+            ..BackendSettings::default()
+        };
+
+        sync_active_relay_to_home(&settings, temp.path()).unwrap();
+
+        let raw = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
+        let auth: serde_json::Value =
+            serde_json::from_str(&raw).expect("重启同步后 auth.json 必须是合法 JSON");
+        assert_eq!(
+            auth.get("OPENAI_API_KEY").and_then(|item| item.as_str()),
+            Some("codex-plus-aggregate")
+        );
     }
 
     #[test]

@@ -281,14 +281,27 @@ pub fn responses_to_chat_completions_with_options(
 
     apply_chat_reasoning_options(&mut result, &body, model, standard);
 
-    let tool_context = build_codex_tool_context(body.get("tools"));
+    let mut tool_context = build_codex_tool_context(body.get("tools"));
+    // Codex 客户端把 tool_search 命中的 MCP 命名空间挂在历史里的 tool_search_output
+    // item 上，却不会把它们提升进下一轮请求的 tools 数组。这里补上这一跳：先登记进
+    // tool context（模型调用回来时才能还原 namespace），再用既有 namespace 链路展开
+    // 成 mcp__<server>__<tool>，否则上游只看到命名空间外壳，调不到内层工具。
+    let harvested_namespaces = collect_tool_search_output_namespaces(&body);
+    for namespace_tool in &harvested_namespaces {
+        add_namespace_tools_to_context(&mut tool_context, namespace_tool);
+    }
     let mut has_chat_tools = false;
+    let mut converted = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted = responses_tools_to_chat_tools(tools, &tool_context);
-        if !converted.is_empty() {
-            has_chat_tools = true;
-            result["tools"] = json!(converted);
-        }
+        converted = responses_tools_to_chat_tools(tools, &tool_context);
+    }
+    for namespace_tool in &harvested_namespaces {
+        converted.extend(namespace_tool_to_chat_tools(namespace_tool, &tool_context));
+    }
+    dedup_chat_tools_by_name(&mut converted);
+    if !converted.is_empty() {
+        has_chat_tools = true;
+        result["tools"] = json!(converted);
     }
 
     if has_chat_tools {
@@ -323,7 +336,12 @@ pub fn chat_completion_to_response_with_request(
     body: Value,
     original_request: &Value,
 ) -> anyhow::Result<Value> {
-    let context = build_codex_tool_context(original_request.get("tools"));
+    let mut context = build_codex_tool_context(original_request.get("tools"));
+    // 反向同样要认领 tool_search_output 里的命名空间，否则模型调用
+    // mcp__<server>__<tool> 回来时查不到 namespace，还原不成 Responses item。
+    for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
+        add_namespace_tools_to_context(&mut context, namespace_tool);
+    }
     chat_completion_to_response_with_context(body, &context, Some(original_request))
 }
 
@@ -1714,11 +1732,8 @@ fn with_relay_auth(
     request: reqwest::RequestBuilder,
     relay: &crate::settings::RelayProfile,
 ) -> reqwest::RequestBuilder {
-    if relay.uses_no_auth() {
-        request
-    } else {
-        request.bearer_auth(relay.api_key.trim())
-    }
+    // 认证（API Key / 无认证）+ 供应商自定义请求头，统一在 relay_headers 里决定优先级。
+    crate::relay_headers::apply(request, relay)
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -2142,8 +2157,12 @@ impl Default for ChatSseState {
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
+        let mut tool_context = build_codex_tool_context(original_request.get("tools"));
+        for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
+            add_namespace_tools_to_context(&mut tool_context, namespace_tool);
+        }
         Self {
-            tool_context: build_codex_tool_context(original_request.get("tools")),
+            tool_context,
             original_request: Some(original_request.clone()),
             ..Self::default()
         }
@@ -4284,6 +4303,56 @@ fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
     })
 }
 
+/// 从历史里的 tool_search_output item 收集 Codex 客户端检索命中的命名空间工具。
+///
+/// 条目形如 `{ type: "namespace", name, description, tools: [...] }`，必须走
+/// `add_namespace_tools_to_context` + `namespace_tool_to_chat_tools` 展开成
+/// `mcp__<server>__<tool>`。只取 namespace 名字的话上游只能看到外壳，
+/// 调不到内层工具，反向转换也还原不出 namespace 字段。
+fn collect_tool_search_output_namespaces(body: &Value) -> Vec<Value> {
+    let mut collected: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return collected;
+    };
+
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+            continue;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for tool in tools {
+            let Some(name) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if seen.insert(name.to_string()) {
+                collected.push(tool.clone());
+            }
+        }
+    }
+
+    collected
+}
+
+/// chat tools 按函数名去重，保留首次出现。
+fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    tools.retain(|tool| match tool
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+    {
+        Some(name) => seen.insert(name.to_string()),
+        None => true,
+    });
+}
+
 fn patch_proxy_description(description: &str, action: &str, default_description: &str) -> String {
     if description.trim().is_empty() {
         default_description.to_string()
@@ -5841,4 +5910,66 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+/// 供应商自定义请求头必须真正写进发往上游的请求（issue #1685）。
+#[cfg(test)]
+mod relay_custom_header_tests {
+    use super::*;
+    use crate::settings::{RelayHeaderKeyValue, RelayMode, RelayProfile};
+
+    fn header(key: &str, value: &str) -> RelayHeaderKeyValue {
+        RelayHeaderKeyValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn relay_with(headers: Vec<RelayHeaderKeyValue>) -> RelayProfile {
+        RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            api_key: "sk-upstream".to_string(),
+            custom_headers: headers,
+            ..RelayProfile::default()
+        }
+    }
+
+    fn build_upstream_request(relay: &RelayProfile) -> reqwest::Request {
+        upstream_request_builder(
+            reqwest::Client::new(),
+            "http://upstream.example/v1/responses",
+            relay,
+            false,
+            &serde_json::json!({ "model": "m" }),
+        )
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn upstream_request_carries_custom_headers() {
+        let request = build_upstream_request(&relay_with(vec![header("X-Tenant", "acme")]));
+        assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer sk-upstream"
+        );
+    }
+
+    /// 代理路径与测试连接、模型列表一致：显式 Authorization 优先于 API Key。
+    #[test]
+    fn upstream_request_prefers_custom_authorization() {
+        let request = build_upstream_request(&relay_with(vec![header(
+            "Authorization",
+            "Bearer explicit",
+        )]));
+        assert_eq!(
+            request.headers().get_all("authorization").iter().count(),
+            1
+        );
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer explicit"
+        );
+    }
 }

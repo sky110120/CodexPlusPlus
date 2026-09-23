@@ -119,6 +119,7 @@ import {
 } from "./model-windows";
 import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregateRoutes } from "./aggregate-routes";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
@@ -383,6 +384,7 @@ export type RelayProfile = {
   vlmModel: string;
   vlmBaseUrl: string;
   userAgent: string;
+  customHeaders: { key: string; value: string }[];
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
   modelRoutes?: RelayModelRoute[];
@@ -1196,6 +1198,7 @@ const defaultSettings: BackendSettings = {
       vlmModel: "",
       vlmBaseUrl: "",
       userAgent: "",
+      customHeaders: [],
       sub2apiEnabled: false,
       sub2apiMultiplier: "",
       standardOpenaiProtocol: false,
@@ -8732,6 +8735,7 @@ function RelayProfileDetail({
       ? aggregateRelayProfileValidation(draft)
       : relayModelRoutesSettingsValidation(validationSettings));
   const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
+  const customHeadersError = relayHeadersValidationMessage(draft.customHeaders || []);
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
     const validSlugs = serializedRows.modelList.split("\n").map((slug) => slug.trim()).filter(Boolean);
@@ -8741,6 +8745,7 @@ function RelayProfileDetail({
       modelWindows: serializedRows.modelWindows,
       modelAutoCompact: serializedRows.modelAutoCompact,
       modelMetadata: retainModelMetadataForSlugs(draft.modelMetadata, validSlugs),
+      customHeaders: serializeRelayHeaders(draft.customHeaders || []),
       modelVlm: serializedRows.modelVlm,
     };
   };
@@ -8760,7 +8765,7 @@ function RelayProfileDetail({
     modelVlm: currentModelState.modelVlm,
   }) !== JSON.stringify(persistedModelState);
   const saveDraft = async () => {
-    if (savingDraft || validationError || modelRowsError) return;
+    if (savingDraft || validationError || modelRowsError || customHeadersError) return;
     setSavingDraft(true);
     try {
       const draftWithWindows = draftWithModelRows();
@@ -8800,7 +8805,7 @@ function RelayProfileDetail({
     }
   };
   const switchDraft = () => {
-    if (isNew || !form.relayProfilesEnabled || validationError || modelRowsError) return;
+    if (isNew || !form.relayProfilesEnabled || validationError || modelRowsError || customHeadersError) return;
     const draftWithWindows = draftWithModelRows();
     const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
     const previousActiveRelayId = form.activeRelayId;
@@ -8876,18 +8881,25 @@ function RelayProfileDetail({
         ) : null}
         {aggregateProfile || isNew ? null : (
           <Button
-            disabled={!form.relayProfilesEnabled || actions.relaySwitching}
+            disabled={!form.relayProfilesEnabled || actions.relaySwitching || !!customHeadersError}
             onClick={switchDraft}
-            title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
+            title={
+              customHeadersError ||
+              (!form.relayProfilesEnabled
+                ? t("供应商配置总开关已关闭")
+                : actions.relaySwitching
+                  ? t("供应商切换中")
+                  : undefined)
+            }
             variant={draft.id === form.activeRelayId ? "secondary" : "default"}
           >
             {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
           </Button>
         )}
         <Button
-          disabled={savingDraft || !!validationError || !!modelRowsError}
+          disabled={savingDraft || !!validationError || !!modelRowsError || !!customHeadersError}
           onClick={() => void saveDraft()}
-          title={validationError || modelRowsError || t("保存")}
+          title={validationError || modelRowsError || customHeadersError || t("保存")}
           type="button"
         >
           <Save className="h-4 w-4" />
@@ -9136,6 +9148,7 @@ function RelayProfileEditor({
     setModelWindowRows([...modelWindowRows, { model: "", window: "", autoCompact: "", imageHandling: "" }]);
   };
   const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
+  const customHeadersError = relayHeadersValidationMessage(profile.customHeaders || []);
   const fetchSub2ApiRate = async () => {
     const result = await actions.fetchSub2ApiBilling(deriveRelayProfileFromFiles(profile));
     if (!result) return;
@@ -9214,7 +9227,7 @@ function RelayProfileEditor({
               <span>{t("关闭官方低额度提示")}</span>
             </label>
             <p className="field-hint">
-              {t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}
+              {t("只隐藏低额度和已用完提示，不改变发送限制。左下角账户菜单仍显示官方剩余额度。")}
             </p>
           </Field>
         ) : null}
@@ -9754,6 +9767,73 @@ function RelayProfileEditor({
               onChange={(event) => updateDraft({ userAgent: event.currentTarget.value })}
               placeholder={t("留空使用默认值")}
             />
+          </Field>
+        ) : null}
+        {showApiFields ? (
+          <Field className="relay-field-custom-headers" label={t("自定义请求头")}>
+            <div className="relay-custom-headers">
+              {(profile.customHeaders || []).map((row, index) => (
+                <div className="relay-custom-header-row" key={`custom-header-${index}`}>
+                  <Input
+                    aria-label={t("请求头名称")}
+                    value={row.key}
+                    onChange={(event) => {
+                      const next = (profile.customHeaders || []).slice();
+                      next[index] = { ...next[index], key: event.currentTarget.value };
+                      updateDraft({ customHeaders: next });
+                    }}
+                    placeholder="X-Tenant"
+                  />
+                  <Input
+                    aria-label={t("请求头值")}
+                    value={row.value}
+                    onChange={(event) => {
+                      const next = (profile.customHeaders || []).slice();
+                      next[index] = { ...next[index], value: event.currentTarget.value };
+                      updateDraft({ customHeaders: next });
+                    }}
+                    placeholder={t("请求头值")}
+                  />
+                  <Button
+                    aria-label={t("删除这一项")}
+                    onClick={() =>
+                      updateDraft({
+                        customHeaders: (profile.customHeaders || []).filter((_, i) => i !== index),
+                      })
+                    }
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+              <div className="relay-custom-headers-actions">
+                <Button
+                  onClick={() =>
+                    updateDraft({
+                      customHeaders: [...(profile.customHeaders || []), { key: "", value: "" }],
+                    })
+                  }
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t("添加请求头")}
+                </Button>
+              </div>
+              <span className="hint-line">
+                {t("自定义请求头会同时用于测试连接、模型列表与实际代理请求。")}
+              </span>
+              <span className="hint-line">
+                {t("Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。")}
+              </span>
+              {customHeadersError ? (
+                <span className="hint-line relay-custom-headers-error">{customHeadersError}</span>
+              ) : null}
+            </div>
           </Field>
         ) : null}
       </div>
@@ -12520,6 +12600,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             vlmModel: "",
             vlmBaseUrl: "",
             userAgent: "",
+            customHeaders: [],
             sub2apiEnabled: false,
             sub2apiMultiplier: "",
             standardOpenaiProtocol: false,
@@ -12660,6 +12741,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     modelMetadata: profile.modelMetadata || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
+    customHeaders: profile.customHeaders || [],
     sub2apiEnabled: noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     aggregate: null,
@@ -13527,6 +13609,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     vlmModel: "",
     vlmBaseUrl: "",
     userAgent: "",
+    customHeaders: [],
     sub2apiEnabled: false,
     sub2apiMultiplier: "",
     modelRoutes: [],
@@ -13570,6 +13653,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       vlmModel: "",
       vlmBaseUrl: "",
       userAgent: "",
+      customHeaders: [],
       sub2apiEnabled: false,
       sub2apiMultiplier: "",
       modelRoutes: [],

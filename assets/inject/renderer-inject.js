@@ -868,9 +868,6 @@
         pointer-events: none;
         white-space: nowrap;
       }
-      [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
-      body.codex-plus-hide-usage-alert aside.app-shell-left-panel [role="status"][aria-live="polite"]:has(progress[max="100"]):has(button[aria-label="Dismiss usage alert" i], button[aria-label="关闭使用量提醒"], button[aria-label="關閉用量提示"], button[aria-label="關閉使用量警示"]),
-      body.codex-plus-hide-usage-alert aside.app-shell-left-panel div.w-full:has(> [role="status"][aria-live="polite"]:has(progress[max="100"]):has(button[aria-label="Dismiss usage alert" i], button[aria-label="关闭使用量提醒"], button[aria-label="關閉用量提示"], button[aria-label="關閉使用量警示"])) { display: none !important; }
       .codex-archive-delete-all {
         border: 1px solid #ef4444;
         border-radius: 7px;
@@ -4391,7 +4388,54 @@
       }
     }
     refreshCodexPlusBackendToggles();
+    if (loaded) syncOfficialUsagePolicy();
+    if (loaded) void installExternalApiQuotaGate();
     return loaded;
+  }
+
+  const externalApiQuotaGateMaxAttempts = 3;
+  let externalApiQuotaGateAttempts = 0;
+  let externalApiQuotaGateInstalled = false;
+  let externalApiQuotaGateUnsupported = false;
+  let externalApiQuotaGatePromise = null;
+  function installExternalApiQuotaGate() {
+    window.__codexPlusExternalApiQuotaAllowed = (hostId) =>
+      codexPlusBackendSettingsLoaded
+      && window.__codexPlusApiQuotaGate?.permitsExternalApi(codexPlusBackendSettings, hostId) === true;
+    if (externalApiQuotaGateInstalled || externalApiQuotaGateUnsupported) return Promise.resolve(false);
+    if (externalApiQuotaGatePromise) return externalApiQuotaGatePromise;
+    if (!window.__codexPlusApiQuotaGate || externalApiQuotaGateAttempts >= externalApiQuotaGateMaxAttempts) {
+      return Promise.resolve(false);
+    }
+    externalApiQuotaGateAttempts += 1;
+    externalApiQuotaGatePromise = (async () => {
+      try {
+        const url = codexAppAssetUrl("app-primary-") || await codexAppAssetUrlFromScriptText("app-primary-");
+        if (!url) return false;
+        const response = await fetch(url);
+        if (!response.ok) return false;
+        const location = window.__codexPlusApiQuotaGate.locate(await response.text(), url);
+        if (!location) {
+          // 源码形状不兼容时不要在 heartbeat 中重复抓取同一脚本。
+          externalApiQuotaGateUnsupported = true;
+          return false;
+        }
+        const condition = window.__codexPlusApiQuotaGate.condition(location);
+        if (typeof condition !== "string" || !condition) {
+          externalApiQuotaGateUnsupported = true;
+          return false;
+        }
+        window.__codexPlusApiQuotaBreakpoint = { ...location, condition };
+        externalApiQuotaGateInstalled = true;
+        return true;
+      } catch {
+        // 瞬态加载失败由下一次后端设置刷新重试，次数有上限。
+        return false;
+      }
+    })().finally(() => {
+      externalApiQuotaGatePromise = null;
+    });
+    return externalApiQuotaGatePromise;
   }
 
   function loadBackendSettingsForStartup(attempt = 0) {
@@ -4414,8 +4458,12 @@
     try {
       const previousConversationView = !!codexPlusSettings().conversationView;
       const loaded = await loadBackendSettingsState();
-      if (loaded && previousConversationView !== !!codexPlusSettings().conversationView) {
-        refreshConversationView();
+      if (loaded) {
+        syncOfficialUsagePolicy();
+        void installExternalApiQuotaGate();
+        if (previousConversationView !== !!codexPlusSettings().conversationView) {
+          refreshConversationView();
+        }
       }
     } finally {
       syncBackendSettingsInFlight = false;
@@ -4587,7 +4635,7 @@
         codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
         if (typeof nextStatus.hideOfficialUsageAlert === "boolean") {
           window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
-          refreshOfficialUsageAlertVisibility();
+          syncOfficialUsagePolicy();
         }
         void syncBackendSettingsFromHeartbeat();
       } else {
@@ -10833,7 +10881,6 @@
 
   function scanLightweight() {
     installStyle();
-    refreshOfficialUsageAlertVisibility();
     installCodexServiceTierDispatcherPatch();
     installCodexAppServerClientPrototypePatch();
     installCodexRemoteSessionRecoveryListener();
@@ -10859,98 +10906,350 @@
     refreshCodexServiceTierControls();
   }
 
-  function officialUsageAlertHidden() {
-    return window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ === true;
+  function officialUsagePolicy() {
+    const profile = codexRemoteSessionActiveProfile();
+    const official = String(profile?.relayMode || "") === "official";
+    return {
+      official,
+      unlockLimits: official && profile?.officialMixApiKey === true,
+      hideAlerts: official && window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ === true,
+    };
   }
 
-  const officialUsageAlertDismissLabelRe = /dismiss usage alert|关闭使用量提醒|關閉用量提示|關閉使用量警示/i;
-
-  function officialUsageAlertCards(scope = document) {
-    const root = scope?.querySelectorAll ? scope : document;
-    return Array.from(root.querySelectorAll('aside.app-shell-left-panel [role="status"][aria-live="polite"]')).filter((card) => {
-      if (!(card instanceof HTMLElement)) return false;
-      const progress = card.querySelector('progress[max="100"]');
-      if (!progress) return false;
-      const dismissButton = Array.from(card.querySelectorAll("button")).find((button) =>
-        officialUsageAlertDismissLabelRe.test(button.getAttribute("aria-label") || ""),
-      );
-      return !!dismissButton;
-    });
+  function officialUsagePolicyKey(policy = officialUsagePolicy()) {
+    if (!policy.official) return "off";
+    return `${policy.unlockLimits ? "official-mix" : "official"}${policy.hideAlerts ? "-hide" : ""}`;
   }
 
-  function normalizeUsageAlertText(text) {
-    return String(text || "").replace(/[\s\u00a0]+/g, " ").trim();
+  function isOfficialUsageStatus(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const rateLimit = value.rate_limit;
+    if (!rateLimit || typeof rateLimit !== "object" || typeof rateLimit.allowed !== "boolean") return false;
+    return typeof value.plan_type === "string"
+      || typeof value.user_id === "string"
+      || typeof value.account_id === "string";
   }
 
-  function isOfficialUsageAlertHeading(text) {
-    const value = normalizeUsageAlertText(text);
-    if (!value || value.length > 48) return false;
-    if (/agents|智能代理|智慧体|子智能/.test(value)) return false;
-    if (/^(?:you(?:['’]re| are)|you['’]ve)\b/i.test(value) && /\b(?:usage|limit|messages)\b/i.test(value) && /\b(?:out of|used all|reached|approaching|hit)\b/i.test(value)) {
-      return true;
-    }
-    if (/^(?:this|selected) model is out of usage\.?$/i.test(value)) return true;
-    if (!/(Codex|模型|使用)/.test(value)) return false;
-    if (!/(额度|額度|用量|限额|限額|上限)/.test(value)) return false;
-    return /(已用完|已用尽|已用盡|已耗尽|已耗盡|已达|已達|即将|即將|超出|用罄|用完|用尽|用盡)/.test(value);
+  function isImageGenerationUpsell(value) {
+    return String(value?.banner_type || "") === "image_generation_limit_reached";
   }
 
-  function composerUsageAlertBanners(scope = document) {
-    const root = scope?.querySelectorAll ? scope : document;
-    return Array.from(root.querySelectorAll("[data-codex-composer-root] aside")).filter((aside) => {
-      if (!(aside instanceof HTMLElement)) return false;
-      const heading = aside.querySelector("h1, h2, h3, h4, h5, [role='heading']");
-      return isOfficialUsageAlertHeading(heading?.textContent || "");
-    });
+  function isMainRateLimitQueryKey(queryKey) {
+    return Array.isArray(queryKey)
+      && queryKey[0] === "rate-limit-status"
+      && queryKey[1] !== "image-generation";
   }
 
-  function officialUsageAlertContainer(card) {
-    const parent = card.parentElement;
-    if (parent?.children.length === 1) {
-      if (parent.matches?.("div.w-full")) return parent;
-      if (
-        parent.closest?.("[data-codex-composer-root]") &&
-        !parent.matches?.("[data-codex-composer-root], form, main")
-      ) {
-        return parent;
+  // 低额度卡片、输入框横幅和发送锁都读 /wham/usage 这份状态。
+  // 仅官方登录混合 API Key 时放开功能锁；纯官方模式保留限制。
+  // 提示字段只在勾选「关闭官方低额度提示」时清掉。
+  // 百分比、重置时间、账号、积分和消费上限不动。图片额度横幅单独留下。
+  function rewriteOfficialUsageStatus(value, policy = officialUsagePolicy()) {
+    if (!policy.official || !isOfficialUsageStatus(value)) return null;
+    const next = { ...value };
+    let changed = false;
+    if (policy.unlockLimits) {
+      if (value.rate_limit_reached_type != null) {
+        next.rate_limit_reached_type = null;
+        changed = true;
+      }
+      if (value.model_picker_upsell != null) {
+        next.model_picker_upsell = null;
+        changed = true;
+      }
+      const rateLimit = value.rate_limit;
+      if (rateLimit.allowed !== true || rateLimit.limit_reached === true) {
+        next.rate_limit = {
+          ...rateLimit,
+          allowed: true,
+          limit_reached: false,
+        };
+        changed = true;
       }
     }
-    return card;
+    if (policy.hideAlerts) {
+      if (value.sidebar_usage_warnings != null) {
+        next.sidebar_usage_warnings = null;
+        changed = true;
+      }
+      if (value.rate_limit_warning != null) {
+        next.rate_limit_warning = null;
+        changed = true;
+      }
+      if (value.rate_limit_upsell != null && !isImageGenerationUpsell(value.rate_limit_upsell)) {
+        next.rate_limit_upsell = null;
+        changed = true;
+      }
+    }
+    return changed ? next : null;
   }
 
-  function markOfficialUsageAlertTarget(targets, node) {
-    if (!node || node === document.body || node === document.documentElement) return;
-    targets.add(node);
+  function rewriteOfficialUsagePayload(value, policy = officialUsagePolicy()) {
+    if (!value || typeof value !== "object") return value;
+    if (isOfficialUsageStatus(value)) return rewriteOfficialUsageStatus(value, policy) || value;
+    if (value.usage && value.usage !== value && isOfficialUsageStatus(value.usage)) {
+      const usage = rewriteOfficialUsageStatus(value.usage, policy);
+      return usage ? { ...value, usage } : value;
+    }
+    return value;
   }
 
-  function refreshOfficialUsageAlertVisibility() {
-    const hidden = officialUsageAlertHidden();
-    // 旧版左下角卡片有稳定的进度条和关闭按钮，body class 让 CSS 在首帧就挡住。
-    // 新版输入框横幅只能靠标题识别，不能用「有标题就隐藏」，否则会误伤其它提示。
-    document.body?.classList.toggle("codex-plus-hide-usage-alert", hidden);
+  function looksLikeQueryClient(value) {
+    return !!value
+      && typeof value.getQueryCache === "function"
+      && typeof value.setQueryData === "function";
+  }
 
-    if (!hidden) {
-      document.querySelectorAll('[data-codex-plus-usage-alert-hidden]').forEach((el) => {
-        delete el.dataset.codexPlusUsageAlertHidden;
+  // 图片额度使用同一条 /wham/usage，只能靠查询键 image-generation 排除。
+  // 这里只在第一次挂上缓存时找客户端，不进每轮 DOM 扫描。
+  function queryClientFromFiber(fiber) {
+    const seen = new Set();
+    const stack = [fiber];
+    let visited = 0;
+    while (stack.length && visited < 8000) {
+      const node = stack.pop();
+      if (!node || typeof node !== "object" || seen.has(node)) continue;
+      seen.add(node);
+      visited += 1;
+      const props = node.memoizedProps || node.pendingProps;
+      if (looksLikeQueryClient(props?.client)) return props.client;
+      if (looksLikeQueryClient(props?.value)) return props.value;
+      if (looksLikeQueryClient(node.stateNode)) return node.stateNode;
+      const state = node.memoizedState;
+      if (state && typeof state === "object" && looksLikeQueryClient(state.memoizedState)) return state.memoizedState;
+      if (node.child) stack.push(node.child);
+      if (node.sibling) stack.push(node.sibling);
+    }
+    return null;
+  }
+
+  let officialUsageClient = null;
+
+  function findCodexQueryClient() {
+    const explicit = window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient;
+    if (looksLikeQueryClient(explicit)) return explicit;
+    if (looksLikeQueryClient(officialUsageClient)) return officialUsageClient;
+    const roots = [document.getElementById?.("root"), document.body, document.documentElement].filter(Boolean);
+    for (const root of roots) {
+      let key = "";
+      try {
+        key = Object.keys(root).find((name) => name.startsWith("__reactContainer$") || name.startsWith("__reactFiber$")) || "";
+      } catch {
+        key = "";
+      }
+      if (!key) continue;
+      let fiber = root[key];
+      if (fiber?.stateNode?.current) fiber = fiber.stateNode.current;
+      const client = queryClientFromFiber(fiber);
+      if (client) {
+        officialUsageClient = client;
+        return client;
+      }
+    }
+    return null;
+  }
+
+  function mainRateLimitQueries(client) {
+    const cache = client.getQueryCache?.();
+    if (cache && typeof cache.findAll === "function") {
+      return cache.findAll({ queryKey: ["rate-limit-status"] }).filter((query) => isMainRateLimitQueryKey(query?.queryKey));
+    }
+    if (typeof client.getQueriesData === "function") {
+      return client.getQueriesData({ queryKey: ["rate-limit-status"] })
+        .filter(([queryKey]) => isMainRateLimitQueryKey(queryKey))
+        .map(([queryKey, data]) => ({ queryKey, state: { data } }));
+    }
+    return [];
+  }
+
+  let officialUsageRewriteDepth = 0;
+  const officialUsageOriginalData = new WeakMap();
+  const officialUsageRewrittenData = new WeakMap();
+
+  function sameQueryKey(left, right) {
+    if (left === right) return true;
+    try {
+      return JSON.stringify(left) === JSON.stringify(right);
+    } catch {
+      return false;
+    }
+  }
+
+  function findRateLimitQuery(client, queryKey) {
+    return mainRateLimitQueries(client).find((query) => sameQueryKey(query?.queryKey, queryKey)) || null;
+  }
+
+  function setOriginalQueryData(client, queryKey, data, pluginRewrite = false) {
+    const original = client?.__codexPlusUsageOriginalSetQueryData;
+    if (typeof original !== "function") return;
+    officialUsageRewriteDepth += 1;
+    try {
+      original.call(client, queryKey, data);
+      const query = findRateLimitQuery(client, queryKey);
+      if (query && pluginRewrite) {
+        officialUsageRewrittenData.set(query, query.state?.data);
+      } else if (query) {
+        officialUsageRewrittenData.delete(query);
+      }
+    } finally {
+      officialUsageRewriteDepth -= 1;
+    }
+  }
+
+  function patchOfficialUsageQueryClient(client) {
+    if (!client || client.__codexPlusUsageRewrite || typeof client.setQueryData !== "function") return;
+    const original = client.setQueryData;
+    client.__codexPlusUsageOriginalSetQueryData = original;
+    client.setQueryData = function codexPlusSetUsageQueryData(queryKey, updater, ...rest) {
+      if (officialUsageRewriteDepth > 0 || !isMainRateLimitQueryKey(queryKey) || !officialUsagePolicy().official) {
+        return original.call(this, queryKey, updater, ...rest);
+      }
+      const query = findRateLimitQuery(client, queryKey);
+      let rawData;
+      const nextUpdater = (previous) => {
+        const previousRaw = query && officialUsageOriginalData.has(query)
+          ? officialUsageOriginalData.get(query)
+          : previous;
+        rawData = typeof updater === "function" ? updater(previousRaw) : updater;
+        return rewriteOfficialUsagePayload(rawData);
+      };
+      officialUsageRewriteDepth += 1;
+      try {
+        const result = original.call(this, queryKey, nextUpdater, ...rest);
+        const updatedQuery = query || findRateLimitQuery(client, queryKey);
+        if (updatedQuery && rawData !== undefined) {
+          officialUsageOriginalData.set(updatedQuery, rawData);
+          if (result !== rawData) {
+            officialUsageRewrittenData.set(updatedQuery, result);
+          } else {
+            officialUsageRewrittenData.delete(updatedQuery);
+          }
+        }
+        return result;
+      } finally {
+        officialUsageRewriteDepth -= 1;
+      }
+    };
+    const cache = client.getQueryCache?.();
+    if (cache && typeof cache.subscribe === "function") {
+      cache.subscribe((event) => {
+        if (officialUsageRewriteDepth > 0) return;
+        const query = event?.query;
+        if (!isMainRateLimitQueryKey(query?.queryKey)) return;
+        if (event?.action?.type !== "success") return;
+        const current = query.state?.data;
+        if (officialUsageRewrittenData.get(query) === current) return;
+        officialUsageRewrittenData.delete(query);
+        if (officialUsagePolicy().official) {
+          officialUsageOriginalData.set(query, current);
+        } else if (officialUsageOriginalData.has(query)) {
+          // A query may refresh after a policy switch but before restoration runs.
+          officialUsageOriginalData.set(query, current);
+        }
+        if (!officialUsagePolicy().official) return;
+        const next = rewriteOfficialUsagePayload(current);
+        if (next === current) return;
+        setOriginalQueryData(client, query.queryKey, next, true);
       });
+    }
+    client.__codexPlusUsageRewrite = true;
+  }
+
+  function rewriteCachedOfficialUsage(client) {
+    if (!client || !officialUsagePolicy().official) return;
+    for (const query of mainRateLimitQueries(client)) {
+      const current = query.state?.data;
+      const raw = officialUsageOriginalData.has(query)
+        ? officialUsageOriginalData.get(query)
+        : current;
+      const next = rewriteOfficialUsagePayload(raw);
+      if (next !== raw) {
+        officialUsageOriginalData.set(query, raw);
+        setOriginalQueryData(client, query.queryKey, next, true);
+      } else if (current !== raw) {
+        setOriginalQueryData(client, query.queryKey, raw);
+      }
+    }
+  }
+
+  function restoreOriginalOfficialUsage(client) {
+    for (const query of mainRateLimitQueries(client)) {
+      if (!officialUsageOriginalData.has(query)) continue;
+      const raw = officialUsageOriginalData.get(query);
+      officialUsageOriginalData.delete(query);
+      officialUsageRewrittenData.delete(query);
+      setOriginalQueryData(client, query.queryKey, raw);
+    }
+  }
+
+  function invalidateMainRateLimitQueries(client) {
+    if (!client || typeof client.invalidateQueries !== "function") return;
+    for (const query of mainRateLimitQueries(client)) {
+      try {
+        Promise.resolve(client.invalidateQueries({ queryKey: query.queryKey })).catch(() => {});
+      } catch {
+      }
+    }
+  }
+
+  let officialUsagePolicyApplied = "";
+  let officialUsageClientTimer = null;
+
+  function syncOfficialUsagePolicy() {
+    const key = officialUsagePolicyKey();
+    const client = findCodexQueryClient();
+    if (client) {
+      officialUsageClient = client;
+      patchOfficialUsageQueryClient(client);
+      if (officialUsageClientTimer) {
+        clearTimeout(officialUsageClientTimer);
+        officialUsageClientTimer = null;
+      }
+    } else if (!officialUsageClientTimer) {
+      let attempts = 0;
+      const retry = () => {
+        attempts += 1;
+        officialUsageClientTimer = null;
+        if (findCodexQueryClient()) {
+          syncOfficialUsagePolicy();
+          return;
+        }
+        if (attempts < 20) officialUsageClientTimer = setTimeout(retry, 300);
+      };
+      officialUsageClientTimer = setTimeout(retry, 300);
+      return;
+    } else {
       return;
     }
+    if (key === officialUsagePolicyApplied) {
+      if (key !== "off") rewriteCachedOfficialUsage(client);
+      return;
+    }
+    const previous = officialUsagePolicyApplied;
+    if (previous && previous !== key) restoreOriginalOfficialUsage(client);
+    officialUsagePolicyApplied = key;
+    if (key === "off") {
+      if (previous) invalidateMainRateLimitQueries(client);
+      return;
+    }
+    rewriteCachedOfficialUsage(client);
+    if (previous) invalidateMainRateLimitQueries(client);
+  }
 
-    const targets = new Set();
-    officialUsageAlertCards().forEach((card) => {
-      markOfficialUsageAlertTarget(targets, card);
-      markOfficialUsageAlertTarget(targets, officialUsageAlertContainer(card));
-    });
-    composerUsageAlertBanners().forEach((banner) => {
-      markOfficialUsageAlertTarget(targets, banner);
-      markOfficialUsageAlertTarget(targets, officialUsageAlertContainer(banner));
-    });
-    document.querySelectorAll("[data-codex-plus-usage-alert-hidden]").forEach((el) => {
-      if (!targets.has(el)) delete el.dataset.codexPlusUsageAlertHidden;
-    });
-    targets.forEach((el) => {
-      if (el.dataset.codexPlusUsageAlertHidden !== "true") el.dataset.codexPlusUsageAlertHidden = "true";
-    });
+  if (window.__CODEX_PLUS_TEST_RATE_LIMIT_UNLOCK__) {
+    window.__codexPlusRateLimitUnlockTest = {
+      setBackendSettings: (settings) => {
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        codexPlusBackendSettingsLoaded = true;
+      },
+      setHideAlerts: (hidden) => {
+        window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = hidden === true;
+      },
+      install: () => syncOfficialUsagePolicy(),
+      policyKey: () => officialUsagePolicyKey(),
+      isRateLimitQueryKey: (queryKey) => isMainRateLimitQueryKey(queryKey),
+      rewrite: (value) => rewriteOfficialUsagePayload(value),
+    };
   }
 
   let zedRemoteStatusPromise = null;
@@ -11923,7 +12222,6 @@
   function scanRelevantSelector() {
     return [
       selectors.sidebarThread,
-      'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
       '[data-app-action-sidebar-section-heading="Chats"]',
       '[data-app-action-sidebar-section-heading="Projects"]',
       '[data-codex-archive-page-row="true"]',
@@ -11996,39 +12294,10 @@
     if (projectVisibilityChanged) {
       forceSessionRowsRefreshOnNextScan = true;
     }
-    // 在 200ms 全量扫描前同步隐藏额度横幅，避免新增节点首帧闪现。
-    if (officialUsageAlertHidden() && mutationTouchesUsageAlert(mutations)) {
-      try {
-        refreshOfficialUsageAlertVisibility();
-      } catch {}
-    }
     if (!projectVisibilityChanged && !shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
     window.__codexSessionDeleteScanTimer = scheduleCodexPlusRendererTimeout(runScheduledScan, 200);
-  }
-
-  function nodeMayContainUsageAlert(node) {
-    if (!node || node.nodeType !== 1) return false;
-    const host = node.matches?.("aside, [role='status']")
-      ? node
-      : node.closest?.("aside, [role='status']");
-    if (host) return !!host.closest?.("[data-codex-composer-root], aside.app-shell-left-panel");
-    return !!node.querySelector?.("[data-codex-composer-root] aside, aside.app-shell-left-panel [role='status'][aria-live='polite']");
-  }
-
-  function mutationTouchesUsageAlert(mutations) {
-    if (!mutations) return false;
-    for (const mutation of mutations) {
-      if (nodeMayContainUsageAlert(mutation.target)) return true;
-      for (const node of mutation.addedNodes || []) {
-        if (nodeMayContainUsageAlert(node)) return true;
-      }
-      for (const node of mutation.removedNodes || []) {
-        if (nodeMayContainUsageAlert(node)) return true;
-      }
-    }
-    return false;
   }
 
   function destroyCodexPlusRendererRuntime() {

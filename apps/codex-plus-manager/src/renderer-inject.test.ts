@@ -55,133 +55,6 @@ it("only reveals floating-panel content after the shell has settled open", async
   }
 });
 
-type FakeElementOptions = {
-  className?: string;
-  closestMatch?: string;
-  dismissLabel?: string;
-  hasProgress?: boolean;
-  hasUpgradeAction?: boolean;
-  headingText?: string;
-  styleDisplay?: string;
-};
-
-class FakeElement {
-  children: FakeElement[] = [];
-  dataset: Record<string, string> = {};
-  parentElement: FakeElement | null = null;
-  style: { display: string };
-  private readonly className: string;
-  private readonly closestMatch?: string;
-  private readonly dismissLabel: string;
-  private readonly hasProgress: boolean;
-  private readonly hasUpgradeAction: boolean;
-  private readonly headingText?: string;
-
-  constructor(options: FakeElementOptions = {}) {
-    this.className = options.className ?? "";
-    this.closestMatch = options.closestMatch;
-    this.dismissLabel = options.dismissLabel ?? "";
-    this.hasProgress = options.hasProgress ?? false;
-    this.hasUpgradeAction = options.hasUpgradeAction ?? false;
-    this.headingText = options.headingText;
-    this.style = { display: options.styleDisplay ?? "" };
-  }
-
-  appendChild(child: FakeElement) {
-    child.parentElement = this;
-    this.children.push(child);
-  }
-
-  closest(selector: string) {
-    return this.closestMatch === selector ? this : null;
-  }
-
-  getAttribute(name: string) {
-    return name === "aria-label" ? this.dismissLabel : null;
-  }
-
-  matches(selector: string) {
-    return selector === "div.w-full" && this.className.split(/\s+/).includes("w-full");
-  }
-
-  querySelector(selector: string) {
-    if (selector === 'progress[max="100"]') {
-      return this.hasProgress ? new FakeElement() : null;
-    }
-    if (/heading|h[1-5]/.test(selector) && this.headingText) {
-      return { textContent: this.headingText };
-    }
-    if (/billing|upgrade/i.test(selector) && this.hasUpgradeAction) {
-      return new FakeElement();
-    }
-    return null;
-  }
-
-  querySelectorAll(selector: string) {
-    return selector === "button" && this.dismissLabel ? [this] : [];
-  }
-}
-
-function usageAlertRuntime(
-  renderer: string,
-  cards: FakeElement[],
-  managed: FakeElement[],
-  composerBanners: FakeElement[] = [],
-) {
-  const start = renderer.indexOf("  function officialUsageAlertHidden(");
-  const end = renderer.indexOf("\n  let zedRemoteStatusPromise", start);
-  assert.ok(start >= 0 && end > start);
-  const source = renderer.slice(start, end);
-  const selectors: string[] = [];
-  const bodyClasses = new Set<string>();
-  const document = {
-    body: {
-      classList: {
-        contains(cls: string) {
-          return bodyClasses.has(cls);
-        },
-        toggle(cls: string, force?: boolean) {
-          const next = force === undefined ? !bodyClasses.has(cls) : !!force;
-          if (next) {
-            bodyClasses.add(cls);
-          } else {
-            bodyClasses.delete(cls);
-          }
-          return next;
-        },
-      },
-    },
-    querySelectorAll(selector: string) {
-      selectors.push(selector);
-      if (selector === '[data-codex-plus-usage-alert-hidden="true"]') {
-        return managed.filter((node) => node.dataset.codexPlusUsageAlertHidden === "true");
-      }
-      if (selector === '[data-codex-plus-usage-alert-hidden]') {
-        return [...managed, ...cards, ...composerBanners].filter((node) => "codexPlusUsageAlertHidden" in node.dataset);
-      }
-      if (selector === '[data-codex-composer-root] aside') {
-        return composerBanners;
-      }
-      return cards;
-    },
-  };
-  const windowValue: Record<string, unknown> = {};
-  const create = new Function(
-    "window",
-    "document",
-    "HTMLElement",
-    `${source}\nreturn { officialUsageAlertHidden, refreshOfficialUsageAlertVisibility };`,
-  ) as (
-    windowValue: Record<string, unknown>,
-    documentValue: typeof document,
-    elementType: typeof FakeElement,
-  ) => {
-    officialUsageAlertHidden: () => boolean;
-    refreshOfficialUsageAlertVisibility: () => void;
-  };
-  return { runtime: create(windowValue, document, FakeElement), selectors, windowValue, bodyClasses };
-}
-
 function installRendererStyle(
   renderer: string,
   existingStyle: { dataset: Record<string, string>; remove: () => void } | null = null,
@@ -220,6 +93,88 @@ function installRendererStyle(
 
   install(document);
   return appended;
+}
+
+type OfficialUsageFixture = {
+  [key: string]: unknown;
+  rate_limit: {
+    [key: string]: unknown;
+    allowed: boolean;
+    limit_reached?: boolean;
+  };
+};
+
+function officialUsageRuntime(
+  renderer: string,
+  profile: Record<string, unknown> | null,
+  queryClient?: Record<string, unknown>,
+) {
+  const start = renderer.indexOf("  function officialUsagePolicy()");
+  const end = renderer.indexOf("\n  let zedRemoteStatusPromise", start);
+  assert.ok(start >= 0 && end > start, "official usage policy block not found");
+  const windowValue: Record<string, unknown> = {
+    __CODEX_PLUS_TEST_RATE_LIMIT_UNLOCK__: true,
+    ...(queryClient ? { __REACT_QUERY_CLIENT__: queryClient } : {}),
+  };
+  const create = new Function(
+    "window",
+    "codexRemoteSessionActiveProfile",
+    `${renderer.slice(start, end)}\nreturn window.__codexPlusRateLimitUnlockTest;`,
+  ) as (
+    windowArg: Record<string, unknown>,
+    activeProfile: () => Record<string, unknown> | null,
+  ) => {
+    policyKey: () => string;
+    isRateLimitQueryKey: (key: unknown) => boolean;
+    rewrite: (value: OfficialUsageFixture) => OfficialUsageFixture;
+    setHideAlerts: (hidden: boolean) => void;
+    install: () => void;
+  };
+  return create(windowValue, () => profile);
+}
+
+function externalApiQuotaGateRuntime(
+  renderer: string,
+  fetchAsset: (url: string) => Promise<{ ok: boolean; text: () => Promise<string> }>,
+  locate: (source: string, url: string) => Record<string, unknown> | null,
+) {
+  const start = renderer.indexOf("  const externalApiQuotaGateMaxAttempts = 3;");
+  const end = renderer.indexOf("\n  function loadBackendSettingsForStartup", start);
+  assert.ok(start >= 0 && end > start, "external API quota gate block not found");
+  const windowValue: Record<string, unknown> = {
+    __codexPlusApiQuotaGate: {
+      locate,
+      condition: (location: Record<string, unknown>) => `condition:${location.quotaVariable}`,
+      permitsExternalApi: (_settings: unknown, hostId: unknown) => hostId === "local",
+    },
+  };
+  const create = new Function(
+    "window",
+    "codexPlusBackendSettings",
+    "codexPlusBackendSettingsLoaded",
+    "codexAppAssetUrl",
+    "codexAppAssetUrlFromScriptText",
+    "fetch",
+    `${renderer.slice(start, end)}\nreturn { installExternalApiQuotaGate, window };`,
+  ) as (
+    windowArg: Record<string, unknown>,
+    settings: Record<string, unknown>,
+    settingsLoaded: boolean,
+    assetUrl: (name: string) => string,
+    fallbackUrl: (name: string) => Promise<string>,
+    fetchAsset: (url: string) => Promise<{ ok: boolean; text: () => Promise<string> }>,
+  ) => {
+    installExternalApiQuotaGate: () => Promise<boolean | void>;
+    window: Record<string, unknown>;
+  };
+  return create(
+    windowValue,
+    {},
+    true,
+    () => "app://-/assets/app-primary.js",
+    async () => "",
+    fetchAsset,
+  );
 }
 
 function rendererRuntimeGate(renderer: string, existingVersion: string) {
@@ -532,149 +487,350 @@ describe("renderer injection header compatibility", () => {
     assert.match(css, /:where\([^)]*codex-plus-modal-overlay[^)]*\)\s*\{[^}]*font-family:\s*inherit;/s);
   });
 
-  it("hides only the official usage alert and restores it without changing upstream styles", async () => {
+  it("rewrites only official usage locks, preserves image quotas, and honors the alert setting", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const wrapper = new FakeElement({ className: "w-full", styleDisplay: "grid" });
-    const usageAlert = new FakeElement({ dismissLabel: "Dismiss usage alert", hasProgress: true });
-    const otherStatus = new FakeElement({ dismissLabel: "Dismiss sync status", hasProgress: true });
-    wrapper.appendChild(usageAlert);
-    const { runtime, selectors, windowValue } = usageAlertRuntime(renderer, [usageAlert, otherStatus], [wrapper]);
+    const scanStart = renderer.indexOf("  function scanLightweight()");
+    const scanEnd = renderer.indexOf("  function officialUsagePolicy()", scanStart);
+    assert.ok(scanStart >= 0 && scanEnd > scanStart);
+    const scan = renderer.slice(scanStart, scanEnd);
 
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(wrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(wrapper.style.display, "grid");
-    assert.equal(otherStatus.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.deepEqual(selectors, [
-      'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
-      '[data-codex-composer-root] aside',
-      '[data-codex-plus-usage-alert-hidden]',
-    ]);
-
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(wrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(wrapper.style.display, "grid");
-    assert.equal(wrapper.children[0], usageAlert);
-    assert.equal(selectors.pop(), '[data-codex-plus-usage-alert-hidden]');
-  });
-
-  it("hides modern composer usage alert banners and restores them without hiding unrelated asides", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const composerWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const matchingBanner = new FakeElement({ headingText: "Codex 和工作使用额度已用完" });
-    composerWrapper.appendChild(matchingBanner);
-
-    const englishWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const englishBanner = new FakeElement({ headingText: "You're out of\nCodex and Work usage" });
-    englishWrapper.appendChild(englishBanner);
-
-    const workspaceWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const workspaceBanner = new FakeElement({ headingText: "你的 Codex 和工作用量均已用完" });
-    workspaceWrapper.appendChild(workspaceBanner);
-
-    const approachingWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const approachingBanner = new FakeElement({ headingText: "您即将达到使用限额" });
-    approachingWrapper.appendChild(approachingBanner);
-
-    const modelWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const modelBanner = new FakeElement({ headingText: "所选模型已超出使用限额" });
-    modelWrapper.appendChild(modelBanner);
-
-    const unrelatedWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const unrelatedNotice = new FakeElement({ headingText: "Network disconnected" });
-    unrelatedWrapper.appendChild(unrelatedNotice);
-
-    const fileErrorWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const fileErrorNotice = new FakeElement({ headingText: "File upload failed" });
-    fileErrorWrapper.appendChild(fileErrorNotice);
-
-    const ultraWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const ultraNotice = new FakeElement({
-      headingText: "Ultra with up to 5 agents can use your usage limits quickly",
-    });
-    ultraWrapper.appendChild(ultraNotice);
-
-    const sharedWrapper = new FakeElement({ closestMatch: "[data-codex-composer-root]" });
-    const sharedBanner = new FakeElement({ headingText: "此模型的使用额度已用完" });
-    const sharedSibling = new FakeElement({ headingText: "Sandbox ready" });
-    sharedWrapper.appendChild(sharedBanner);
-    sharedWrapper.appendChild(sharedSibling);
-
-    const { runtime, windowValue, bodyClasses } = usageAlertRuntime(
-      renderer,
-      [],
-      [
-        composerWrapper,
-        englishWrapper,
-        workspaceWrapper,
-        approachingWrapper,
-        modelWrapper,
-        unrelatedWrapper,
-        fileErrorWrapper,
-        ultraWrapper,
-        sharedWrapper,
-      ],
-      [
-        matchingBanner,
-        englishBanner,
-        workspaceBanner,
-        approachingBanner,
-        modelBanner,
-        unrelatedNotice,
-        fileErrorNotice,
-        ultraNotice,
-        sharedBanner,
-        sharedSibling,
-      ],
-    );
-
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(composerWrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(englishWrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(workspaceWrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(approachingWrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(modelWrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(unrelatedWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(fileErrorWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(ultraWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(sharedWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(sharedBanner.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(sharedSibling.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(bodyClasses.has("codex-plus-hide-usage-alert"), true);
-
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(composerWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(englishWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(workspaceWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(approachingWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(modelWrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(sharedBanner.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(bodyClasses.has("codex-plus-hide-usage-alert"), false);
-  });
-
-  it("refreshes active-profile usage alert settings through the existing backend heartbeat", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
+    assert.doesNotMatch(scan, /syncOfficialUsagePolicy|refreshOfficialUsageAlert/);
     assert.match(renderer, /typeof nextStatus\.hideOfficialUsageAlert === "boolean"/);
     assert.match(renderer, /window\.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus\.hideOfficialUsageAlert/);
-    assert.match(renderer, /\[data-codex-plus-usage-alert-hidden="true"\] \{ display: none !important; \}/);
-    assert.match(
+    assert.match(renderer, /function syncOfficialUsagePolicy\(\)/);
+    assert.match(renderer, /queryKey\[1\] !== "image-generation"/);
+    assert.match(renderer, /image_generation_limit_reached/);
+    assert.match(renderer, /if \(loaded\) syncOfficialUsagePolicy\(\);/);
+    assert.doesNotMatch(renderer, /officialUsageAlertCards|refreshOfficialUsageAlertVisibility|codex-plus-hide-usage-alert/);
+    assert.doesNotMatch(renderer, /mutationTouchesUsageAlert/);
+
+    const runtime = officialUsageRuntime(renderer, { relayMode: "official", officialMixApiKey: true });
+    const status = {
+      plan_type: "plus",
+      rate_limit_reached_type: "weekly_limit",
+      model_picker_upsell: { message: "upgrade" },
+      rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100 } },
+      sidebar_usage_warnings: [{ message: "low" }],
+      rate_limit_warning: { message: "warning" },
+      rate_limit_upsell: { message: "upgrade" },
+    };
+
+    const visibleAlerts = runtime.rewrite(status);
+    assert.equal(visibleAlerts.rate_limit_reached_type, null);
+    assert.equal(visibleAlerts.model_picker_upsell, null);
+    assert.deepEqual(visibleAlerts.rate_limit, {
+      allowed: true,
+      limit_reached: false,
+      primary_window: { used_percent: 100 },
+    });
+    assert.deepEqual(visibleAlerts.sidebar_usage_warnings, status.sidebar_usage_warnings);
+    assert.deepEqual(visibleAlerts.rate_limit_warning, status.rate_limit_warning);
+    assert.equal(runtime.isRateLimitQueryKey(["rate-limit-status"]), true);
+    assert.equal(runtime.isRateLimitQueryKey(["rate-limit-status", "image-generation"]), false);
+
+    runtime.setHideAlerts(true);
+    const hiddenAlerts = runtime.rewrite({
+      ...status,
+      rate_limit_upsell: { banner_type: "image_generation_limit_reached" },
+    });
+    assert.equal(hiddenAlerts.sidebar_usage_warnings, null);
+    assert.equal(hiddenAlerts.rate_limit_warning, null);
+    assert.deepEqual(hiddenAlerts.rate_limit_upsell, { banner_type: "image_generation_limit_reached" });
+
+    const pureOfficial = officialUsageRuntime(renderer, { relayMode: "official", officialMixApiKey: false });
+    assert.equal(pureOfficial.policyKey(), "official");
+    assert.equal(pureOfficial.rewrite(status), status, "pure official profiles keep the original quota restriction");
+    pureOfficial.setHideAlerts(true);
+    const pureOfficialHidden = pureOfficial.rewrite(status);
+    assert.equal(pureOfficialHidden.rate_limit.allowed, false);
+    assert.equal(pureOfficialHidden.rate_limit.limit_reached, true);
+    assert.deepEqual(pureOfficialHidden.rate_limit_reached_type, status.rate_limit_reached_type);
+    assert.deepEqual(pureOfficialHidden.model_picker_upsell, status.model_picker_upsell);
+    assert.equal(pureOfficialHidden.sidebar_usage_warnings, null);
+  });
+
+  it("does not write the same usage cache entry again after delayed query notifications", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const query = {
+      queryKey: ["rate-limit-status", "user-1", "account-1"],
+      state: {
+        data: {
+          plan_type: "plus",
+          user_id: "user-1",
+          rate_limit_reached_type: "weekly_limit",
+          rate_limit: { allowed: false, limit_reached: true },
+        },
+      },
+    };
+    const queryListener: {
+      current: ((event: { query: typeof query; action?: { type: string } }) => void) | null;
+    } = { current: null };
+    let writes = 0;
+    const client = {
+      getQueryCache() {
+        return {
+          findAll: () => [query],
+          subscribe(callback: (event: { query: typeof query; action?: { type: string } }) => void) {
+            queryListener.current = callback;
+            return () => {};
+          },
+        };
+      },
+      setQueryData(_key: unknown, update: unknown) {
+        writes += 1;
+        const next = typeof update === "function"
+          ? (update as (previous: typeof query.state.data) => typeof query.state.data)(query.state.data)
+          : update as typeof query.state.data;
+        query.state.data = next;
+        queueMicrotask(() => queryListener.current?.({ query, action: { type: "success" } }));
+        return next;
+      },
+    };
+    const profile = { relayMode: "official", officialMixApiKey: true };
+    const runtime = officialUsageRuntime(
       renderer,
-      /body\.codex-plus-hide-usage-alert aside\.app-shell-left-panel \[role="status"\]\[aria-live="polite"\]:has\(progress\[max="100"\]\):has\(/,
+      profile,
+      client,
     );
-    assert.match(renderer, /button\[aria-label="关闭使用量提醒"\]/);
-    assert.match(renderer, /button\[aria-label="關閉用量提示"\]/);
-    assert.doesNotMatch(renderer, /\[data-codex-composer-root\] aside:not\(\[data-codex-plus-usage-alert-hidden="false"\]\):has/);
-    assert.doesNotMatch(renderer, /:has\(\[role="heading"\], h1, h2, h3, h4, h5\)/);
-    assert.match(renderer, /if \(officialUsageAlertHidden\(\) && mutationTouchesUsageAlert\(mutations\)\)/);
-    assert.doesNotMatch(renderer, /container\.style\.(?:setProperty|removeProperty)\("display"/);
+
+    runtime.install();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(writes, 1, "install rewrites the cached quota state once");
+    assert.equal(query.state.data.rate_limit.allowed, true);
+
+    client.setQueryData(query.queryKey, {
+      plan_type: "plus",
+      user_id: "user-1",
+      rate_limit_reached_type: "weekly_limit",
+      rate_limit: { allowed: false, limit_reached: true },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(writes, 2, "a later raw quota update is rewritten once despite delayed notification");
+    assert.equal(query.state.data.rate_limit.allowed, true);
+
+    profile.officialMixApiKey = false;
+    runtime.install();
+    assert.equal(query.state.data.rate_limit.allowed, false);
+    assert.equal(query.state.data.rate_limit.limit_reached, true);
+    assert.equal(query.state.data.rate_limit_reached_type, "weekly_limit");
+    assert.equal(writes, 3, "switching back restores the pre-rewrite object after the async success event");
+  });
+
+  it("preserves the raw quota across nested delayed server and plugin success notifications", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const profile = { relayMode: "official", officialMixApiKey: true };
+    const query = {
+      queryKey: ["rate-limit-status", "user-1", "account-1"],
+      state: {
+        data: {
+          plan_type: "plus",
+          user_id: "user-1",
+          rate_limit_reached_type: "weekly_limit",
+          rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100 } },
+        },
+      },
+    };
+    const queryListener: {
+      current: ((event: { query: typeof query; action?: { type: string } }) => void) | null;
+    } = { current: null };
+    let writes = 0;
+    const client = {
+      getQueryCache() {
+        return {
+          findAll: () => [query],
+          subscribe(callback: (event: { query: typeof query; action?: { type: string } }) => void) {
+            queryListener.current = callback;
+            return () => {};
+          },
+        };
+      },
+      setQueryData(_key: unknown, data: unknown) {
+        writes += 1;
+        query.state.data = data as typeof query.state.data;
+        queueMicrotask(() => queryListener.current?.({ query, action: { type: "success" } }));
+        return query.state.data;
+      },
+    };
+    const runtime = officialUsageRuntime(renderer, profile, client);
+
+    runtime.install();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(query.state.data.rate_limit.allowed, true);
+
+    query.state.data = {
+      plan_type: "plus",
+      user_id: "user-1",
+      rate_limit_reached_type: "daily_limit",
+      rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 64 } },
+    };
+    queryListener.current?.({ query, action: { type: "success" } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(query.state.data.rate_limit.allowed, true);
+    assert.equal(writes, 2, "server data is rewritten once and the delayed plugin notification does not rewrite it again");
+
+    profile.officialMixApiKey = false;
+    runtime.install();
+    assert.equal(query.state.data.rate_limit.allowed, false);
+    assert.equal(query.state.data.rate_limit.limit_reached, true);
+    assert.equal(query.state.data.rate_limit.primary_window.used_percent, 64);
+    assert.equal(query.state.data.rate_limit_reached_type, "daily_limit");
+  });
+
+  it("restores the latest raw account quota before a failed refetch can leave mixed-mode data behind", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const profile = { relayMode: "official", officialMixApiKey: true };
+    const query = {
+      queryKey: ["rate-limit-status", "user-1", "account-1"],
+      state: {
+        data: {
+          plan_type: "plus",
+          user_id: "user-1",
+          rate_limit_reached_type: "weekly_limit",
+          rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100 } },
+        },
+      },
+    };
+    const remoteQuery = {
+      queryKey: ["remote-rate-limit-status", "host-1"],
+      state: { data: { allowed: false, host_id: "host-1" } },
+    };
+    const queryListener: {
+      current: ((event: { query: typeof query; action?: { type: string } }) => void) | null;
+    } = { current: null };
+    let invalidations = 0;
+    const queries = [query, remoteQuery];
+    const client = {
+      getQueryCache() {
+        return {
+          findAll: () => queries,
+          subscribe(callback: (event: { query: typeof query; action?: { type: string } }) => void) {
+            queryListener.current = callback;
+            return () => {};
+          },
+        };
+      },
+      setQueryData(_key: unknown, update: unknown) {
+        const next = typeof update === "function"
+          ? (update as (previous: typeof query.state.data) => typeof query.state.data)(query.state.data)
+          : update as typeof query.state.data;
+        query.state.data = next;
+        queueMicrotask(() => queryListener.current?.({ query }));
+        return next;
+      },
+      invalidateQueries() {
+        invalidations += 1;
+        return Promise.reject(new Error("refetch failed"));
+      },
+    };
+    const runtime = officialUsageRuntime(renderer, profile, client);
+
+    runtime.install();
+    assert.equal(query.state.data.rate_limit.allowed, true);
+
+    const latestRaw = {
+      plan_type: "plus",
+      user_id: "user-1",
+      rate_limit_reached_type: "daily_limit",
+      rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 73 } },
+    };
+    query.state.data = latestRaw;
+    queryListener.current?.({ query, action: { type: "success" } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(query.state.data.rate_limit.allowed, true);
+
+    profile.officialMixApiKey = false;
+    runtime.install();
+    assert.equal(query.state.data.rate_limit.allowed, false);
+    assert.equal(query.state.data.rate_limit.limit_reached, true);
+    assert.equal(query.state.data.rate_limit.primary_window.used_percent, 73);
+    assert.equal(query.state.data.rate_limit_reached_type, "daily_limit");
+    assert.deepEqual(remoteQuery.state.data, { allowed: false, host_id: "host-1" });
+    assert.equal(invalidations, 1);
+
+    profile.relayMode = "pureApi";
+    runtime.install();
+    assert.equal(query.state.data.rate_limit.allowed, false);
+    assert.equal(query.state.data.rate_limit.primary_window.used_percent, 73);
+    assert.deepEqual(remoteQuery.state.data, { allowed: false, host_id: "host-1" });
+  });
+
+  it("retries transient quota-gate discovery without duplicate or unbounded asset fetches", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    let fetches = 0;
+    let fail = true;
+    const runtime = externalApiQuotaGateRuntime(
+      renderer,
+      async () => {
+        fetches += 1;
+        if (fail) throw new Error("temporary asset fetch failure");
+        return { ok: true, text: async () => "fixture source" };
+      },
+      () => ({ urlRegex: "^fixture$", lineNumber: 1, columnNumber: 2, quotaVariable: "quota", hostVariable: "host" }),
+    );
+
+    await Promise.all([
+      runtime.installExternalApiQuotaGate(),
+      runtime.installExternalApiQuotaGate(),
+    ]);
+    assert.equal(fetches, 1, "simultaneous settings refreshes share the in-flight fetch");
+
+    fail = false;
+    assert.equal(await runtime.installExternalApiQuotaGate(), true);
+    assert.equal(fetches, 2, "a later settings refresh retries the transient failure");
+    assert.equal(
+      runtime.window.__codexPlusApiQuotaBreakpoint && typeof runtime.window.__codexPlusApiQuotaBreakpoint,
+      "object",
+      "only a discovered descriptor marks the gate installed",
+    );
+    await runtime.installExternalApiQuotaGate();
+    assert.equal(fetches, 2, "a successfully installed descriptor is not fetched again");
+
+    let failedFetches = 0;
+    const exhausted = externalApiQuotaGateRuntime(
+      renderer,
+      async () => {
+        failedFetches += 1;
+        throw new Error("asset unavailable");
+      },
+      () => null,
+    );
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await exhausted.installExternalApiQuotaGate();
+    }
+    assert.equal(failedFetches, 3, "transient discovery is bounded");
+
+    let mismatchedFetches = 0;
+    const mismatched = externalApiQuotaGateRuntime(
+      renderer,
+      async () => {
+        mismatchedFetches += 1;
+        return { ok: true, text: async () => "unsupported source shape" };
+      },
+      () => null,
+    );
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await mismatched.installExternalApiQuotaGate();
+    }
+    assert.equal(mismatchedFetches, 1, "an unsupported source shape is not repeatedly fetched");
+    assert.match(renderer, /function loadBackendSettings\(\)[\s\S]*if \(loaded\) void installExternalApiQuotaGate\(\);[\s\S]*function loadBackendSettingsForStartup/);
+    const heartbeatStart = renderer.indexOf("  async function syncBackendSettingsFromHeartbeat()");
+    const heartbeatEnd = renderer.indexOf("\n  async function setBackendSetting", heartbeatStart);
+    assert.match(renderer.slice(heartbeatStart, heartbeatEnd), /if \(loaded\) \{[\s\S]*void installExternalApiQuotaGate\(\);/);
+  });
+
+  it("keeps the recommendation tab and ad request unreachable from the normal menu path", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const modalStart = renderer.indexOf("  function openCodexPlusModal()");
+    const modalEnd = renderer.indexOf("\n  function findNativeMenuInsertionPoint()", modalStart);
+    assert.ok(modalStart >= 0 && modalEnd > modalStart);
+    const modal = renderer.slice(modalStart, modalEnd);
+    const withoutHtmlComments = modal.replace(/<!--[\s\S]*?-->/g, "");
+
+    assert.match(renderer, /function scanLightweight\(\)[\s\S]*?installCodexPlusMenu\(\)/);
+    assert.match(modal, /<!-- 推荐内容页签暂时隐藏/);
+    assert.doesNotMatch(withoutHtmlComments, /data-codex-plus-tab="sponsor"/);
+    assert.match(modal, /selectCodexPlusTab\("home"\)/);
+    assert.match(modal, /\/\/ if \(!codexPlusAdsLoaded\) fetchCodexPlusAds\(\);/);
   });
 
   it("removes session sharing when Codex enhancements are disabled", async () => {

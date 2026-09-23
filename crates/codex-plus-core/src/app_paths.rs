@@ -407,6 +407,231 @@ pub fn find_standalone_codex_app_dir() -> Option<PathBuf> {
     None
 }
 
+/// Finds the CLI shipped by the standalone Codex installer.
+pub fn find_standalone_codex_cli() -> Option<PathBuf> {
+    find_standalone_codex_cli_candidates().into_iter().next()
+}
+
+/// Finds standalone CLI candidates in preference order.
+pub fn find_standalone_codex_cli_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME");
+        let path = std::env::var_os("PATH");
+        return find_macos_standalone_codex_cli_candidates_in(
+            path.as_deref(),
+            home.as_deref().map(Path::new),
+            &[
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ],
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        find_standalone_codex_cli_from_local_appdata(
+            std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        )
+        .into_iter()
+        .collect()
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn find_standalone_codex_cli_from_local_appdata(local_appdata: Option<&Path>) -> Option<PathBuf> {
+    let bin_dir = local_appdata?.join("OpenAI").join("Codex").join("bin");
+    find_standalone_codex_cli_in(&bin_dir)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn find_standalone_codex_cli_in(bin_dir: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = standalone_cli_in_dir(bin_dir) {
+        candidates.push(path);
+    }
+    if let Ok(entries) = std::fs::read_dir(bin_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(path) = standalone_cli_in_dir(&entry.path()) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    candidates.pop()
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn standalone_cli_in_dir(dir: &Path) -> Option<PathBuf> {
+    ["codex.exe", "codex", "Codex.exe", "Codex"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn find_macos_standalone_codex_cli_candidates_in(
+    path_env: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+    additional_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut search_dirs = path_env
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(path))
+        .collect::<Vec<_>>();
+    if let Some(home) = home {
+        search_dirs.push(home.join(".local").join("bin"));
+    }
+    search_dirs.extend_from_slice(additional_dirs);
+
+    let mut seen = std::collections::HashSet::new();
+    search_dirs
+        .into_iter()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .filter(|dir| seen.insert(dir.clone()))
+        .map(|dir| dir.join("codex"))
+        .filter(|candidate| candidate.is_file())
+        .collect()
+}
+
+#[cfg(test)]
+mod standalone_cli_tests {
+    use super::{
+        find_macos_standalone_codex_cli_candidates_in,
+        find_standalone_codex_cli_from_local_appdata, find_standalone_codex_cli_in,
+    };
+    use std::ffi::OsStr;
+
+    #[test]
+    fn standalone_cli_finds_latest_versioned_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("codex.exe"), "old").unwrap();
+        std::fs::write(new.join("codex.exe"), "new").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(old.join("codex.exe"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+            ))
+            .unwrap();
+        assert_eq!(
+            find_standalone_codex_cli_in(temp.path()),
+            Some(new.join("codex.exe"))
+        );
+    }
+
+    #[test]
+    fn standalone_cli_returns_none_without_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(find_standalone_codex_cli_in(temp.path()), None);
+    }
+
+    #[test]
+    fn standalone_cli_finds_unversioned_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("codex.exe");
+        std::fs::write(&binary, "cli").unwrap();
+        assert_eq!(find_standalone_codex_cli_in(temp.path()), Some(binary));
+    }
+
+    #[test]
+    fn standalone_cli_preserves_local_appdata_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("OpenAI").join("Codex").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let binary = bin.join("codex.exe");
+        std::fs::write(&binary, "cli").unwrap();
+
+        assert_eq!(
+            find_standalone_codex_cli_from_local_appdata(Some(temp.path())),
+            Some(binary)
+        );
+        assert_eq!(find_standalone_codex_cli_from_local_appdata(None), None);
+    }
+
+    #[test]
+    fn macos_standalone_cli_searches_path_before_home_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let path_bin = temp.path().join("path-bin");
+        let home_bin = temp.path().join("home").join(".local").join("bin");
+        std::fs::create_dir_all(&path_bin).unwrap();
+        std::fs::create_dir_all(&home_bin).unwrap();
+        let path_cli = path_bin.join("codex");
+        std::fs::write(&path_cli, "path").unwrap();
+        std::fs::write(home_bin.join("codex"), "home").unwrap();
+
+        assert_eq!(
+            find_macos_standalone_codex_cli_candidates_in(
+                Some(path_bin.as_os_str()),
+                Some(temp.path().join("home").as_path()),
+                &[],
+            ),
+            vec![path_cli, home_bin.join("codex")]
+        );
+    }
+
+    #[test]
+    fn macos_standalone_cli_searches_home_and_common_bins() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let home_bin = home.join(".local").join("bin");
+        let common_bin = temp.path().join("homebrew");
+        std::fs::create_dir_all(&home_bin).unwrap();
+        std::fs::create_dir_all(&common_bin).unwrap();
+        let home_cli = home_bin.join("codex");
+        let common_cli = common_bin.join("codex");
+        std::fs::write(&home_cli, "home").unwrap();
+        std::fs::write(&common_cli, "common").unwrap();
+
+        assert_eq!(
+            find_macos_standalone_codex_cli_candidates_in(
+                None,
+                Some(home.as_path()),
+                std::slice::from_ref(&common_bin),
+            ),
+            vec![home_cli.clone(), common_cli.clone()]
+        );
+        std::fs::remove_file(&home_cli).unwrap();
+        assert_eq!(
+            find_macos_standalone_codex_cli_candidates_in(
+                None,
+                Some(home.as_path()),
+                std::slice::from_ref(&common_bin),
+            ),
+            vec![common_cli]
+        );
+    }
+
+    #[test]
+    fn macos_standalone_cli_ignores_empty_and_missing_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_path = std::env::join_paths([temp.path().join("missing")]).unwrap();
+        assert_eq!(
+            find_macos_standalone_codex_cli_candidates_in(
+                Some(missing_path.as_os_str()),
+                None,
+                &[temp.path().to_path_buf()],
+            ),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert_eq!(
+            find_macos_standalone_codex_cli_candidates_in(Some(OsStr::new("")), None, &[]),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+}
+
 pub fn resolve_codex_app_dir_with_saved(
     app_dir: Option<&Path>,
     saved_app_path: Option<&str>,

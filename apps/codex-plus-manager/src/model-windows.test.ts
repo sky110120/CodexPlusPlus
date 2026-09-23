@@ -40,6 +40,7 @@ const _profileTypeCheck: RelayProfile = {
   vlmModel: "",
   vlmBaseUrl: "",
   userAgent: "",
+  customHeaders: [],
   sub2apiEnabled: false,
   sub2apiMultiplier: "",
   standardOpenaiProtocol: false,

@@ -804,8 +804,8 @@ export const EN_PLAIN: Record<string, string> = {
   "混入 API": "Mixed-in API",
   "混入 API KEY": "Mix in API KEY",
   "关闭官方低额度提示": "Hide official low-usage alert",
-  "关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。":
-    "When hidden, you can still view the official quota from the account menu in the lower-left corner of Codex.",
+  "只隐藏低额度和已用完提示，不改变发送限制。左下角账户菜单仍显示官方剩余额度。":
+    "Only hides low-usage and exhausted prompts. It does not change send restrictions. The account menu in Codex's lower-left corner still shows the official remaining quota.",
   "混入 API Key": "Mix in API Key",
   "添加供应商": "Add provider",
   "添加模型": "Add model",
@@ -1188,6 +1188,14 @@ export const EN_PLAIN: Record<string, string> = {
     "❌ Batch description parse failed (should not trigger for single-image tests)",
   "❌ HTTP 客户端构建失败": "❌ Failed to build the HTTP client",
   "❌ 未知错误": "❌ Unknown error",
+  // issue #1685：供应商自定义上游请求头。
+  "自定义请求头": "Custom request headers",
+  "请求头名称": "Header name",
+  "请求头值": "Header value",
+  "自定义请求头会同时用于测试连接、模型列表与实际代理请求。":
+    "Custom headers apply to the connection test, the model list and proxied requests alike.",
+  "Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。":
+    "Transport headers such as Host and Content-Length are managed by the proxy and cannot be overridden. When Authorization is set here it takes precedence and the API key is not injected.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.

@@ -18,6 +18,44 @@ use codex_plus_core::settings::{
     BackendSettings, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
 };
 
+/// 回归（issue #1685）：自定义请求头在保存时做结构校验，传输头不允许覆盖。
+#[test]
+fn normalize_relay_profile_rejects_forbidden_custom_headers() {
+    let mut profile = RelayProfile {
+        custom_headers: vec![codex_plus_core::settings::RelayHeaderKeyValue {
+            key: "Host".to_string(),
+            value: "evil.example".to_string(),
+        }],
+        ..RelayProfile::default()
+    };
+
+    let error = normalize_relay_profile_for_storage(&mut profile).unwrap_err();
+    assert!(format!("{error:#}").contains("不允许覆盖"));
+}
+
+/// 回归（issue #1685）：合法自定义头保留，空行被丢掉，首尾空白被压缩。
+#[test]
+fn normalize_relay_profile_keeps_custom_headers() {
+    let mut profile = RelayProfile {
+        custom_headers: vec![
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: " X-Tenant ".to_string(),
+                value: " acme ".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: String::new(),
+                value: String::new(),
+            },
+        ],
+        ..RelayProfile::default()
+    };
+
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    assert_eq!(profile.custom_headers.len(), 1);
+    assert_eq!(profile.custom_headers[0].key, "X-Tenant");
+    assert_eq!(profile.custom_headers[0].value, "acme");
+}
+
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
     let root = home.join(".tmp").join("plugins-remote");
     std::fs::create_dir_all(root.join(".agents").join("plugins")).unwrap();
@@ -570,6 +608,69 @@ fn apply_chat_protocol_relay_points_codex_to_local_responses_proxy() {
     assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
     assert!(!updated.contains("codex_plus_chat_base_url"));
+}
+
+/// 回归（issue #1604）：重启/注入路径写入聚合代理配置时，
+/// 必须保留 live auth.json 里已有的官方 OAuth token，不能整体覆盖。
+#[test]
+fn apply_relay_config_with_session_provider_keeps_live_oauth_tokens() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"access-token","refresh_token":"refresh-token"}}"#,
+    )
+    .unwrap();
+
+    codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
+        temp.path(),
+        "http://127.0.0.1:57321/v1",
+        "codex-plus-aggregate",
+        RelayProtocol::Responses,
+        57321,
+        codex_plus_core::settings::RelaySessionProvider::Custom,
+    )
+    .unwrap();
+
+    let auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        auth.get("tokens")
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(|token| token.as_str()),
+        Some("access-token"),
+        "重启/注入路径不能清掉官方 OAuth token"
+    );
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(|item| item.as_str()),
+        Some("codex-plus-aggregate")
+    );
+}
+
+/// 回归（issue #1604）：现场用户手上已经是历史遗留的 0 字节 auth.json，
+/// 只重启（走注入路径）也必须自愈为合法 JSON，否则依旧停在登录页。
+#[test]
+fn apply_relay_config_with_session_provider_repairs_empty_auth_json() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("auth.json"), "").unwrap();
+
+    codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
+        temp.path(),
+        "http://127.0.0.1:57321/v1",
+        "codex-plus-aggregate",
+        RelayProtocol::Responses,
+        57321,
+        codex_plus_core::settings::RelaySessionProvider::Custom,
+    )
+    .unwrap();
+
+    let raw = std::fs::read_to_string(temp.path().join("auth.json")).unwrap();
+    let auth: serde_json::Value =
+        serde_json::from_str(&raw).expect("空 auth.json 必须被修复成合法 JSON");
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(|item| item.as_str()),
+        Some("codex-plus-aggregate")
+    );
 }
 
 #[test]
@@ -1532,6 +1633,65 @@ experimental_bearer_token = "sk-a"
 }
 
 #[test]
+fn apply_relay_files_preserves_live_hook_array_tables_without_overriding_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"[[hooks.UserPromptSubmit]]
+matcher = "Bash"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "live-submit"
+
+[[hooks.Stop]]
+matcher = "live-stop"
+
+[hooks.state]
+live_state = "keep"
+"#,
+    )
+    .unwrap();
+
+    apply_relay_files_to_home(
+        temp.path(),
+        r#"[[hooks.Stop]]
+matcher = "profile-stop"
+
+[hooks.state]
+profile_state = "discard"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://relay.example/v1"
+"#,
+        "{}",
+    )
+    .unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let parsed: toml::Value = config.parse().unwrap();
+    assert_eq!(
+        parsed["hooks"]["UserPromptSubmit"][0]["matcher"].as_str(),
+        Some("Bash")
+    );
+    assert_eq!(
+        parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
+        Some("live-submit")
+    );
+    assert_eq!(
+        parsed["hooks"]["Stop"][0]["matcher"].as_str(),
+        Some("profile-stop")
+    );
+    assert_eq!(
+        parsed["hooks"]["state"]["live_state"].as_str(),
+        Some("keep")
+    );
+    assert!(parsed["hooks"]["state"].get("profile_state").is_none());
+}
+
+#[test]
 fn apply_relay_files_removes_stale_profile_hook_state_when_live_config_has_none() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("config.toml"), "model = \"old\"\n").unwrap();
@@ -1611,6 +1771,41 @@ fn apply_relay_files_allows_empty_isolated_auth_json() {
     assert_eq!(
         std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
         ""
+    );
+}
+
+/// 回归（issue #1604）：低层 apply API 处理聚合 profile 时不能把 auth.json 写成空文件，
+/// 并且要保留 live 里已有的官方 OAuth token。
+#[test]
+fn apply_relay_profile_files_for_aggregate_keeps_live_oauth_tokens() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"access-token"}}"#,
+    )
+    .unwrap();
+    let profile = RelayProfile {
+        id: "agg".to_string(),
+        name: "聚合".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("auth.json")).unwrap())
+            .expect("聚合 apply 后 auth.json 必须是合法 JSON");
+    assert_eq!(
+        auth.get("tokens")
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(|token| token.as_str()),
+        Some("access-token"),
+        "聚合 apply 不能清掉官方 OAuth token"
+    );
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(|item| item.as_str()),
+        Some("codex-plus-aggregate")
     );
 }
 
@@ -2187,6 +2382,75 @@ base_url = "https://relay.example/v1"
     assert!(config.contains("[mcp_servers.manual]"));
     assert!(config.contains(r#"command = "template-manual""#));
     assert!(!config.contains(r#"command = "live-managed""#));
+}
+
+#[test]
+fn apply_relay_profile_with_context_repairs_existing_mcp_without_restoring_disabled_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "old"
+
+[mcp_servers.node_repl]
+args = []
+command = "node_repl"
+env_vars = ["CODEX_WINDOWS_REGISTERED_CORE"]
+startup_timeout_sec = 120
+NODE_REPL_NODE_PATH = "flattened-node"
+CODEX_HOME = "flattened-home"
+
+[mcp_servers.node_repl.env]
+NODE_REPL_NODE_PATH = "live-node"
+CODEX_HOME = "live-home"
+
+[mcp_servers.disabled]
+command = "live-disabled"
+"#,
+    )
+    .unwrap();
+    let profile = RelayProfile {
+        id: "relay-node-repl".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://relay.example/v1"
+
+[mcp_servers.node_repl]
+NODE_REPL_NODE_PATH = "profile-node"
+CODEX_HOME = "profile-home"
+
+[mcp_servers.node_repl.env]
+NODE_REPL_NODE_PATH = "profile-node"
+CODEX_HOME = "profile-home"
+"#
+        .to_string(),
+        auth_contents: "{}".to_string(),
+        ..RelayProfile::default()
+    };
+    let common = r#"[mcp_servers.disabled]
+enabled = false
+command = "disabled-by-context"
+"#;
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, common).unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let parsed: toml::Value = config.parse().unwrap();
+    let node_repl = &parsed["mcp_servers"]["node_repl"];
+    assert!(node_repl.get("args").is_some());
+    assert_eq!(node_repl["command"].as_str(), Some("node_repl"));
+    assert!(node_repl.get("env_vars").is_some());
+    assert_eq!(node_repl["startup_timeout_sec"].as_integer(), Some(120));
+    assert!(node_repl.get("NODE_REPL_NODE_PATH").is_none());
+    assert!(node_repl.get("CODEX_HOME").is_none());
+    assert_eq!(
+        node_repl["env"]["NODE_REPL_NODE_PATH"].as_str(),
+        Some("profile-node")
+    );
+    assert!(!config.contains("[mcp_servers.disabled]"));
 }
 
 #[test]
@@ -4659,6 +4923,60 @@ base_url = "https://relay.example/v1"
 }
 
 #[test]
+fn apply_relay_profile_generates_gpt6_sol_luna_catalog_without_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-gpt6".to_string(),
+        model: "gpt-6-sol".to_string(),
+        model_list: "gpt-6-sol\ngpt-6-luna".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "gpt-6-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://relay.example/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_catalog_json = "model-catalogs/relay-gpt6.json""#));
+    let catalog: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(temp.path().join("model-catalogs/relay-gpt6.json")).unwrap(),
+    )
+    .unwrap();
+    for model in catalog["models"].as_array().unwrap() {
+        let mut expected_efforts = vec!["none", "low", "medium", "high", "xhigh", "max"];
+        if model["slug"] == "gpt-6-sol" {
+            expected_efforts.push("ultra");
+        }
+        assert_eq!(model["context_window"], 272_000);
+        assert_eq!(model["max_context_window"], 872_000);
+        assert_eq!(model["use_responses_lite"], false);
+        assert_eq!(model["multi_agent_version"], "v2");
+        assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
+        assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(
+            model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level["effort"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_efforts
+        );
+    }
+    assert_eq!(catalog["models"][0]["slug"], "gpt-6-sol");
+    assert_eq!(catalog["models"][1]["slug"], "gpt-6-luna");
+}
+
+#[test]
 fn apply_deepseek_responses_official_mix_writes_official_tool_compatibility() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -6008,4 +6326,48 @@ base_url = "https://chatgpt.com/backend-api/codex"
         generated_catalog_model(&temp, "relay-lite-oauth-session")["use_responses_lite"],
         true
     );
+}
+
+/// 供应商 slug 已由内置元数据链命中时，粘贴导入的 metadata 仍应覆盖展示类
+/// 字段（display_name 等），而窗口字段继续由生成器管辖（issue #2191）。
+#[test]
+fn pasted_metadata_overrides_embedded_vendor_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        model: "kimi-k3".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        config_contents: r#"model = "kimi-k3"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example.test/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
+        model_list: "kimi-k3".to_string(),
+        model_metadata: r#"{"kimi-k3":{"display_name":"我的K3","priority":3}}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_catalog_json = "model-catalogs/relay-a.json""#));
+    let catalog: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(temp.path().join("model-catalogs/relay-a.json")).unwrap(),
+    )
+    .unwrap();
+    let model = &catalog["models"][0];
+    assert_eq!(model["slug"], "kimi-k3");
+    // 粘贴导入的展示字段覆盖内置供应商元数据
+    assert_eq!(model["display_name"], "我的K3");
+    assert_eq!(model["priority"], 3);
+    // 窗口仍按生成器管辖：未显式配置时取供应商元数据的 1M（而非粘贴残留值）
+    assert_eq!(model["context_window"], 1_048_576);
+    assert_eq!(model["max_context_window"], 1_048_576);
 }
