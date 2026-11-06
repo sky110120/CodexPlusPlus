@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   windows-artifacts:
+    if: ${{ false }}
     name: Windows artifacts
     runs-on: windows-latest
     steps:
@@ -159,6 +160,9 @@ jobs:
       # 与 Info.plist 的 LSMinimumSystemVersion 一致，不随 runner 的 SDK 抬高 C 依赖的最低系统版本。
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -176,6 +180,10 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm ci
 
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: npm test
+
       - name: Native Fast regression tests
         run: >-
           node --test
@@ -189,9 +197,24 @@ jobs:
       - name: Check native browser inspector bundle
         run: node scripts/assemble-native-browser-inspector.mjs --check
 
+      - name: TypeScript check
+        working-directory: apps/codex-plus-manager
+        run: npm run check
+
       - name: Build frontend
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
+
+      - name: Rust tests
+        timeout-minutes: 60
+        env:
+          RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
+        run: |
+          if [ -n "${RUST_TEST_FILTER:-}" ]; then
+            cargo test --workspace -- "$RUST_TEST_FILTER" --test-threads=1
+          else
+            cargo test --workspace
+          fi
 
       - name: Build Apple Silicon macOS DMG
         run: |
@@ -241,6 +264,7 @@ jobs:
           if-no-files-found: error
 
   linux-deb:
+    if: ${{ false }}
     name: Linux DEB (Ubuntu 24.04, amd64)
     runs-on: ubuntu-24.04
     steps:

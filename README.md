@@ -8,15 +8,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/BigPizzaV3/CodexPlusPlus/releases"><img src="https://img.shields.io/github/v/release/BigPizzaV3/CodexPlusPlus?style=flat-square&amp;color=7387ff&amp;label=release" alt="最新版本"></a>
+  <a href="https://github.com/sky110120/CodexPlusPlus/releases"><img src="https://img.shields.io/github/v/release/sky110120/CodexPlusPlus?style=flat-square&amp;color=7387ff&amp;label=release" alt="最新版本"></a>
   <a href="https://github.com/BigPizzaV3/CodexPlusPlus/stargazers"><img src="https://img.shields.io/github/stars/BigPizzaV3/CodexPlusPlus?style=flat-square&amp;color=e8b86d" alt="GitHub Stars"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-838da8?style=flat-square" alt="许可证 AGPL-3.0-only"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-838da8?style=flat-square" alt="支持 Windows 和 macOS">
+  <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-838da8?style=flat-square" alt="本仓库提供 macOS Apple Silicon 安装包">
   <img src="https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-838da8?style=flat-square" alt="使用 Rust 与 Tauri 构建">
 </p>
 
 <p align="center">
-  <a href="https://github.com/BigPizzaV3/CodexPlusPlus/releases"><strong>下载最新版 ↗</strong></a> &nbsp; · &nbsp;
+  <a href="https://github.com/sky110120/CodexPlusPlus/releases"><strong>下载最新版 ↗</strong></a> &nbsp; · &nbsp;
   <a href="#快速上手">快速上手</a> &nbsp; · &nbsp;
   <a href="#功能一览">功能一览</a> &nbsp; · &nbsp;
   <a href="https://github.com/BigPizzaV3/CodexPlusPlus/issues">反馈问题</a> &nbsp; · &nbsp;
@@ -368,12 +368,11 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
 
 ## 快速上手
 
-**1. 下载安装包**：前往 [GitHub Releases](https://github.com/BigPizzaV3/CodexPlusPlus/releases)。
+**1. 下载安装包**：前往本仓库 [GitHub Releases](https://github.com/sky110120/CodexPlusPlus/releases)。本仓库仅构建 Apple Silicon 安装包。
 
 | 你的设备 | 安装包 |
 | --- | --- |
-| Windows · x64 | `CodexPlusPlus-*-windows-x64-setup.exe` |
-| macOS · Apple Silicon / Intel | `CodexPlusPlus-*-macos-universal.dmg` |
+| macOS · Apple Silicon | `CodexPlusPlus-*-macos-arm64.dmg` |
 
 **2. 添加供应商**：打开「网关 → 供应商池」，点「添加供应商」：填 API Key、登录 ChatGPT / GitHub Copilot / SuperGrok 订阅，或从直连模式、OpenCode 一次导入多家。添加时自动拉模型列表并填好价格。
 

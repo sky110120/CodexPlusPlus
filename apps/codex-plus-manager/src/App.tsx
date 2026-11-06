@@ -1829,9 +1829,7 @@ export function App() {
     percent: 0,
     message: t("尚未运行安装包更新。"),
   });
-  const [ads, setAds] = useState<AdsResult | null>(null);
-  // 供应商池右下角「正在找合适的供应商？」的悬浮提示：点 × 关掉，本次运行内不再出现。
-  const [sponsorHintClosed, setSponsorHintClosed] = useState(false);
+  const [, setAds] = useState<AdsResult | null>(null);
   const [scriptMarket, setScriptMarket] = useState<ScriptMarketResult | null>(null);
   const [launchForm, setLaunchForm] = useState({
     appPath: "",
@@ -2935,7 +2933,6 @@ export function App() {
       await refreshScriptMarket(true);
       await refreshUserScriptInventory();
     }
-    if (next === "home") await refreshAds(true);
     if (next === "settings") {
       await refreshOverview(true);
       await refreshLogs(true);
@@ -4246,8 +4243,6 @@ export function App() {
         void checkUpdate(true);
       }
       await refreshOverview(true);
-      // 供应商页的提示依赖赞助商数据，启动时先刷新一次。
-      await refreshAds(true);
       if (!handledNavigation) await refreshSettings(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
@@ -5337,22 +5332,6 @@ export function App() {
               onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])}
               tab={gatewayTabByRoute[route]}
             />
-          ) : null}
-          {/* 供应商池右下角的悬浮提示：在找供应商时顺手带去首页的赞助商推荐；首页没有赞助商时不显示。 */}
-          {route === "gatewayProviders" && !sponsorHintClosed && (ads?.ads?.length ?? 0) + (ads?.topAds?.length ?? 0) > 0 ? (
-            <div className="cx-float-hint">
-              <button className="cx-float-hint-main" onClick={() => void navigate("home")} type="button">
-                <Sparkles aria-hidden="true" />
-                <span className="cx-float-hint-copy">
-                  <strong>{t("正在找合适的供应商？")}</strong>
-                  <small>{t("去首页看看赞助商推荐")}</small>
-                </span>
-                <ArrowRight aria-hidden="true" />
-              </button>
-              <button aria-label={t("关闭")} className="cx-float-hint-close" onClick={() => setSponsorHintClosed(true)} title={t("关闭")} type="button">
-                <X aria-hidden="true" />
-              </button>
-            </div>
           ) : null}
           {route === "agentSettings" || route === "maintenance" ? (
             // 设置与安装维护合在一页：左侧分类目录，右侧限宽列表。
@@ -17647,7 +17626,7 @@ function routeSubtitle(route: Route, soloAgent: string | null = null) {
   if (soloAgent && route === "hub") return tf("{0} 经 Codex++ 接入任意供应商：走哪家、是否健康，一屏看全", [agentName(soloAgent)]);
   if (soloAgent && route === "gateway") return tf("让 {0} 经 Codex++ 网关接入供应商池，并选它默认用的模型", [agentName(soloAgent)]);
   const subtitles: Record<Route, string> = {
-    home: t("赞助商推荐：支持 Codex++ 的服务"),
+    home: t("检查问题、启动与快速修复"),
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),

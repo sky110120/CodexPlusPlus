@@ -363,14 +363,15 @@ test("首页：状态与常用入口保留，推荐区域不渲染；首页是�
   // 侧栏主模式第一项；旧「推荐内容」路由跳到首页，设置模式里不再有这一项。
   assert.match(functionSource("AppSidebar"), /const general: SideEntry\[\] = \[\n\s*\{ key: "home", route: "home", label: t\("首页"\), icon: House, match: \["home", "recommendations"\] \},/);
   assert.match(app, /target === "recommendations" \? "home" : target/);
-  assert.match(app, /if \(next === "home"\) await refreshAds\(true\);/);
+  assert.doesNotMatch(app, /await refreshAds\(true\)/);
+  assert.doesNotMatch(app, /去首页看看赞助商推荐/);
   assert.doesNotMatch(text.slice(text.indexOf("const settingsModeRoutes"), text.indexOf("const customizeRoutes")), /"recommendations"/);
   const home = functionSource("HomeScreen");
   const visibleHome = home.replace(/\{\/\*[\s\S]*?\*\/\}/g, "");
   const order = ['title={t("状态")}', 'title={t("常用")}'].map((needle) => visibleHome.indexOf(needle));
   assert.ok(order.every((index, position) => index > 0 && (position === 0 || index > order[position - 1])), String(order));
-  assert.match(home, /\{\/\* 首页刷新推荐按钮暂时下线\./);
-  assert.match(home, /\{\/\* 首页精选推荐和更多赞助商区域暂时下线\./);
+  assert.match(home, /\{\/\* 首页刷新推荐按钮暂时下线。/);
+  assert.match(home, /\{\/\* 首页精选推荐和更多赞助商区域暂时下线。/);
   assert.doesNotMatch(visibleHome, /TopbarActions|刷新推荐|精选推荐|赞助商推荐|更多赞助商|home-heroes|home-sponsors/);
   // 只管增强时不显示网关一行，入口也按使用模式过滤。
   assert.match(home, /\{enhanceOnly \? null : \(/);
