@@ -1426,7 +1426,7 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
  * 新增页面时**必须**想清楚归属：默认可见会让 Codex 专属功能在 Grok 下露出来。
  */
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string; tools?: readonly string[] }> = [
-  // 首页：整个程序的落脚页，专门放赞助商推荐（原「推荐内容」页并进来）。
+  // 首页：整个程序的落脚页，集中展示状态与常用入口。
   { id: "home", get label() { return t("首页"); }, icon: House },
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
@@ -4246,7 +4246,7 @@ export function App() {
         void checkUpdate(true);
       }
       await refreshOverview(true);
-      // 启动落在首页，首页就是赞助商推荐，所以启动就拉一次。
+      // 供应商页的提示依赖赞助商数据，启动时先刷新一次。
       await refreshAds(true);
       if (!handledNavigation) await refreshSettings(true);
       await refreshRelay(true);
@@ -5302,8 +5302,6 @@ export function App() {
           {route === "pluginMarket" ? <PluginMarketScreen /> : null}
           {route === "home" ? (
             <HomeScreen
-              ads={ads}
-              actions={actions}
               tools={shownTools}
               focus={agentFocus}
               codexRunning={codexAppRunning}
@@ -11057,13 +11055,8 @@ function SessionsScreen({
   );
 }
 
-/// 首页：整个程序的落脚页。上面是各 Agent 与网关的状态，中间是精选推荐和其他赞助商，最下面是常用入口。
-///
-/// 推荐：置顶位全部做大卡片，排成一行均分宽度；推荐池里的赞助商全部列出，两列小卡片，紧跟在精选下面。
-/// 置顶位和推荐池里同一家常有两个 id、同一个落地页，按 adIdentity 去重。只展示赞助商，普通推荐不显示。
+/// 首页：整个程序的落脚页，展示各 Agent 与网关状态及常用入口。
 function HomeScreen({
-  ads,
-  actions,
   tools,
   focus,
   codexRunning,
@@ -11072,8 +11065,6 @@ function HomeScreen({
   onNavigate,
   onOpenAgent,
 }: {
-  ads: AdsResult | null;
-  actions: Actions;
   tools: ToolEntry[];
   focus: AgentFocus;
   codexRunning: boolean;
@@ -11086,14 +11077,6 @@ function HomeScreen({
   const usage = useTodayUsage();
   const enhanceOnly = providersHidden(focus);
   const connected = new Set((gateway?.agents ?? []).filter((agent) => agent.enabled).map((agent) => agent.agent as string));
-
-  const topAds = featuredAds(ads);
-  const topIdentities = new Set(topAds.map(adIdentity));
-  const pool = (ads?.ads ?? []).filter((ad) => !isExpiredAd(ad) && !topIdentities.has(adIdentity(ad)));
-  // 大横幅只放置顶位（top_ad / topAds），没有置顶位就不显示；推荐池里的赞助商只进下面的列表。
-  const heroes = topAds;
-  const rest = pool.filter((ad) => ad.type === "sponsor");
-  const open = (ad: AdItem) => void actions.openExternalUrl(ad.url);
 
   const shortcuts: Array<{ route: Route; label: string; detail: string; icon: LucideIcon }> = [
     { route: "userScripts", label: t("万物皆拓展"), detail: t("给 Codex、Claude 加功能的脚本"), icon: Blocks },
@@ -11151,12 +11134,14 @@ function HomeScreen({
 
   return (
     <div className="tp-page home-page">
+      {/* 首页刷新推荐按钮暂时下线。
       <TopbarActions>
         <button className="cx-secondary" onClick={() => void actions.refreshAds()} type="button">
           <RefreshCw />
           {t("刷新推荐")}
         </button>
       </TopbarActions>
+      */}
 
       <CxSection title={t("状态")}>
         <CxCard>
@@ -11174,6 +11159,7 @@ function HomeScreen({
         </CxCard>
       </CxSection>
 
+      {/* 首页精选推荐和更多赞助商区域暂时下线。
       {heroes.length ? (
         <CxSection aside={<span>{t("赞助商推荐：支持 Codex++ 的服务")}</span>} title={t("精选推荐")}>
           <div className="home-heroes" data-dense={heroes.length >= 3 || undefined} style={{ gridTemplateColumns: `repeat(${heroes.length}, minmax(0, 1fr))` }}>
@@ -11236,6 +11222,7 @@ function HomeScreen({
           </div>
         </CxSection>
       ) : null}
+      */}
 
       <CxSection title={t("常用")}>
         <div className="home-shortcuts">
