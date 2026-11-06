@@ -150,9 +150,9 @@ jobs:
           if-no-files-found: error
 
   macos-dmg:
-    # PR 构建也出通用包，跟发版产物保持一致，避免只在发版时才暴露问题。
+    # PR 构建只出 Apple Silicon 包，跟发版产物保持一致。
     # 没有签名密钥，所以这里走 ad-hoc（脚本的默认行为）。
-    name: macOS DMG (universal)
+    name: macOS DMG (Apple Silicon)
     # macos-14 镜像 2026-11-02 退役，期间还有计划性停机（任务分配 runner 前就被取消）。
     runs-on: macos-15
     env:
@@ -170,7 +170,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -193,7 +193,7 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      - name: Build universal macOS DMG
+      - name: Build Apple Silicon macOS DMG
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION#V}"
@@ -202,7 +202,7 @@ jobs:
             VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
           fi
           # 未设置 MACOS_SIGNING_IDENTITY，脚本自动退回 ad-hoc 签名。
-          bash scripts/installer/macos/build-universal.sh "$VERSION"
+          bash scripts/installer/macos/build-apple-silicon.sh "$VERSION"
 
       - name: Verify macOS bundle structure
         run: |
@@ -216,7 +216,10 @@ jobs:
           for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
-            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            binary="$app/Contents/MacOS/$executable"
+            test -x "$binary"
+            test "$(lipo -archs "$binary")" = "arm64"
             if [[ "$app" == *"管理工具.app" ]]; then
               test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
               test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
@@ -233,7 +236,7 @@ jobs:
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
         with:
-          name: codex-plus-plus-macos-universal-dmg
+          name: codex-plus-plus-macos-arm64-dmg
           path: dist/macos/*.dmg
           if-no-files-found: error
 

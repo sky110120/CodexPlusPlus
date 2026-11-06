@@ -198,9 +198,8 @@ jobs:
   macos-dmg:
     needs: prepare
     if: github.event_name == 'push' || inputs.platform != 'windows'
-    # 单个通用包（universal）同时支持 Intel 与 Apple Silicon，
-    # 用户不必再自己判断架构，Release 也只多一个而不是两个产物。
-    name: macOS DMG (universal)
+    # 仅构建 Apple Silicon（arm64）产物。
+    name: macOS DMG (Apple Silicon)
     # macos-14 镜像 2026-11-02 退役，期间还有计划性停机（任务分配 runner 前就被取消）。
     runs-on: macos-15
     env:
@@ -274,8 +273,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # 通用包需要两个架构的 std，构建脚本会各编一遍再 lipo 合并。
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -285,7 +283,7 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      - name: Build universal macOS DMG
+      - name: Build Apple Silicon macOS DMG
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           MACOS_NOTARY_PROFILE: codexplusplus-notary
@@ -298,8 +296,7 @@ jobs:
           fi
           VERSION="${RELEASE_TAG#v}"
           VERSION="${VERSION#V}"
-          # 构建脚本自己编两个架构、lipo 合并、再调 package-dmg.sh 打包。
-          bash scripts/installer/macos/build-universal.sh "$VERSION"
+          bash scripts/installer/macos/build-apple-silicon.sh "$VERSION"
 
       - name: Verify macOS bundle structure
         env:
@@ -315,7 +312,10 @@ jobs:
           for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
-            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            binary="$app/Contents/MacOS/$executable"
+            test -x "$binary"
+            test "$(lipo -archs "$binary")" = "arm64"
             if [[ "$app" == *"管理工具.app" ]]; then
               test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
               test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
@@ -392,7 +392,7 @@ jobs:
           const required = [
             "CodexPlusPlus-" + version + "-windows-x64-setup.exe",
             "CodexPlusPlus-" + version + "-windows-x64.zip",
-            "CodexPlusPlus-" + version + "-macos-universal.dmg"
+            "CodexPlusPlus-" + version + "-macos-arm64.dmg"
           ];
           for (const name of required) {
             if (!(release.assets || []).some((asset) => asset.name === name && asset.size > 0)) {
