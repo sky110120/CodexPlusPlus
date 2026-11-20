@@ -7380,14 +7380,15 @@
 
   async function setBackendSetting(key, value) {
     const fastPreference = key === "codexAppNativeFastUnlock";
-    if (fastPreference && codexPlusFastPreferenceWrite.pending) return;
+    const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
+    if (fastPreference && (!fastWrite || fastWrite.pending)) return;
     const seq = fastPreference ? codexPlusBackendSettingsSeq : ++codexPlusBackendSettingsSeq;
-    const fastRevision = codexPlusFastPreferenceWrite.revision;
-    const fastWasPending = codexPlusFastPreferenceWrite.pending;
+    const fastRevision = fastWrite?.revision;
+    const fastWasPending = fastWrite?.pending;
     const previous = typeof codexPlusBackendSettingsSnapshot === "function" ? codexPlusBackendSettingsSnapshot() : null;
     if (fastPreference) {
-      codexPlusFastPreferenceWrite.pending = true;
-      codexPlusFastPreferenceWrite.revision += 1;
+      fastWrite.pending = true;
+      fastWrite.revision += 1;
     } else {
       codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
       codexPlusBackendSettingsLoaded = true;
@@ -7409,7 +7410,7 @@
       if (fastPreference) {
         // 并发保存时保留上次已核实的供应商状态，交给下一次心跳重新读取。
         const current = seq === codexPlusBackendSettingsSeq;
-        if (!current) codexPlusFastPreferenceWrite.needsRefresh = true;
+        if (!current) fastWrite.needsRefresh = true;
         codexPlusBackendSettings = {
           ...codexPlusBackendSettings,
           [key]: value,
@@ -7426,7 +7427,7 @@
           nativeFastProviderCompatible,
           ...otherSettings
         } = settings ?? {};
-        if (!fastWasPending && fastRevision === codexPlusFastPreferenceWrite.revision) {
+        if (!fastWasPending && fastRevision === fastWrite?.revision) {
           otherSettings.nativeFastLocalApiConfigured = nativeFastLocalApiConfigured === true;
           otherSettings.nativeFastProviderCompatible = nativeFastProviderCompatible === true;
         }
@@ -7448,7 +7449,7 @@
         emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
       }
     } finally {
-      if (fastPreference) codexPlusFastPreferenceWrite.pending = false;
+      if (fastPreference) fastWrite.pending = false;
       refreshCodexPlusBackendToggles();
     }
   }
