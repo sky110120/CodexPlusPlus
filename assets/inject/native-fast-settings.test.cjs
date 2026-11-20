@@ -173,6 +173,7 @@ function runFastPreferenceControlTests() {
   vm.runInContext([
     extract("92-extension-host.js", "codexPlusComposerFastPreferenceEnabled"),
     extract("40-backend-settings.js", "syncCodexPlusFastPreferenceControls"),
+    extract("40-backend-settings.js", "renderCodexPlusSettingsCatalogInput"),
     extract("40-backend-settings.js", "renderCodexPlusSettingsCatalogRow"),
   ].join("\n"), context);
   const markup = (key) => context.renderCodexPlusSettingsCatalogRow({
