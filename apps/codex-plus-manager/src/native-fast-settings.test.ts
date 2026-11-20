@@ -59,7 +59,8 @@ test("backend loads and saves publish only native Fast policy flags and tolerate
   };
   for (const surface of ["absent-window", "absent-helper", "helper"]) {
     const publications: Array<Record<string, boolean>> = [];
-    let response = { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true, privateField: "fixture-only" };
+    let response = { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true,
+      nativeFastProviderCompatible: true, privateField: "fixture-only" };
     const window = {
       __CODEX_PLUS_TEST_SERVICE_TIER__: true,
       ...(surface === "helper" ? { __codexPlusNativeFastUnlock: { runtime: { update: (value: Record<string, boolean>) => publications.push({ ...value }) } } } : {}),
@@ -80,12 +81,13 @@ test("backend loads and saves publish only native Fast policy flags and tolerate
     assert.equal(await context.loadBackendSettingsState(), true);
     if (surface === "absent-window") delete context.window;
     await context.setBackendSetting("codexAppNativeFastUnlock", true);
-    response = { ...response, enhancementsEnabled: false, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: false };
+    response = { ...response, enhancementsEnabled: false, codexAppNativeFastUnlock: false,
+      nativeFastLocalApiConfigured: false, nativeFastProviderCompatible: false };
     await context.setBackendSetting("codexAppNativeFastUnlock", false);
     assert.deepEqual(publications, surface === "helper" ? [
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: true },
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: true },
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: false },
     ] : []);
   }
 });

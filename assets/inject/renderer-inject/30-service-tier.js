@@ -1621,6 +1621,7 @@
     const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
     const fastRevision = fastWrite?.revision;
     const fastWasPending = fastWrite?.pending;
+    let staleFastSnapshot = false;
     try {
       let settings = await (timeoutMs > 0
         ? readCodexAppServerPreparation("/settings/get", {}, timeoutMs)
@@ -1631,13 +1632,20 @@
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
       }
-      if (fastWasPending || fastRevision !== fastWrite?.revision) {
-        // 交叠的读取可能落在写入之前，不能覆盖 Fast 写入确认。
-        const { codexAppNativeFastUnlock: _staleFastPreference, ...otherSettings } = settings;
+      staleFastSnapshot = fastWasPending || fastRevision !== fastWrite?.revision;
+      if (staleFastSnapshot) {
+        // 交叠的读取不能覆盖 Fast 开关和同一快照里的供应商判定。
+        const {
+          codexAppNativeFastUnlock: _staleFastPreference,
+          nativeFastLocalApiConfigured: _staleFastLocalApi,
+          nativeFastProviderCompatible: _staleFastProvider,
+          ...otherSettings
+        } = settings;
         settings = otherSettings;
       }
       const previousSettings = codexPlusBackendSettings;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+      if (fastWrite && !staleFastSnapshot) fastWrite.needsRefresh = false;
       codexPlusBackendSettingsLoaded = true;
       if (typeof initializeCodexGatewayBaseline === "function") {
         void initializeCodexGatewayBaseline(codexGatewayRecoveryEnabled());
@@ -1646,9 +1654,9 @@
         refreshCodexModelCatalogForSettings(previousSettings, codexPlusBackendSettings);
       }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        // 清退旧页面中的补丁；真实设置现在只控制本机默认速度入口。
-        codexAppNativeFastUnlock: false,
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
+        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
+          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
       // 原生输入预测只接收自己的开关和本机 API 布尔投影。
@@ -1681,5 +1689,5 @@
         errorMessage: String(error?.message || error),
       }));
     }
-    return true;
+    return !staleFastSnapshot;
   }

@@ -1114,7 +1114,10 @@ where
             timeline.mark("ensure_injection_done", 95);
             if injection_ready {
                 keep_launched_on_error = false;
-                if settings.codex_app_native_predictions
+                if crate::native_predictions::native_modules_requested_in_home(
+                    &settings,
+                    &hooks.codex_home_dir(),
+                )
                     && let Err(error) = hooks.apply_native_module_patches_on_launch(debug_port).await
                 {
                     let _ = crate::diagnostic_log::append_diagnostic_log(

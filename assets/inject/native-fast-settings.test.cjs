@@ -14,6 +14,7 @@ async function runNativeFastSettingsTests() {
     enhancementsEnabled: true,
     codexAppNativeFastUnlock: true,
     nativeFastLocalApiConfigured: true,
+    nativeFastProviderCompatible: true,
     relayProfiles: [{ configContents: "private backend fixture" }],
   };
   const context = vm.createContext({
@@ -34,9 +35,9 @@ async function runNativeFastSettingsTests() {
   ].join("\n"), context);
 
   assert.equal(await context.loadBackendSettingsState(), true);
-  assert.equal(runtime.allow("local", null), false, "首次加载仍关闭旧 Fast 补丁");
+  assert.equal(runtime.allow("local", null), true, "本机自定义供应商开启原生 Fast");
   assert.equal(context.codexPlusBackendSettings.codexAppNativeFastUnlock, true, "入口使用真实后端设置");
-  assert.equal(context.window.__codexPlusSettings.codexAppNativeFastUnlock, false);
+  assert.equal(context.window.__codexPlusSettings.codexAppNativeFastUnlock, true);
   assert.equal(context.window.__codexPlusSettings.nativeFastLocalApiConfigured, true);
   assert.deepEqual(Object.keys(context.window.__codexPlusSettings).sort(), [
     "codexAppNativeFastUnlock", "enhancementsEnabled", "nativeFastLocalApiConfigured",
@@ -62,14 +63,22 @@ async function runNativeFastSettingsTests() {
   assert.equal(predictions.relax("local"), true);
 
   response.nativeFastLocalApiConfigured = false;
+  response.nativeFastProviderCompatible = true;
   assert.equal(await context.loadBackendSettingsState(), true);
-  assert.equal(runtime.allow("local", null), false, "心跳也保持旧补丁关闭");
+  assert.equal(runtime.allow("local", null), false, "要求原生登录时不放行未识别的账号");
+  assert.equal(runtime.allow("local", "apiKey"), true, "第三方 Bearer 档案支持本机 API key 身份");
+  assert.equal(runtime.allow("remote", "apiKey"), false);
+  response.nativeFastProviderCompatible = false;
+  assert.equal(await context.loadBackendSettingsState(), true);
+  assert.equal(runtime.allow("local", null), false, "切离本机自定义供应商后恢复原生门控");
+  assert.equal(runtime.allow("local", "apiKey"), false);
   assert.equal(context.window.__codexPlusSettings.nativeFastLocalApiConfigured, false);
 
   response.nativeFastLocalApiConfigured = true;
+  response.nativeFastProviderCompatible = true;
   await context.setBackendSetting("codexAppNativeFastUnlock", true);
   assert.equal(context.codexPlusBackendSettings.codexAppNativeFastUnlock, true);
-  assert.equal(runtime.allow("local", null), false, "保存入口开关不重新开启旧补丁");
+  assert.equal(runtime.allow("local", null), true, "保存时使用后端确认的本机供应商状态");
   await context.setBackendSetting("codexAppNativeFastUnlock", false);
   assert.equal(context.codexPlusBackendSettings.codexAppNativeFastUnlock, false);
   assert.equal(runtime.allow("local", null), false);
@@ -84,7 +93,10 @@ async function runFastPreferenceWriteTests() {
   const requests = [];
   const events = [];
   const notices = [];
-  const settings = { enhancementsEnabled: true, codexAppNativeFastUnlock: false, codexAppNativePredictions: false };
+  const settings = {
+    enhancementsEnabled: true, codexAppNativeFastUnlock: false, codexAppNativePredictions: false,
+    nativeFastLocalApiConfigured: true, nativeFastProviderCompatible: true,
+  };
   const context = vm.createContext({
     window: { __CODEX_PLUS_TEST_SERVICE_TIER__: true },
     codexPlusBackendSettings: settings,
@@ -127,7 +139,7 @@ async function runFastPreferenceWriteTests() {
   const enable = setFast(true);
   await setFast(true);
   assert.equal(requests.length, 1, "同键保存尚未完成时不再发第二个请求");
-  requests.shift().resolve({ codexAppNativeFastUnlock: true });
+  requests.shift().resolve({ ...settings, codexAppNativeFastUnlock: true });
   await enable;
   assert.equal(getFast(), true);
   assert.deepEqual(events, [["codexAppNativeFastUnlock", true, true]]);
@@ -135,10 +147,10 @@ async function runFastPreferenceWriteTests() {
   await staleRead;
   assert.equal(getFast(), true, "发起于保存之前的读取不能覆盖 Fast 确认");
 
-  const other = context.setBackendSetting("codexAppNativePredictions", true);
-  const otherRequest = requests.shift();
   const disable = setFast(false);
   const fastRequest = requests.shift();
+  const other = context.setBackendSetting("codexAppNativePredictions", true);
+  const otherRequest = requests.shift();
   const pendingRead = context.loadBackendSettingsState();
   requests.shift().resolve({ enhancementsEnabled: true, codexAppNativeFastUnlock: false });
   await pendingRead;
@@ -147,10 +159,20 @@ async function runFastPreferenceWriteTests() {
   await disable;
   assert.equal(getFast(), false);
   assert.equal(context.codexPlusBackendSettings.codexAppNativePredictions, true, "Fast 确认只更新 Fast 字段");
+  assert.equal(context.codexPlusBackendSettings.nativeFastProviderCompatible, true, "并发写入不清空已确认的供应商状态");
+  assert.equal(context.codexPlusBackendSettings.nativeFastLocalApiConfigured, true);
+  assert.equal(context.codexPlusFastPreferenceWrite.needsRefresh, true);
   otherRequest.resolve({ ...settings, codexAppNativeFastUnlock: true, codexAppNativePredictions: true });
   await other;
   assert.equal(getFast(), false, "其它保存的陈旧 Fast 字段不能重新开启按钮");
   assert.equal(context.codexPlusBackendSettings.codexAppNativePredictions, true);
+
+  const freshRead = context.loadBackendSettingsState();
+  requests.shift().resolve({ ...settings, nativeFastLocalApiConfigured: false, nativeFastProviderCompatible: false });
+  assert.equal(await freshRead, true);
+  assert.equal(context.codexPlusFastPreferenceWrite.needsRefresh, false);
+  assert.equal(context.codexPlusBackendSettings.nativeFastProviderCompatible, false);
+  assert.equal(context.codexPlusBackendSettings.nativeFastLocalApiConfigured, false);
 }
 
 function runFastPreferenceControlTests() {

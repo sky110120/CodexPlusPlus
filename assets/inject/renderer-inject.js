@@ -6432,6 +6432,7 @@
     const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
     const fastRevision = fastWrite?.revision;
     const fastWasPending = fastWrite?.pending;
+    let staleFastSnapshot = false;
     try {
       let settings = await (timeoutMs > 0
         ? readCodexAppServerPreparation("/settings/get", {}, timeoutMs)
@@ -6442,13 +6443,20 @@
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
       }
-      if (fastWasPending || fastRevision !== fastWrite?.revision) {
-        // 交叠的读取可能落在写入之前，不能覆盖 Fast 写入确认。
-        const { codexAppNativeFastUnlock: _staleFastPreference, ...otherSettings } = settings;
+      staleFastSnapshot = fastWasPending || fastRevision !== fastWrite?.revision;
+      if (staleFastSnapshot) {
+        // 交叠的读取不能覆盖 Fast 开关和同一快照里的供应商判定。
+        const {
+          codexAppNativeFastUnlock: _staleFastPreference,
+          nativeFastLocalApiConfigured: _staleFastLocalApi,
+          nativeFastProviderCompatible: _staleFastProvider,
+          ...otherSettings
+        } = settings;
         settings = otherSettings;
       }
       const previousSettings = codexPlusBackendSettings;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+      if (fastWrite && !staleFastSnapshot) fastWrite.needsRefresh = false;
       codexPlusBackendSettingsLoaded = true;
       if (typeof initializeCodexGatewayBaseline === "function") {
         void initializeCodexGatewayBaseline(codexGatewayRecoveryEnabled());
@@ -6457,9 +6465,9 @@
         refreshCodexModelCatalogForSettings(previousSettings, codexPlusBackendSettings);
       }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        // 清退旧页面中的补丁；真实设置现在只控制本机默认速度入口。
-        codexAppNativeFastUnlock: false,
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
+        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
+          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
       // 原生输入预测只接收自己的开关和本机 API 布尔投影。
@@ -6492,7 +6500,7 @@
         errorMessage: String(error?.message || error),
       }));
     }
-    return true;
+    return !staleFastSnapshot;
   }
   // 原生准备会话时会读取本地配置；该 fetch 没有默认超时，丢失响应会同时
   // 挂住恢复和发送队列。只约束这一个只读接口，不接管原生恢复/提交生命周期。
@@ -7368,12 +7376,14 @@
     }
   }
 
-  const codexPlusFastPreferenceWrite = { pending: false, revision: 0 };
+  const codexPlusFastPreferenceWrite = { pending: false, revision: 0, needsRefresh: false };
 
   async function setBackendSetting(key, value) {
     const fastPreference = key === "codexAppNativeFastUnlock";
     if (fastPreference && codexPlusFastPreferenceWrite.pending) return;
     const seq = fastPreference ? codexPlusBackendSettingsSeq : ++codexPlusBackendSettingsSeq;
+    const fastRevision = codexPlusFastPreferenceWrite.revision;
+    const fastWasPending = codexPlusFastPreferenceWrite.pending;
     const previous = typeof codexPlusBackendSettingsSnapshot === "function" ? codexPlusBackendSettingsSnapshot() : null;
     if (fastPreference) {
       codexPlusFastPreferenceWrite.pending = true;
@@ -7397,16 +7407,35 @@
         return;
       }
       if (fastPreference) {
-        // 确认只合入 Fast 字段，避免覆盖同时保存的其他设置。
-        codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
+        // 并发保存时保留上次已核实的供应商状态，交给下一次心跳重新读取。
+        const current = seq === codexPlusBackendSettingsSeq;
+        if (!current) codexPlusFastPreferenceWrite.needsRefresh = true;
+        codexPlusBackendSettings = {
+          ...codexPlusBackendSettings,
+          [key]: value,
+          ...(current ? {
+            nativeFastLocalApiConfigured: settings?.nativeFastLocalApiConfigured === true,
+            nativeFastProviderCompatible: settings?.nativeFastProviderCompatible === true,
+          } : {}),
+        };
       } else {
         if (seq !== codexPlusBackendSettingsSeq) return;
-        const { codexAppNativeFastUnlock: _fastPreference, ...otherSettings } = settings ?? {};
+        const {
+          codexAppNativeFastUnlock: _fastPreference,
+          nativeFastLocalApiConfigured,
+          nativeFastProviderCompatible,
+          ...otherSettings
+        } = settings ?? {};
+        if (!fastWasPending && fastRevision === codexPlusFastPreferenceWrite.revision) {
+          otherSettings.nativeFastLocalApiConfigured = nativeFastLocalApiConfigured === true;
+          otherSettings.nativeFastProviderCompatible = nativeFastProviderCompatible === true;
+        }
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...otherSettings };
       }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        codexAppNativeFastUnlock: false,
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
+        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
+          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
       globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
@@ -7588,6 +7617,7 @@
         const weixinRevision = nextStatus.weixinDesktopSyncRevision ?? null;
         const settingsStale = !revision
           || !codexPlusBackendSettingsLoaded
+          || codexPlusFastPreferenceWrite.needsRefresh
           || revision !== codexPlusBackendSettingsRevision
           || weixinRevision !== codexPlusWeixinSyncRevision;
         if (settingsStale) {

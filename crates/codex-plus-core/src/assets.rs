@@ -731,7 +731,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
             format!(
                 "{}\nwindow.__codexPlusNativeFastUnlock.runtime.update({});\n{}\nwindow.__codexPlusNativePredictions.runtime.update({});",
                 native_fast_unlock_script(),
-                json!(crate::native_fast::legacy_runtime_settings(settings)),
+                json!(crate::native_fast::runtime_settings(settings)),
                 native_predictions_script(),
                 json!(crate::native_predictions::runtime_settings(settings)),
             ),

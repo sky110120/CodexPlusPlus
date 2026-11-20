@@ -142,12 +142,14 @@
     }
   }
 
-  const codexPlusFastPreferenceWrite = { pending: false, revision: 0 };
+  const codexPlusFastPreferenceWrite = { pending: false, revision: 0, needsRefresh: false };
 
   async function setBackendSetting(key, value) {
     const fastPreference = key === "codexAppNativeFastUnlock";
     if (fastPreference && codexPlusFastPreferenceWrite.pending) return;
     const seq = fastPreference ? codexPlusBackendSettingsSeq : ++codexPlusBackendSettingsSeq;
+    const fastRevision = codexPlusFastPreferenceWrite.revision;
+    const fastWasPending = codexPlusFastPreferenceWrite.pending;
     const previous = typeof codexPlusBackendSettingsSnapshot === "function" ? codexPlusBackendSettingsSnapshot() : null;
     if (fastPreference) {
       codexPlusFastPreferenceWrite.pending = true;
@@ -171,16 +173,35 @@
         return;
       }
       if (fastPreference) {
-        // 确认只合入 Fast 字段，避免覆盖同时保存的其他设置。
-        codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
+        // 并发保存时保留上次已核实的供应商状态，交给下一次心跳重新读取。
+        const current = seq === codexPlusBackendSettingsSeq;
+        if (!current) codexPlusFastPreferenceWrite.needsRefresh = true;
+        codexPlusBackendSettings = {
+          ...codexPlusBackendSettings,
+          [key]: value,
+          ...(current ? {
+            nativeFastLocalApiConfigured: settings?.nativeFastLocalApiConfigured === true,
+            nativeFastProviderCompatible: settings?.nativeFastProviderCompatible === true,
+          } : {}),
+        };
       } else {
         if (seq !== codexPlusBackendSettingsSeq) return;
-        const { codexAppNativeFastUnlock: _fastPreference, ...otherSettings } = settings ?? {};
+        const {
+          codexAppNativeFastUnlock: _fastPreference,
+          nativeFastLocalApiConfigured,
+          nativeFastProviderCompatible,
+          ...otherSettings
+        } = settings ?? {};
+        if (!fastWasPending && fastRevision === codexPlusFastPreferenceWrite.revision) {
+          otherSettings.nativeFastLocalApiConfigured = nativeFastLocalApiConfigured === true;
+          otherSettings.nativeFastProviderCompatible = nativeFastProviderCompatible === true;
+        }
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...otherSettings };
       }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        codexAppNativeFastUnlock: false,
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
+        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
+          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
       globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
@@ -362,6 +383,7 @@
         const weixinRevision = nextStatus.weixinDesktopSyncRevision ?? null;
         const settingsStale = !revision
           || !codexPlusBackendSettingsLoaded
+          || codexPlusFastPreferenceWrite.needsRefresh
           || revision !== codexPlusBackendSettingsRevision
           || weixinRevision !== codexPlusWeixinSyncRevision;
         if (settingsStale) {
