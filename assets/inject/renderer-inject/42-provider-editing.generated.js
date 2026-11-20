@@ -1783,7 +1783,7 @@ ${key} = ${value}`]);
       id: "zhipu-glm",
       name: "Zhipu GLM",
       websiteUrl: "https://open.bigmodel.cn",
-      apiKeyUrl: "https://www.bigmodel.cn/claude-code?ic=RRVJPB5SII",
+      apiKeyUrl: "https://www.bigmodel.cn/claude-code",
       category: "cn_official",
       baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
       protocol: "chatCompletions",
@@ -1895,12 +1895,12 @@ ${key} = ${value}`]);
       modelList: ["LongCat-Flash-Chat"],
       websiteUrl: "https://longcat.chat/platform"
     },
-    // ── 聚合/中转（赞助商不在这里，见 sponsorPresets）──
+    // ── 聚合/中转 ──
     {
       id: "siliconflow",
       name: "SiliconFlow",
       websiteUrl: "https://siliconflow.cn",
-      apiKeyUrl: "https://cloud.siliconflow.cn/i/drGuwc9k",
+      apiKeyUrl: "https://cloud.siliconflow.cn/",
       category: "aggregator",
       baseUrl: "https://api.siliconflow.cn/v1",
       protocol: "chatCompletions",
@@ -2766,13 +2766,11 @@ ${key} = ${value}`]);
       apiKeyUrl: preset.apiKeyUrl
     };
   }
-  function gatewayPresets(sponsors = []) {
-    const sponsorIds = new Set(sponsors.map((preset) => preset.id));
-    const shared = PRESETS.filter((preset) => !sponsorIds.has(preset.id)).map((preset) => toGatewayPreset(preset, preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay"));
+  function gatewayPresets() {
+    const shared = PRESETS.map((preset) => toGatewayPreset(preset, preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay"));
     const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
     const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
     return [
-      ...sponsors.map((preset) => toGatewayPreset(preset, "sponsor")),
       ...vendors,
       ...relays,
       ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")

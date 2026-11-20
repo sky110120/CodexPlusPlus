@@ -67,7 +67,7 @@
   /**
    * 在 Codex 页面里改了一项设置后发公开事件 `settings/changed`，参数 `{ key, value, persisted }`：
    * key 是改动的设置字段（存在 Codex++ 后端的用后端字段名，如 codexAppCapacityAutoRetry；只存页面本地的用页面键名）；
-   * 先按新值发一次 persisted: false（这时读设置已是新值），写进后端后再发一次 persisted: true。
+   * 乐观更新先发 persisted: false，写进后端后再发 persisted: true；Fast 入口只发已确认的值。
    * 跟着设置走的内置拓展订阅它，内核不再逐个点名功能。
    */
   function emitCodexPlusSettingsChanged(key, value, persisted) {
@@ -112,6 +112,8 @@
       // 记下读之前的设置：loadBackendSettingsState 换成新对象，旧引用里还是上一次的值。
       // 下面的 typeof 守卫：本段会被切片到只给了少量依赖的沙箱里测。
       const previous = codexPlusBackendSettingsSnapshot();
+      const fastPreferenceWasEnabled = typeof codexPlusComposerFastPreferenceEnabled === "function"
+        && codexPlusComposerFastPreferenceEnabled();
       const loaded = await loadBackendSettingsState();
       if (loaded) {
         syncOfficialUsagePolicy();
@@ -128,6 +130,11 @@
         // 管理器里改的设置：设置页开着时，开关与随总开关切换的说明也跟着变。
         syncCodexPlusBackendToggleButtons();
         renderCodexPlusMenu();
+        if (typeof refreshCodexPlusComposerActions === "function"
+            && typeof codexPlusComposerFastPreferenceEnabled === "function"
+            && fastPreferenceWasEnabled !== codexPlusComposerFastPreferenceEnabled()) {
+          refreshCodexPlusComposerActions();
+        }
       }
       return loaded;
     } finally {
@@ -135,31 +142,58 @@
     }
   }
 
+  const codexPlusFastPreferenceWrite = { pending: false, revision: 0 };
+
   async function setBackendSetting(key, value) {
-    const seq = ++codexPlusBackendSettingsSeq;
+    const fastPreference = key === "codexAppNativeFastUnlock";
+    if (fastPreference && codexPlusFastPreferenceWrite.pending) return;
+    const seq = fastPreference ? codexPlusBackendSettingsSeq : ++codexPlusBackendSettingsSeq;
     const previous = typeof codexPlusBackendSettingsSnapshot === "function" ? codexPlusBackendSettingsSnapshot() : null;
-    codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
-    codexPlusBackendSettingsLoaded = true;
-    if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, false);
-    refreshCodexPlusBackendToggles();
+    if (fastPreference) {
+      codexPlusFastPreferenceWrite.pending = true;
+      codexPlusFastPreferenceWrite.revision += 1;
+    } else {
+      codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
+      codexPlusBackendSettingsLoaded = true;
+      if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, false);
+      refreshCodexPlusBackendToggles();
+    }
     try {
-      const settings = await postJson("/settings/set", { [key]: value });
-      if (seq === codexPlusBackendSettingsSeq) {
-        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
-        globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-          codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
-          nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
-        });
-        globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
-          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-          codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
-          nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
-        });
-        if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, true);
-        if (previous && typeof emitCodexPlusRelaySettingsEvents === "function") emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
+      let settings;
+      try {
+        settings = await postJson("/settings/set", { [key]: value });
+        if (fastPreference && (settings?.status === "failed" || typeof settings?.[key] !== "boolean" || settings[key] !== value)) {
+          throw new Error("Fast preference not confirmed");
+        }
+      } catch (error) {
+        if (!fastPreference) throw error;
+        if (typeof showToast === "function") showToast("未能确认 Fast 按钮设置，请重试。", { type: "warn" });
+        return;
+      }
+      if (fastPreference) {
+        // 确认只合入 Fast 字段，避免覆盖同时保存的其他设置。
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
+      } else {
+        if (seq !== codexPlusBackendSettingsSeq) return;
+        const { codexAppNativeFastUnlock: _fastPreference, ...otherSettings } = settings ?? {};
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...otherSettings };
+      }
+      globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+        codexAppNativeFastUnlock: false,
+        nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
+      });
+      globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+        codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+        nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
+      });
+      if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, true);
+      if (!fastPreference && previous && typeof emitCodexPlusRelaySettingsEvents === "function") {
+        emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
       }
     } finally {
+      if (fastPreference) codexPlusFastPreferenceWrite.pending = false;
       refreshCodexPlusBackendToggles();
     }
   }
@@ -177,6 +211,28 @@
       button.setAttribute("aria-checked", enabled);
     });
     syncCodexPlusSettingsCatalogDescriptions();
+    syncCodexPlusFastPreferenceControls();
+  }
+
+  function syncCodexPlusFastPreferenceControls() {
+    if (typeof codexPlusComposerFastPreferenceEnabled !== "function"
+        || codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    const enabled = codexPlusComposerFastPreferenceEnabled();
+    document.querySelectorAll("[data-codex-plus-fast-preference-control]").forEach((node) => {
+      if (node.hidden === enabled) node.hidden = !enabled;
+      if (!enabled) return;
+      const button = node.querySelector("[data-codex-plus-fast-preference-settings]");
+      if (!button || button.__codexPlusGeneration === codexPlusBackendGeneration) return;
+      button.__codexPlusGeneration = codexPlusBackendGeneration;
+      // 设置页可能在重注入前就已打开，在按钮上更新当前代处理器。
+      button.onclick = (event) => {
+        event.preventDefault();
+        if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration
+            && codexPlusComposerFastPreferenceEnabled()
+            && typeof openCodexPlusFastPreference === "function") openCodexPlusFastPreference(button);
+      };
+    });
+    if (!enabled && typeof closeCodexPlusFastPreference === "function") closeCodexPlusFastPreference();
   }
 
   /** 刷新设置页的开关与菜单。跟着设置走的功能由内置拓展订阅 settings/loaded、settings/changed 自己对齐，这里不点名。 */
@@ -782,7 +838,6 @@
     const main = document.createElement("div");
     main.className = "codex-plus-page-main";
     // 「拓展」的左面板是脚本列表；设置页的左面板是分组导航（和 Codex 自己的设置页一样，右边一次只看一组）。
-    // 推荐内容是单栏内容页，没有左面板。
     if (tab === codexPlusExtensionsTab) {
       const nav = document.createElement("div");
       nav.className = "codex-plus-page-nav";
@@ -814,7 +869,6 @@
   /** 页面标题：每个 rail 入口一个名字，和图标栏上的标签保持一致。 */
   function codexPlusPageTitle(tab) {
     if (tab === codexPlusExtensionsTab) return "拓展";
-    if (tab === codexPlusSponsorTab) return "推荐内容";
     return "Codex++";
   }
 
@@ -1141,131 +1195,6 @@
     });
   }
 
-  const codexPlusAdsUrl = "/ads";
-  let codexPlusAds = [];
-  let codexPlusAdsLoaded = false;
-
-  function isCodexPlusAdExpired(ad) {
-    if (!ad.expires_at) return false;
-    const expiresAt = Date.parse(ad.expires_at);
-    return Number.isFinite(expiresAt) && expiresAt < Date.now();
-  }
-
-  /**
-   * 广告落地页只认 http(s)。
-   *
-   * 清单来自远程，`javascript:` 之类的 scheme 一旦写进 `<a href>`，点击就会在
-   * Codex 渲染进程里执行脚本；`escapeHtml` 只挡得住标签，挡不住 scheme。
-   */
-  function isCodexPlusAdWebUrl(value) {
-    return /^https?:\/\/[^\s/]/i.test(String(value || "").trim());
-  }
-
-  function normalizeCodexPlusAds(payload) {
-    if (!payload || !Array.isArray(payload.ads)) return [];
-    // 只留赞助商推荐。上游清单里的 normal 条目不属于合作伙伴分组，
-    // 放进来只会让「有数据但渲染不出东西」的状态变得难以判断。
-    return payload.ads.filter((ad) => {
-      return ad && ad.type === "sponsor" && ad.title && ad.description && isCodexPlusAdWebUrl(ad.url) && !isCodexPlusAdExpired(ad);
-    }).map((ad) => ({
-      id: String(ad.id || ad.title),
-      type: ad.type,
-      title: String(ad.title),
-      description: String(ad.description),
-      url: String(ad.url),
-      image: ad.image ? String(ad.image) : "",
-      expires_at: ad.expires_at ? String(ad.expires_at) : "",
-      highlights: Array.isArray(ad.highlights) ? ad.highlights.map((item) => String(item)).filter(Boolean) : [],
-    }));
-  }
-
-  function formatCodexPlusAdTitle(title) {
-    const value = String(title || "");
-    return value.split(/[｜|]/, 1)[0].trim() || value;
-  }
-
-  /** 推荐卡片的右上角外链箭头，跟 VSCode/Codex 的「新窗口打开」同一语义。 */
-  const codexPlusAdArrowIcon = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 10.5 10.5 5.5"/><path d="M6.5 5.5h4v4"/></svg>';
-
-  function renderCodexPlusAdGroup() {
-    const ads = codexPlusAds;
-    if (!ads.length) return `<div class="codex-plus-ad-empty">暂无推荐内容。</div>`;
-    return ads.map((ad) => {
-      const name = formatCodexPlusAdTitle(ad.title);
-      // 底部那条优惠信息：取第一个亮点。没有就不渲染整条，免得留一段空白。
-      const promo = (ad.highlights || []).find(Boolean) || "";
-      // 没有配图时用名称首字当占位，比空一块更整齐。
-      const icon = ad.image
-        ? `<img class="codex-plus-ad-icon" src="${escapeHtml(ad.image)}" alt="" loading="lazy" />`
-        : `<span class="codex-plus-ad-icon codex-plus-ad-icon-fallback" aria-hidden="true">${escapeHtml(name.slice(0, 1))}</span>`;
-      return `
-        <a class="codex-plus-ad-card" data-codex-plus-ad-url="${escapeHtml(ad.url)}" href="${escapeHtml(ad.url)}" rel="noreferrer" title="${escapeHtml(name)}">
-          <span class="codex-plus-ad-main">
-            ${icon}
-            <span class="codex-plus-ad-text">
-              <span class="codex-plus-ad-title">${escapeHtml(name)}</span>
-              <span class="codex-plus-ad-description">${escapeHtml(ad.description)}</span>
-              ${promo ? `<span class="codex-plus-ad-promo">${escapeHtml(promo)}</span>` : ""}
-            </span>
-            <span class="codex-plus-ad-arrow" aria-hidden="true">${codexPlusAdArrowIcon}</span>
-          </span>
-        </a>
-      `;
-    }).join("");
-  }
-
-  function renderCodexPlusAds() {
-    if (!codexPlusAdsLoaded) return `<div class="codex-plus-ad-empty">推荐内容加载中…</div>`;
-    if (!codexPlusAds.length) return `<div class="codex-plus-ad-empty">暂无推荐内容。</div>`;
-    // 合作伙伴用同一套原生列表节奏展示，文案与外链沿用后端数据。
-    return `<div class="codex-plus-ad-list">${renderCodexPlusAdGroup()}</div>`;
-  }
-
-  function cacheBustCodexPlusAdUrl(url, version) {
-    return `${url}${url.includes("?") ? "&" : "?"}v=${version}`;
-  }
-
-  async function directFetchCodexPlusAds() {
-    const urls = [
-      "https://ads.codexpp.cc/ads.json",
-      "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-      "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
-    ];
-    let lastError = null;
-    const cacheBust = Date.now();
-    for (const url of urls) {
-      try {
-        const response = await fetch(cacheBustCodexPlusAdUrl(url, cacheBust), {
-          headers: { "Accept": "application/json" },
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw lastError || new Error("ad list unavailable");
-  }
-
-  async function fetchCodexPlusAds() {
-    try {
-      const localPayload = await postJson(codexPlusAdsUrl, {});
-      codexPlusAds = normalizeCodexPlusAds(localPayload?.ads ? localPayload : localPayload?.payload);
-      if (!codexPlusAds.length) codexPlusAds = normalizeCodexPlusAds(await directFetchCodexPlusAds());
-    } catch (error) {
-      sendCodexPlusDiagnostic("ads_fetch_failed", {
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-      codexPlusAds = [];
-    } finally {
-      codexPlusAdsLoaded = true;
-      const panel = document.querySelector('[data-codex-plus-panel="sponsor"] .codex-plus-ad-remote');
-      if (panel) panel.innerHTML = renderCodexPlusAds();
-    }
-  }
-
   function selectCodexPlusTab(tab) {
     // 归一化后再比对：panel 用的是 extensions，而旧调用点仍传 userScripts，
     // 不统一就会两边都对不上、所有 panel 全被隐藏。
@@ -1285,13 +1214,12 @@
     refreshCodexPlusPageNav(normalized);
   }
 
-  /** 两个 rail 入口各自对应一个页面，激活态要分别判断，不能只看页面开着没有。 */
+  /** 每个 rail 入口分别判断激活态，不能只看页面开着没有。 */
   function codexPlusActiveEntry() {
     const overlay = document.querySelector(`.${codexPlusPageClass}`);
     if (!overlay) return null;
     const tab = overlay.querySelector(".codex-plus-modal-content")?.dataset?.codexPlusActiveTab;
     if (tab === codexPlusExtensionsTab) return "extensions";
-    if (tab === codexPlusSponsorTab) return "sponsor";
     if (tab === codexPlusPluginMarketTab) return "plugin-market";
     if (tab === codexPlusProviderTab) return "provider";
     if (tab === codexPlusRemoteControlTab) return "remote";
@@ -1312,7 +1240,6 @@
     [
       [codexPlusRailNavId, "home"],
       [codexPlusRailExtensionsId, "extensions"],
-      [codexPlusRailSponsorId, "sponsor"],
       [codexPlusRailProviderId, "provider"],
       [codexPlusRailRemoteId, "remote"],
       [codexPlusRailWeixinId, "weixin"],
@@ -1615,7 +1542,6 @@
    */
   function codexPlusModalTab(tab) {
     if (tab === "extensions" || tab === "userScripts") return codexPlusExtensionsTab;
-    if (tab === "sponsor") return "sponsor";
     return "home";
   }
 
@@ -1944,30 +1870,6 @@
       const description = item ? codexPlusSettingsCatalogDescription(item) : "";
       if (item && node.textContent !== description) node.textContent = description;
     });
-    syncCodexPlusNativeFastStatus();
-  }
-
-  // 原生 Fast 的自检结果：补丁是否真的打进了当前 Codex。Codex 更新后结构变了时，
-  // 用户在这里就能看到「暂未适配」和原因，不用再猜按钮为什么不见了。
-  function codexPlusNativeFastStatusText() {
-    if (codexPlusBackendSettings.enhancementsEnabled === false || codexPlusBackendSettings.codexAppNativeFastUnlock !== true) return "";
-    const state = window.__codexPlusNativeFastPatchState;
-    if (window.__codexPlusNativeFastCompiled === "v1" || state === "patched") return "已生效：当前 Codex 版本已适配。";
-    if (state === "failed" || state === "unsupported") {
-      const reason = String(window.__codexPlusNativeFastFailureReason || window.__codexPlusNativeFastModuleDiagnostics?.reason || "").slice(0, 120);
-      return `当前 Codex 版本暂未适配，Fast 开关不会出现${reason ? `（${reason}）` : ""}。请把 codex-plus.log 里 bridge.native_module_patch_prepared 那一行反馈给我们。`;
-    }
-    return "";
-  }
-
-  function syncCodexPlusNativeFastStatus() {
-    document.querySelectorAll("[data-codex-plus-native-fast-status]").forEach((node) => {
-      const text = codexPlusNativeFastStatusText();
-      const failed = String(!!text && !text.startsWith("已生效"));
-      if (node.textContent !== text) node.textContent = text;
-      if (node.hidden !== !text) node.hidden = !text;
-      if (node.dataset.failed !== failed) node.dataset.failed = failed;
-    });
   }
 
   // 与管理器增强页一致：「（实验）」从标题里拿出来做成小标签；说明里写了要重启 Codex 的，标题旁加「需重启」。
@@ -1991,7 +1893,10 @@
       const binding = localKey ? `data-codex-plus-setting="${escapeHtml(localKey)}"` : `data-codex-backend-setting="${escapeHtml(item.key)}"`;
       const toggle = `<button type="button" class="codex-plus-toggle" ${binding} role="switch" aria-checked="false" aria-label="${title}"><span></span></button>`;
       const inputs = (Array.isArray(item.codexInputs) ? item.codexInputs : []).map(renderCodexPlusSettingsCatalogInput).join("");
-      control = inputs ? `<div class="codex-plus-width-control">${inputs}${toggle}</div>` : toggle;
+      const fastPreference = item.key === "codexAppNativeFastUnlock"
+        ? '<span data-codex-plus-fast-preference-control hidden><button type="button" class="codex-plus-menu-trigger" data-codex-plus-fast-preference-settings aria-haspopup="dialog">设置默认速度</button></span>'
+        : "";
+      control = inputs || fastPreference ? `<div class="codex-plus-width-control">${inputs}${fastPreference}${toggle}</div>` : toggle;
     }
     // 不认识的控件类型宁可不显示，也不显示一个点了不生效的行。
     if (!control) return "";
@@ -2003,7 +1908,7 @@
     const param = options.param ? " data-codex-plus-builtin-param=\"true\"" : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}"${builtin}${param}>
-                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div>${item.key === "codexAppNativeFastUnlock" ? '<div class="codex-plus-row-description" data-codex-plus-native-fast-status="true" role="status" hidden></div>' : ""}</div>
+                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
                   ${control}
                 </div>`;
   }
@@ -2221,15 +2126,6 @@
               <div class="codex-plus-extensions-detail" data-codex-plus-extensions-detail="true">${renderCodexPlusExtensionsDetail()}</div>
             </div>
           </div>
-          <div class="codex-plus-panel" data-codex-plus-panel="sponsor" hidden>
-            <div class="codex-plus-discovery codex-plus-sponsor-page">
-              <div class="codex-plus-discovery-header">
-                <div><h1 class="codex-plus-discovery-title">推荐内容</h1><p class="codex-plus-discovery-description codex-plus-sponsor-text">以下推荐来自支持 Codex++ 继续维护的合作方。</p></div>
-              </div>
-              <h2 class="codex-plus-discovery-section-title">合作伙伴</h2>
-              <div class="codex-plus-ad-remote">${renderCodexPlusAds()}</div>
-            </div>
-          </div>
         </div>
       </div>
     `;
@@ -2354,20 +2250,6 @@
           });
         return;
       }
-      // 推荐卡片用 window.open 而非原生 <a target="_blank">：Codex 是 Electron
-      // 应用，原生新窗口跳转在它的 webview 里不会交给系统浏览器（同页的
-      // Discord / Telegram / Issues 按钮也一律走 window.open）。
-      const adCard = target?.closest("[data-codex-plus-ad-url]");
-      if (adCard) {
-        // 无论 URL 合不合法都先掐掉 <a> 的默认行为：留下它，非 http(s) 的
-        // scheme 就会走原生跳转，而不是被下面这层挡掉。
-        event.preventDefault();
-        const adUrl = adCard.getAttribute("data-codex-plus-ad-url") || "";
-        if (isCodexPlusAdWebUrl(adUrl)) {
-          window.open(adUrl, "_blank", "noopener,noreferrer");
-        }
-        return;
-      }
       if (target?.closest("[data-codex-plus-discord]")) {
         window.open("https://discord.gg/y96kX7A76v", "_blank");
         return;
@@ -2472,7 +2354,6 @@
       // 必须在 selectCodexPlusTab 之前建好两栏，否则刷新左面板时找不到容器。
       installCodexPlusPageLayout(overlay, initialTab);
     }
-    if (!codexPlusAdsLoaded) fetchCodexPlusAds();
     selectCodexPlusTab(initialTab);
     // 必须在 selectCodexPlusTab 之后：激活态要靠 data-codex-plus-active-tab
     // 判断当前是 Codex++ 还是「拓展」，提前调用会永远落到 home 上。
@@ -2497,9 +2378,16 @@
     openCodexPlusModal({ page: true, tab: codexPlusExtensionsTab });
   }
 
-  /** 「推荐内容」页面：从弹窗的二级 tab 提出来，成为图标栏上的一级入口。 */
-  function openCodexPlusSponsor() {
-    openCodexPlusModal({ page: true, tab: codexPlusSponsorTab });
+  function removeRetiredCodexPlusSponsorUi(railEntry = document.getElementById(retiredCodexPlusSponsorRailId)) {
+    // 同页重新注入时，移除旧闭包绑定的入口和广告内容。
+    if (railEntry?.querySelector('button[aria-describedby="codex-plus-rail-tooltip"]')) {
+      window.__codexPlusRailTooltipDismiss?.();
+    }
+    railEntry?.remove();
+    const activeTab = '.codex-plus-modal-content[data-codex-plus-active-tab="sponsor"]';
+    if (document.querySelector(`.${codexPlusPageClass} ${activeTab}`)) closeCodexPlusPage();
+    document.querySelectorAll(`.codex-plus-modal-overlay:has(${activeTab})`).forEach((node) => node.remove());
+    document.querySelectorAll('.codex-plus-modal-content [data-codex-plus-panel="sponsor"]').forEach((node) => node.remove());
   }
 
   function closeCodexPlusPage() {
@@ -2666,7 +2554,7 @@
   }
 
   function removeCodexPlusRailNavigation() {
-    [codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailSponsorId, codexPlusRailPluginMarketId].forEach((id) => document.getElementById(id)?.remove());
+    [codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailPluginMarketId].forEach((id) => document.getElementById(id)?.remove());
   }
 
   function detachCodexPlusSidebarNavigation() {
@@ -2906,8 +2794,8 @@
       rail.dataset.codexPlusRailNavigationListener = "true";
       rail.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-        if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailProviderId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}, #${codexPlusRailRemoteId}, #${codexPlusRailWeixinId}, #${codexPlusRailTasksId}`)) return;
-        // 拓展入口的 id 是动态生成的，不在上面三个之内。不排除它，点拓展入口会被
+        if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailProviderId}, #${codexPlusRailExtensionsId}, #${codexPlusRailRemoteId}, #${codexPlusRailWeixinId}, #${codexPlusRailTasksId}`)) return;
+        // 第三方拓展入口的 id 是动态生成的，不在上面的内置入口之内。不排除它，点击时会被
         // 当成「点了原生导航按钮」，刚打开的拓展页面立刻被关掉。
         if (target?.closest(`[${codexPlusExtensionConstants.extensionAttribute}]`)) return;
         if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
@@ -2920,10 +2808,8 @@
       // 「拓展」直接用 VSCode 的扩展字形（就是列表里默认图标那一份），
       // 和页面内部保持同一个符号，不再另画一个近似图形。
       extensions: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="${codexPlusDefaultExtensionIconPath}"/></svg>`,
-      // Lucide 的 megaphone：与 home 同一套 24 格线性风格，笔画宽度和端点也一致。
       // Lucide 的 server：同一套 24 格线性风格。
       provider: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01"/></svg>',
-      sponsor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg>',
       // Lucide 的 smartphone：同一套 24 格线性风格。
       remote: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>',
       // Lucide 的 message-circle：同一套 24 格线性风格（管理器微信页的状态图标也是它）。
@@ -2940,7 +2826,6 @@
       { id: codexPlusRailWeixinId, label: "微信连接", iconMarkup: icons.weixin, withStatus: false, onActivate: openCodexPlusWeixinConnectPage },
       { id: codexPlusRailTasksId, label: "任务面板", iconMarkup: icons.tasks, withStatus: false, onActivate: openCodexPlusTaskBoardPage },
       { id: codexPlusRailExtensionsId, label: "拓展", iconMarkup: icons.extensions, withStatus: false, onActivate: openCodexPlusExtensions },
-      { id: codexPlusRailSponsorId, label: "推荐内容", iconMarkup: icons.sponsor, withStatus: false, onActivate: openCodexPlusSponsor },
     ];
 
     const anchor = codexPlusRailPrimaryAnchor(rail);

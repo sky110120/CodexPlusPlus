@@ -71,7 +71,6 @@ import { gatewayJump } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { singleAgent, visibleAgents } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
-import { useSponsorPresets } from "./sponsor-store";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok" | `sub:${string}`;
@@ -1146,8 +1145,8 @@ function ProviderCatalog({
 }) {
   const [query, setQuery] = useState("");
   const [importing, setImporting] = useState(false);
-  const sponsors = useSponsorPresets();
-  const presets = useMemo(() => gatewayPresets(sponsors), [sponsors]);
+  // 广告供应商预设已停用。
+  const presets = useMemo(() => gatewayPresets(), []);
   const needle = query.trim().toLowerCase();
   const hit = (...values: string[]) => !needle || values.some((value) => value.toLowerCase().includes(needle));
   const presetItems = (section: PresetSection): CatalogItem[] => presets
@@ -1175,7 +1174,6 @@ function ProviderCatalog({
     ...(hit(t("自定义")) ? [{ key: "custom", name: t("自定义"), icon: <span className="gw-avatar gw-avatar-plus" data-size="sm"><Plus className="h-3.5 w-3.5" /></span>, onClick: onCustom }] : []),
   ];
   const sections: Array<{ key: string; title: string; hint: string; items: CatalogItem[] }> = [
-    { key: "sponsor", title: t("赞助商"), hint: t("支持 Codex++ 的服务商"), items: presetItems("sponsor") },
     { key: "subscription", title: t("订阅"), hint: t("登录即可，无需密钥；与 Codex 自己的登录互不影响"), items: subscriptions },
     { key: "vendor", title: t("供应商"), hint: t("模型厂商的 API"), items: presetItems("vendor") },
     { key: "relay", title: t("中转"), hint: t("一个密钥用多家模型"), items: presetItems("relay") },

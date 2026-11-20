@@ -51,52 +51,16 @@ test("sponsor presets are not built in", () => {
     assert.equal(PRESETS.some((candidate) => candidate.id === id), false, id);
   }
 });
+
+test("provider links do not include the known invitation codes", () => {
+  assert.equal(PRESETS.find((preset) => preset.id === "zhipu-glm")?.apiKeyUrl, "https://www.bigmodel.cn/claude-code");
+  assert.equal(PRESETS.find((preset) => preset.id === "siliconflow")?.apiKeyUrl, "https://cloud.siliconflow.cn/");
+});
 });
 
-describe("sponsor presets from the remote ad list", () => {
-  const ad = (id: string, preset: unknown, extra: Record<string, unknown> = {}) => ({
-    id: `${id}-ad`, type: "sponsor", title: id, description: "d", url: "https://example.test", preset, ...extra,
-  });
-  const preset = (id: string, extra: Record<string, unknown> = {}) => ({
-    id, name: id.toUpperCase(), baseUrl: `https://${id}.example/v1`, protocol: "responses", model: "", ...extra,
-  });
-
-  it("returns nothing when the list did not load", () => {
+describe("广告供应商预设已停用", () => {
+  it("忽略远端广告及其预设", () => {
+    assert.deepEqual(sponsorPresets({ topAds: [{ type: "sponsor", preset: { id: "ad", name: "Ad", baseUrl: "https://example.test/v1", protocol: "responses" } }], ads: [] }), []);
     assert.deepEqual(sponsorPresets(null), []);
-    assert.deepEqual(sponsorPresets({ ads: [] }), []);
-  });
-
-  it("reads the preset of each sponsor ad, top slots first, as an aggregator preset", () => {
-    const presets = sponsorPresets({
-      topAds: [ad("jojo", preset("jojocode-max", { websiteUrl: "https://max2.jojocode.com/" }))],
-      ads: [
-        ad("apikey", preset("apikeyfun", { model: "gpt-5.5", modelList: ["gpt-5.5", " ", 3], apiKeyUrl: "javascript:alert(1)" })),
-        ad("plain", undefined),
-        ad("jojo-again", preset("jojocode-max")),
-        { ...ad("normal", preset("normal")), type: "normal" },
-      ],
-    });
-    assert.deepEqual(presets, [
-      { id: "jojocode-max", name: "JOJOCODE-MAX", websiteUrl: "https://max2.jojocode.com/", category: "aggregator", baseUrl: "https://jojocode-max.example/v1", protocol: "responses", model: "" },
-      { id: "apikeyfun", name: "APIKEYFUN", category: "aggregator", baseUrl: "https://apikeyfun.example/v1", protocol: "responses", model: "gpt-5.5", modelList: ["gpt-5.5"] },
-    ]);
-  });
-
-  it("drops presets with a bad address or protocol", () => {
-    const presets = sponsorPresets({
-      ads: [
-        ad("a", preset("a", { baseUrl: "javascript:alert(1)" })),
-        ad("b", preset("b", { protocol: "anthropicMessages" })),
-        ad("c", preset("c", { name: " " })),
-        ad("d", preset("d", { protocol: "chatCompletions" })),
-      ],
-    });
-    assert.deepEqual(presets.map((item) => [item.id, item.protocol]), [["d", "chatCompletions"]]);
-  });
-
-  it("keeps a sponsor through its expiry day and drops it the day after", () => {
-    const payload = { ads: [ad("apikey", preset("apikeyfun"), { expires_at: "2026-12-22" })] };
-    assert.equal(sponsorPresets(payload, new Date(2026, 11, 22, 23, 59)).length, 1);
-    assert.equal(sponsorPresets(payload, new Date(2026, 11, 23)).length, 0);
   });
 });

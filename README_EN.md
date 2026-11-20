@@ -38,7 +38,7 @@ After installation, one `Codex++` entry is available. Double-click it to open th
 
 1. **Add providers** — open **Gateway → Provider pool** and click **Add provider**: paste an API key, sign in to a ChatGPT / GitHub Copilot / SuperGrok subscription, or import several providers at once from direct mode or OpenCode. Model lists and prices are filled in automatically.
 2. **Connect agents** — open **Gateway → Agent access**, turn on the agents you use, and pick each one's default model. Claude Code and Grok keep working in your terminal as usual.
-3. **Launch Codex** — click **Launch Codex** on the Codex page or the start button next to Codex in the sidebar. Settings that rely on injection (most enhancements, Fast unlock) take effect after restarting Codex from Codex++.
+3. **Launch Codex** — click **Launch Codex** on the Codex page or the start button next to Codex in the sidebar. Most settings that rely on renderer injection take effect after restarting Codex from Codex++.
 
 Prefer not to use the gateway? Direct mode still works: in **Codex → Connection & providers**, set **Connection** to **Direct**, pick a provider, and launch. See the full [guide](https://codexpp.cc/guide.html) on the website.
 
@@ -81,7 +81,7 @@ Friendly link: <a href="https://linux.do">LINUX DO</a>
 | Session management | Codex, Claude Code, Claude Desktop, and Grok sessions in one list; bulk deletion with undo, Markdown export, project move, thread IDs, opt-in [turn rewind](docs/turn-rewind.md), and side chats saved as ordinary conversations |
 | Codex multi-launch | Start an isolated Codex instance per provider identity, each with its own config, sessions, and user data directory; restart or stop each one individually |
 | Sub-agent collaboration | Delegate in natural language from a Codex chat to Codex CLI, DeepSeek Harness (dsh), Claude Code, or Google Antigravity (`agy`) and receive results in the same chat; tasks for a busy agent run concurrently up to a limit, then queue |
-| Codex enhancements | Plugin marketplace and model whitelist handling, session actions, paste fix, dictation with a global hotkey, native composer predictions, conversation width and scroll restore, native Fast unlock, Goals, next-step suggestions, skins, and image overlays |
+| Codex enhancements | Plugin marketplace and model whitelist handling, session actions, paste fix, dictation with a global hotkey, native composer predictions, conversation width and scroll restore, Fast speed button, Goals, next-step suggestions, skins, and image overlays |
 | Usage status line | Output throughput, cache hit rate, and context usage below the composer, read from local Codex session records |
 | Tray panel and WeChat | A tray quick panel to switch models and check usage and recent requests; QR login connects personal WeChat to local Codex sessions |
 | Maintenance | MCP and Skills per agent, user scripts, AI agent cache cleanup (Codex, Claude, Codex++), app detection, launch at login, settings export / import, logs, diagnostics, and Release updates downloaded in the background |
@@ -147,7 +147,7 @@ Every UI enhancement is independently configurable. Disabling the global enhance
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/readme-preview/codex-enhance-en.webp" alt="Codex enhancements: plugin marketplace unlock, model whitelist, native Fast, composer predictions, and session deletion switches" width="100%"></td>
+    <td width="50%"><img src="docs/images/readme-preview/codex-enhance-en.webp" alt="Codex enhancements: plugin marketplace unlock, model whitelist, Fast speed button, composer predictions, and session deletion switches" width="100%"></td>
     <td width="50%"><img src="docs/images/readme-preview/claude-enhance.webp" alt="Claude enhancements: the managed copy is ready, with switches for localization, dictation, and Computer Use" width="100%"></td>
   </tr>
   <tr>
@@ -219,22 +219,22 @@ Provider switching saves the current profile before applying the target profile.
 - Plugin marketplace unlock, plugin auto-expand, and model whitelist handling.
 - Plain-text paste and startup acceleration.
 - Dictation: use an independent OpenAI-compatible service or the local SenseVoiceSmall INT8 model (downloaded manually from the voice settings and run on-device), then record and insert or send the text.
-- Conversation width, scroll restoration, thread IDs, native Fast unlock, and Goals.
+- Conversation width, scroll restoration, thread IDs, Fast speed button, and Goals.
 - Next-step suggestions: manage toggles, API, model, item count, and timeout together in Codex Enhancements.
 - Skin management: search, preview, install, and image replacement for Dream Skin community themes.
 - Custom image overlays and user scripts.
 
-Settings that depend on renderer injection generally require saving and restarting Codex from the Codex++ window.
+Most settings that depend on renderer injection require saving and restarting Codex from the Codex++ window.
 
-### Use native Fast controls with an API key
+### Set Codex's default speed on this device
 
-**Force unlock native Fast** gives pure API-key setups access to Codex's native **Standard / ⚡ Fast** controls for supported models, using the existing model and reasoning-effort menus.
+The **Fast speed button** below the composer sets Codex's default speed on this device. Enabling the **Fast speed button** option alone does not change the speed.
 
-1. Open **Codex → Built-in extensions** and enable both the **Enable built-in extensions** master switch at the top and **Force unlock native Fast** (disabled by default).
+1. Open **Codex → Built-in extensions** and enable both the **Enable built-in extensions** master switch at the top and **Fast speed button** (disabled by default).
 2. Make sure the model declares a Fast service tier. In direct mode, open that model's settings in **Codex → Connection & providers**, set **Fast (priority) support**, and save the model and provider. In gateway mode, a model group supports Fast when every member does.
-3. Save the enhancement settings and restart Codex from Codex++. Open the model or reasoning-effort menu and select **⚡ Fast**, or select **Standard** to switch back.
+3. Use the **Fast** button below the composer to set Codex's default speed on this device. You can also select **Standard** when needed.
 
-Availability, speed improvements, and pricing depend on the provider. Enabling this feature does not automatically speed up every model. Disable the option and restart Codex to restore its original authentication checks.
+The actual tier and cost depend on the model and provider.
 
 ## Updates and Packages
 

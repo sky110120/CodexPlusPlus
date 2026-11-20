@@ -12,10 +12,22 @@ on:
       - "**/*.md"
   workflow_dispatch:
     inputs:
-      rust_test_filter:
-        description: "只跑名字匹配的 Rust 用例并串行执行（留空跑全量），排查平台相关失败时用"
-        default: ""
+      draft_release_id:
+        description: "可选：把 DMG 附到当前提交已有的 Release 草稿（数字 ID）"
         required: false
+        type: string
+  workflow_call:
+    inputs:
+      build_dmg:
+        description: "构建并上传 Apple Silicon DMG"
+        required: false
+        default: false
+        type: boolean
+      checkout_ref:
+        description: "构建的 Git ref，空值使用调用方提交"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -27,187 +39,190 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows-artifacts:
-    name: Windows artifacts
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+#   windows-artifacts:
+#     name: Windows artifacts
+#     runs-on: windows-latest
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+#       - name: Setup Node
+#         uses: actions/setup-node@v4
+#         with:
+#           node-version: "22"
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+#       - name: Setup Rust
+#         uses: dtolnay/rust-toolchain@stable
 
-      # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
-      # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
-      # 这份只有测试用的 dev 产物；发版用的 release 依赖缓存由 release-cache.yml 单独维护。
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+#       # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
+#       # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
+#       # 这份只有测试用的 dev 产物；发版用的 release 依赖缓存由 release-cache.yml 单独维护。
+#       - name: Cache Rust dependencies
+#         uses: Swatinem/rust-cache@v2
+#         with:
+#           shared-key: windows
+#           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check sherpa-onnx prebuilt cache
-        shell: bash
-        # 缓存可能只保留 lib 目录；同时失效 build-script 输出，确保首次测试前重新解压。
-        run: |
-          node --test scripts/tests/prepare-sherpa-cache.test.cjs
-          node scripts/prepare-sherpa-cache.mjs
-          cargo clean --package sherpa-onnx-sys
+#       - name: Check sherpa-onnx prebuilt cache
+#         shell: bash
+#         # 缓存可能只保留 lib 目录；同时失效 build-script 输出，确保首次测试前重新解压。
+#         run: |
+#           node --test scripts/tests/prepare-sherpa-cache.test.cjs
+#           node scripts/prepare-sherpa-cache.mjs
+#           cargo clean --package sherpa-onnx-sys
 
-      - name: Install NSIS
-        # 安装包只在手动触发时打，PR 和推送 main 都不需要 NSIS。
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
-        run: |
-          $makensis = $null
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            choco install nsis -y --no-progress
-            # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
-            $candidates = @(
-              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-              "$env:ProgramFiles\NSIS\makensis.exe"
-            )
-            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-            if (-not $makensis) {
-              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
-              if ($command) { $makensis = $command.Source }
-            }
-            if ($makensis) {
-              & $makensis /VERSION
-              if ($LASTEXITCODE -eq 0) { break }
-            }
-            $makensis = $null
-            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
-          }
-          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止 PR 构建。" }
+#       - name: Install NSIS
+#         # 安装包只在手动触发时打，PR 和推送 main 都不需要 NSIS。
+#         if: github.event_name == 'workflow_dispatch'
+#         shell: pwsh
+#         run: |
+#           $makensis = $null
+#           for ($attempt = 1; $attempt -le 3; $attempt++) {
+#             choco install nsis -y --no-progress
+#             # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
+#             $candidates = @(
+#               "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+#               "$env:ProgramFiles\NSIS\makensis.exe"
+#             )
+#             $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+#             if (-not $makensis) {
+#               $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+#               if ($command) { $makensis = $command.Source }
+#             }
+#             if ($makensis) {
+#               & $makensis /VERSION
+#               if ($LASTEXITCODE -eq 0) { break }
+#             }
+#             $makensis = $null
+#             if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+#           }
+#           if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止 PR 构建。" }
 
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
+#       - name: Install frontend dependencies
+#         working-directory: apps/codex-plus-manager
+#         run: npm ci
 
-      - name: Frontend tests
-        working-directory: apps/codex-plus-manager
-        run: npm test
+#       - name: Frontend tests
+#         working-directory: apps/codex-plus-manager
+#         run: npm test
 
-      - name: Native Fast regression tests
-        run: >-
-          node --test
-          assets/inject/native-fast-unlock.test.cjs
-          assets/inject/native-fast-module.test.cjs
-          assets/inject/native-fast-settings.test.cjs
-          assets/inject/native-fast-rspack.test.cjs
-          assets/inject/native-predictions.test.cjs
-          scripts/tests/check-native-fast.test.cjs
+#       - name: Native Fast regression tests
+#         run: >-
+#           node --test
+#           assets/inject/native-fast-unlock.test.cjs
+#           assets/inject/native-fast-module.test.cjs
+#           assets/inject/native-fast-settings.test.cjs
+#           assets/inject/native-fast-rspack.test.cjs
+#           assets/inject/native-predictions.test.cjs
+#           scripts/tests/check-native-fast.test.cjs
 
-      - name: Check native browser inspector bundle
-        run: node scripts/assemble-native-browser-inspector.mjs --check
+#       - name: Check native browser inspector bundle
+#         run: node scripts/assemble-native-browser-inspector.mjs --check
 
-      - name: TypeScript check
-        working-directory: apps/codex-plus-manager
-        run: npm run check
+#       - name: TypeScript check
+#         working-directory: apps/codex-plus-manager
+#         run: npm run check
 
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
+#       - name: Build frontend
+#         working-directory: apps/codex-plus-manager
+#         run: npm run vite:build
 
-      - name: Rust tests
-        # 有用例卡死时到点失败，不要一直占着 runner 到作业 6 小时上限（编译加测试平时 20 分钟左右）。
-        timeout-minutes: 60
-        env:
-          RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
-        run: |
-          if ($env:RUST_TEST_FILTER) {
-            cargo test --workspace -- $env:RUST_TEST_FILTER --test-threads=1
-          } else {
-            cargo test --workspace --exclude codex-plus-data
-          }
+#       - name: Rust tests
+#         # 有用例卡死时到点失败，不要一直占着 runner 到作业 6 小时上限（编译加测试平时 20 分钟左右）。
+#         timeout-minutes: 60
+#         env:
+#           RUST_TEST_FILTER: ${{ inputs.rust_test_filter }}
+#         run: |
+#           if ($env:RUST_TEST_FILTER) {
+#             cargo test --workspace -- $env:RUST_TEST_FILTER --test-threads=1
+#           } else {
+#             cargo test --workspace --exclude codex-plus-data
+#           }
 
-      - name: Data tests (shared memory budget)
-        if: ${{ !inputs.rust_test_filter }}
-        timeout-minutes: 60
-        # 大行索引用例共享进程级缓冲预算，避免不同夹具并发耗尽预算而提前返回 partial。
-        run: cargo test -p codex-plus-data -- --test-threads=1
+#       - name: Data tests (shared memory budget)
+#         if: ${{ !inputs.rust_test_filter }}
+#         timeout-minutes: 60
+#         # 大行索引用例共享进程级缓冲预算，避免不同夹具并发耗尽预算而提前返回 partial。
+#         run: cargo test -p codex-plus-data -- --test-threads=1
 
-      - name: Build release application
-        # PR 和推送 main 只跑测试：release 是第二套完整编译，Windows 上要多 10 分钟左右。
-        # 要安装包时手动触发本 workflow；release profile 才有的问题由 release-cache.yml（Cargo.lock 变化时）
-        # 和发版的 release-assets.yml 兜住。
-        if: github.event_name == 'workflow_dispatch'
-        run: cargo build --release
+#       - name: Build release application
+#         # PR 和推送 main 只跑测试：release 是第二套完整编译，Windows 上要多 10 分钟左右。
+#         # 要安装包时手动触发本 workflow；release profile 才有的问题由 release-cache.yml（Cargo.lock 变化时）
+#         # 和发版的 release-assets.yml 兜住。
+#         if: github.event_name == 'workflow_dispatch'
+#         run: cargo build --release
 
-      - name: Stage Windows app files
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
-          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
-          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
+#       - name: Stage Windows app files
+#         if: github.event_name == 'workflow_dispatch'
+#         shell: pwsh
+#         run: |
+#           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+#           Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+#           if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
 
-      - name: Build Windows installer
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart("v", "V")
-          $version = $version -replace '[\\/]', '-'
-          if (-not $version -or $version -eq "main") {
-            $version = "0.0.0-${{ github.run_number }}"
-          }
-          # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
-          $candidates = @(
-            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-            "$env:ProgramFiles\NSIS\makensis.exe"
-          )
-          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-          if (-not $makensis) {
-            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
-            if ($command) { $makensis = $command.Source }
-          }
-          if (-not $makensis) {
-            throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
-          }
-          Push-Location scripts/installer/windows
-          try {
-            # 版本资源只收 X.X.X.X：去掉预发布后缀；手动在分支上跑（版本是分支名）时用 0.0.0.0。
-            $viVersion = if ($version -match '^(\d+)\.(\d+)\.(\d+)') { "$($Matches[1]).$($Matches[2]).$($Matches[3]).0" } else { "0.0.0.0" }
-            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DVI_VERSION=$viVersion" CodexPlusPlus.nsi
-            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
-          } finally {
-            Pop-Location
-          }
+#       - name: Build Windows installer
+#         if: github.event_name == 'workflow_dispatch'
+#         shell: pwsh
+#         run: |
+#           $version = "${{ github.ref_name }}".TrimStart("v", "V")
+#           $version = $version -replace '[\\/]', '-'
+#           if (-not $version -or $version -eq "main") {
+#             $version = "0.0.0-${{ github.run_number }}"
+#           }
+#           # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
+#           $candidates = @(
+#             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+#             "$env:ProgramFiles\NSIS\makensis.exe"
+#           )
+#           $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+#           if (-not $makensis) {
+#             $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+#             if ($command) { $makensis = $command.Source }
+#           }
+#           if (-not $makensis) {
+#             throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
+#           }
+#           Push-Location scripts/installer/windows
+#           try {
+#             # 版本资源只收 X.X.X.X：去掉预发布后缀；手动在分支上跑（版本是分支名）时用 0.0.0.0。
+#             $viVersion = if ($version -match '^(\d+)\.(\d+)\.(\d+)') { "$($Matches[1]).$($Matches[2]).$($Matches[3]).0" } else { "0.0.0.0" }
+#             & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DVI_VERSION=$viVersion" CodexPlusPlus.nsi
+#             if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
+#           } finally {
+#             Pop-Location
+#           }
 
-      - name: Upload Windows binaries
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-plus-plus-windows-binaries
-          path: dist/windows/app/*
-          if-no-files-found: error
+#       - name: Upload Windows binaries
+#         if: github.event_name == 'workflow_dispatch'
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: codex-plus-plus-windows-binaries
+#           path: dist/windows/app/*
+#           if-no-files-found: error
 
-      - name: Upload Windows installer
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-plus-plus-windows-installer
-          path: dist/windows/*.exe
-          if-no-files-found: error
+#       - name: Upload Windows installer
+#         if: github.event_name == 'workflow_dispatch'
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: codex-plus-plus-windows-installer
+#           path: dist/windows/*.exe
+#           if-no-files-found: error
 
   macos-dmg:
-    # PR / 推送 main 只做 cargo check：Windows、Linux 编不到 macOS 专属代码（录屏、objc 等），
-    # 这里是唯一的编译检查。双架构通用包（ad-hoc 签名）只在手动触发时打，发版走 release-assets.yml。
-    name: macOS DMG (universal)
-    # macos-14 镜像 2026-11-02 退役，期间还有计划性停机（任务分配 runner 前就被取消）。
+    # PR 只检查；手动运行时生成 Apple Silicon 专用 DMG。
+    name: macOS Apple Silicon (arm64)
     runs-on: macos-15
     env:
       # 与 Info.plist 的 LSMinimumSystemVersion 一致，不随 runner 的 SDK 抬高 C 依赖的最低系统版本。
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
+      - name: Require an Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -217,7 +232,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          # Intel target: x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
       # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
@@ -239,8 +255,21 @@ jobs:
           assets/inject/native-fast-module.test.cjs
           assets/inject/native-fast-settings.test.cjs
           assets/inject/native-fast-rspack.test.cjs
+          assets/inject/fast-preference.test.cjs
           assets/inject/native-predictions.test.cjs
           scripts/tests/check-native-fast.test.cjs
+          docs/site.sponsors.test.cjs
+
+      - name: Check shipped renderer sources
+        run: |
+          node scripts/assemble-provider-editing.mjs --check
+          node scripts/assemble-renderer-inject.mjs --check
+
+      - name: Check manager changes
+        working-directory: apps/codex-plus-manager
+        run: |
+          npm run check
+          npm test
 
       - name: Check native browser inspector bundle
         run: node scripts/assemble-native-browser-inspector.mjs --check
@@ -250,23 +279,18 @@ jobs:
         run: npm run vite:build
 
       - name: Check macOS build
-        if: github.event_name != 'workflow_dispatch'
-        run: cargo check --workspace --all-targets
+        if: github.event_name != 'workflow_dispatch' && inputs.build_dmg != true
+        run: cargo check --workspace --all-targets --target aarch64-apple-darwin
 
-      - name: Build universal macOS DMG
-        if: github.event_name == 'workflow_dispatch'
+      - name: Build Apple Silicon DMG
+        if: github.event_name == 'workflow_dispatch' || inputs.build_dmg == true
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION#V}"
-          VERSION="${VERSION//\//-}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
-            VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
-          fi
+          VERSION="$(node -p "require('./apps/codex-plus-manager/package.json').version")"
           # 未设置 MACOS_SIGNING_IDENTITY，脚本自动退回 ad-hoc 签名。
-          bash scripts/installer/macos/build-universal.sh "$VERSION"
+          bash scripts/installer/macos/build-universal.sh "$VERSION" arm64
 
       - name: Verify macOS bundle structure
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || inputs.build_dmg == true
         run: |
           set -euo pipefail
           test -L "dist/macos/stage/Applications"
@@ -278,7 +302,9 @@ jobs:
           for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
-            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            executable="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            test -x "$executable"
+            test "$(lipo -archs "$executable")" = arm64
             if [[ "$app" == *"管理工具.app" ]]; then
               test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
               test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
@@ -293,151 +319,183 @@ jobs:
           done
 
       - name: Upload macOS DMG
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || inputs.build_dmg == true
         uses: actions/upload-artifact@v4
         with:
-          name: codex-plus-plus-macos-universal-dmg
-          path: dist/macos/*.dmg
+          name: codex-plus-plus-macos-arm64-dmg
+          path: dist/macos/*-macos-arm64.dmg
           if-no-files-found: error
 
-  linux-deb:
-    name: Linux DEB (Ubuntu 24.04, amd64)
-    runs-on: ubuntu-24.04
+  attach-to-draft:
+    name: Attach DMG to draft Release
+    needs: macos-dmg
+    if: github.event_name == 'workflow_dispatch' && inputs.draft_release_id != ''
+    runs-on: macos-15
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: "22"
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
-      # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: linux
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Check sherpa-onnx prebuilt cache
+          name: codex-plus-plus-macos-arm64-dmg
+          path: package
+      - name: Upload the verified DMG to the matching draft
         shell: bash
-        run: |
-          node --test scripts/tests/prepare-sherpa-cache.test.cjs
-          node scripts/prepare-sherpa-cache.mjs
-          cargo clean --package sherpa-onnx-sys
-
-      # runner 默认的 azure.archive.ubuntu.com 偶尔整段连不上（2026-11-11 所有 Linux 作业在这里卡了一个多小时）：
-      # 单次尝试限时，失败后换官方源再装一次，整步到点失败，不再一直占着 runner。
-      - name: Install Linux build dependencies
-        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_ID: ${{ inputs.draft_release_id }}
         run: |
           set -euo pipefail
-          pkgs="build-essential curl git pkg-config libssl-dev libsqlite3-dev \
-            libdbus-1-dev libglib2.0-dev libgtk-3-dev \
-            libayatana-appindicator3-dev libjavascriptcoregtk-4.1-dev \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev"
-          apt="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15"
-          try_install() {
-            timeout 480 bash -c "$apt update -qq && $apt install -y --no-install-recommends $pkgs"
-          }
-          # 新版 runner 的源写成 mirror+file:/etc/apt/apt-mirrors.txt（里面是 azure 镜像），旧版直接写 azure 地址，两种都换。
-          use_official_mirror() {
-            echo "::warning::默认 Ubuntu 镜像不可用，改用 archive.ubuntu.com"
-            for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
-              if [ -f "$f" ]; then
-                sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu#g' \
-                  -e 's#http://azure.archive.ubuntu.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
-              fi
-            done
-          }
-          # 域名都解析不了时 apt 要白等好几分钟才放弃（2026-11-11 实测），先探一下，不通直接换。
-          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
-            use_official_mirror
-          fi
-          if ! try_install; then
-            use_official_mirror
-            try_install
-          fi
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
+          [[ "$DRAFT_ID" =~ ^[0-9]+$ ]]
+          shopt -s nullglob
+          files=(package/CodexPlusPlus-*-macos-arm64.dmg)
+          [[ "${#files[@]}" == 1 ]]
+          file="${files[0]}"
+          version="${file#package/CodexPlusPlus-}"
+          version="${version%-macos-arm64.dmg}"
+          tag="v${version}"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${DRAFT_ID}" |
+            jq -e --arg sha "$GITHUB_SHA" --arg tag "$tag" \
+              '.draft == true and .target_commitish == $sha and .tag_name == $tag' >/dev/null
+          gh release upload "$tag" "$file" --repo "$GITHUB_REPOSITORY"
 
-      - name: Frontend tests
-        working-directory: apps/codex-plus-manager
-        run: npm test
+#   linux-deb:
+#     name: Linux DEB (Ubuntu 24.04, amd64)
+#     runs-on: ubuntu-24.04
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
+#       - name: Setup Node
+#         uses: actions/setup-node@v4
+#         with:
+#           node-version: "22"
+#       - name: Setup Rust
+#         uses: dtolnay/rust-toolchain@stable
 
-      - name: Native Fast regression tests
-        run: >-
-          node --test
-          assets/inject/native-fast-unlock.test.cjs
-          assets/inject/native-fast-module.test.cjs
-          assets/inject/native-fast-settings.test.cjs
-          assets/inject/native-fast-rspack.test.cjs
-          assets/inject/native-predictions.test.cjs
-          scripts/tests/check-native-fast.test.cjs
+#       # 只缓存第三方依赖的编译产物（rust-cache 会剔除本仓库 crate）。只在 main 上写缓存：
+#       # PR 读 main 的缓存，各 PR 不再各占一份，免得 10 GB 配额被挤爆、main 的缓存被逐出。
+#       - name: Cache Rust dependencies
+#         uses: Swatinem/rust-cache@v2
+#         with:
+#           key: linux
+#           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check native browser inspector bundle
-        run: node scripts/assemble-native-browser-inspector.mjs --check
+#       - name: Check sherpa-onnx prebuilt cache
+#         shell: bash
+#         run: |
+#           node --test scripts/tests/prepare-sherpa-cache.test.cjs
+#           node scripts/prepare-sherpa-cache.mjs
+#           cargo clean --package sherpa-onnx-sys
 
-      - name: TypeScript check
-        working-directory: apps/codex-plus-manager
-        run: npm run check
+#       # runner 默认的 azure.archive.ubuntu.com 偶尔整段连不上（2026-11-11 所有 Linux 作业在这里卡了一个多小时）：
+#       # 单次尝试限时，失败后换官方源再装一次，整步到点失败，不再一直占着 runner。
+#       - name: Install Linux build dependencies
+#         timeout-minutes: 20
+#         run: |
+#           set -euo pipefail
+#           pkgs="build-essential curl git pkg-config libssl-dev libsqlite3-dev \
+#             libdbus-1-dev libglib2.0-dev libgtk-3-dev \
+#             libayatana-appindicator3-dev libjavascriptcoregtk-4.1-dev \
+#             libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev"
+#           apt="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15"
+#           try_install() {
+#             timeout 480 bash -c "$apt update -qq && $apt install -y --no-install-recommends $pkgs"
+#           }
+#           # 新版 runner 的源写成 mirror+file:/etc/apt/apt-mirrors.txt（里面是 azure 镜像），旧版直接写 azure 地址，两种都换。
+#           use_official_mirror() {
+#             echo "::warning::默认 Ubuntu 镜像不可用，改用 archive.ubuntu.com"
+#             for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+#               if [ -f "$f" ]; then
+#                 sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu#g' \
+#                   -e 's#http://azure.archive.ubuntu.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+#               fi
+#             done
+#           }
+#           # 域名都解析不了时 apt 要白等好几分钟才放弃（2026-11-11 实测），先探一下，不通直接换。
+#           if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+#             use_official_mirror
+#           fi
+#           if ! try_install; then
+#             use_official_mirror
+#             try_install
+#           fi
+#       - name: Install frontend dependencies
+#         working-directory: apps/codex-plus-manager
+#         run: npm ci
 
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
+#       - name: Frontend tests
+#         working-directory: apps/codex-plus-manager
+#         run: npm test
 
-      - name: Rust tests
-        # 有用例卡死时到点失败，不要一直占着 runner 到作业 6 小时上限（编译加测试平时 20 分钟左右）。
-        timeout-minutes: 60
-        run: cargo test --workspace --exclude codex-plus-data
+#       - name: Native Fast regression tests
+#         run: >-
+#           node --test
+#           assets/inject/native-fast-unlock.test.cjs
+#           assets/inject/native-fast-module.test.cjs
+#           assets/inject/native-fast-settings.test.cjs
+#           assets/inject/native-fast-rspack.test.cjs
+#           assets/inject/native-predictions.test.cjs
+#           scripts/tests/check-native-fast.test.cjs
 
-      - name: Data tests (shared memory budget)
-        timeout-minutes: 60
-        # 与 Windows 一致，只串行化共用全局缓冲预算的 data 测试。
-        run: cargo test -p codex-plus-data -- --test-threads=1
+#       - name: Check native browser inspector bundle
+#         run: node scripts/assemble-native-browser-inspector.mjs --check
 
-      # 以下打 DEB 的步骤只在手动触发时跑；PR 和推送 main 只跑测试。
-      - name: Build Linux application
-        if: github.event_name == 'workflow_dispatch'
-        run: cargo build --release -p codex-plus-manager
-      - name: Check default version outside repository
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd /tmp
-          "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --help
-          test -f "$GITHUB_WORKSPACE/apps/codex-plus-manager/package.json"
-      - name: Build DEB from outside repository
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd /tmp
-          bash "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --package-only
-      - name: Verify package and install
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          deb_file="$(find dist/linux -maxdepth 1 -name "*.deb" -print -quit)"
-          test -n "$deb_file"
-          test "$(dpkg-deb -f "$deb_file" Package)" = "codex-plus-plus"
-          test "$(dpkg-deb -f "$deb_file" Version)" = "$(node -p 'require("./apps/codex-plus-manager/package.json").version')"
-          dpkg-deb -c "$deb_file" | grep -F "./usr/bin/codex-plus-plus"
-          if dpkg-deb -c "$deb_file" | grep -Fq "./usr/bin/codex-plus-plus-manager"; then exit 1; fi
-          sudo apt-get install -y "./$deb_file"
-          test -x /usr/bin/codex-plus-plus
-          dpkg -V codex-plus-plus
-          ldd /usr/bin/codex-plus-plus | tee /tmp/codex-plus-plus-ldd.log
-          ! grep -q "not found" /tmp/codex-plus-plus-ldd.log
-      - name: Upload DEB
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-plus-plus-linux-amd64-deb
-          path: dist/linux/*.deb
-          if-no-files-found: error
+#       - name: TypeScript check
+#         working-directory: apps/codex-plus-manager
+#         run: npm run check
+
+#       - name: Build frontend
+#         working-directory: apps/codex-plus-manager
+#         run: npm run vite:build
+
+#       - name: Rust tests
+#         # 有用例卡死时到点失败，不要一直占着 runner 到作业 6 小时上限（编译加测试平时 20 分钟左右）。
+#         timeout-minutes: 60
+#         run: cargo test --workspace --exclude codex-plus-data
+
+#       - name: Data tests (shared memory budget)
+#         timeout-minutes: 60
+#         # 与 Windows 一致，只串行化共用全局缓冲预算的 data 测试。
+#         run: cargo test -p codex-plus-data -- --test-threads=1
+
+#       # 以下打 DEB 的步骤只在手动触发时跑；PR 和推送 main 只跑测试。
+#       - name: Build Linux application
+#         if: github.event_name == 'workflow_dispatch'
+#         run: cargo build --release -p codex-plus-manager
+#       - name: Check default version outside repository
+#         if: github.event_name == 'workflow_dispatch'
+#         shell: bash
+#         run: |
+#           set -euo pipefail
+#           cd /tmp
+#           "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --help
+#           test -f "$GITHUB_WORKSPACE/apps/codex-plus-manager/package.json"
+#       - name: Build DEB from outside repository
+#         if: github.event_name == 'workflow_dispatch'
+#         shell: bash
+#         run: |
+#           set -euo pipefail
+#           cd /tmp
+#           bash "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --package-only
+#       - name: Verify package and install
+#         if: github.event_name == 'workflow_dispatch'
+#         shell: bash
+#         run: |
+#           set -euo pipefail
+#           deb_file="$(find dist/linux -maxdepth 1 -name "*.deb" -print -quit)"
+#           test -n "$deb_file"
+#           test "$(dpkg-deb -f "$deb_file" Package)" = "codex-plus-plus"
+#           test "$(dpkg-deb -f "$deb_file" Version)" = "$(node -p 'require("./apps/codex-plus-manager/package.json").version')"
+#           dpkg-deb -c "$deb_file" | grep -F "./usr/bin/codex-plus-plus"
+#           if dpkg-deb -c "$deb_file" | grep -Fq "./usr/bin/codex-plus-plus-manager"; then exit 1; fi
+#           sudo apt-get install -y "./$deb_file"
+#           test -x /usr/bin/codex-plus-plus
+#           dpkg -V codex-plus-plus
+#           ldd /usr/bin/codex-plus-plus | tee /tmp/codex-plus-plus-ldd.log
+#           ! grep -q "not found" /tmp/codex-plus-plus-ldd.log
+#       - name: Upload DEB
+#         if: github.event_name == 'workflow_dispatch'
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: codex-plus-plus-linux-amd64-deb
+#           path: dist/linux/*.deb
+#           if-no-files-found: error

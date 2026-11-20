@@ -13,6 +13,9 @@
   window.addEventListener("resize", window.__codexPlusResizeHandler);
   window.__codexSessionDeleteObserver?.disconnect();
   window.__codexSessionDeleteObserver = new MutationObserver((mutations) => {
+    // 旧注入的设置重试可能异步补扫，再次插入已退役的入口。
+    const retiredSponsorRail = document.getElementById(retiredCodexPlusSponsorRailId);
+    if (retiredSponsorRail) runScanStep(() => removeRetiredCodexPlusSponsorUi(retiredSponsorRail));
     // 先同步藏起已删会话的重建行（首帧前生效，#2791），再按原规则排扫描。
     runScanStep(() => hideDeletedSessionRowsInMutations(mutations));
     // 挂载后的微任务内对齐阅读位置，避免等待轻量扫描期间先绘制原生恢复位置。

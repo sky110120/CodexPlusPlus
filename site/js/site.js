@@ -3,7 +3,7 @@
    - 明暗主题切换（记在 localStorage，读写失败时照常跟随系统）
    - 首屏产品导览页签；「在线体验」页签第一次打开时才加载 iframe
    - 滚动入场、截图大图预览
-   - 最新动态（构建期生成的 releases.json）与赞助商（只读远端实时清单）
+   - 最新动态（构建期生成的 releases.json）
    没有 JS 时页面内容照常可读：入场动画只在 html.js 下生效。
    ============================================================ */
 
@@ -153,7 +153,7 @@
       });
   })();
 
-  /* ---------------- 赞助商（只读远端实时清单，与管理工具同一来源） ---------------- */
+  /* 赞助商广告入口暂停；保留代码供维护者审阅后恢复。
 
   (function sponsors() {
     var topBox = document.getElementById("sponsorTop");
@@ -283,4 +283,5 @@
         status.textContent = EN ? "The sponsor list could not be loaded. Try again later or check the source." : "赞助商列表暂时无法加载，请稍后重试或查看来源。";
       });
   })();
+  */
 })();

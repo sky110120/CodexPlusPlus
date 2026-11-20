@@ -20,6 +20,8 @@ permissions:
 jobs:
   image-overlay-regressions:
     name: Image overlay regressions
+    # 暂停 Windows 作业；保留原流程供日后恢复。
+    if: ${{ false }}
     runs-on: windows-latest
     timeout-minutes: 15
     steps:

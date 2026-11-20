@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
-# 构建 macOS 通用（universal）安装包：一个 DMG 同时支持 Intel 与 Apple Silicon。
-#
-# 两个 target 各编一遍，用 lipo 把裸二进制合并成通用二进制，再交给
-# package-dmg.sh 打包。后者只认 BINARY_DIR 里的文件，不关心二进制从哪来，
-# 所以不需要任何改动。
+# 默认构建 Intel 与 Apple Silicon 通用安装包；传入 arm64 只构建 Apple Silicon。
+# 用法：build-universal.sh [版本] [universal|arm64]
 set -euo pipefail
 
 VERSION="${1:-0.0.0}"
+MODE="${2-universal}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 UNIVERSAL_DIR="$ROOT/target/universal/release"
+ARM64_TARGET=aarch64-apple-darwin
+ARM64_DIR="$ROOT/target/$ARM64_TARGET/release"
 BINARIES=(codex-plus-plus codex-plus-legacy-shim)
+
+case "$MODE" in
+  universal) targets=(x86_64-apple-darwin "$ARM64_TARGET") ;;
+  arm64) targets=("$ARM64_TARGET") ;;
+  *)
+    echo "error: 未知打包架构 $MODE；可选 universal 或 arm64。" >&2
+    exit 1
+    ;;
+esac
 
 cd "$ROOT"
 
-# UNIVERSAL_SKIP_BUILD=1：两个架构的二进制已由上游并行 job 编好、放进
-# target/<target>/release/（发版流水线这么用），这里只合并和打包。
+# UNIVERSAL_SKIP_BUILD=1：所选架构已由上游编好并放进 target/<target>/release/，
+# 这里直接打包；universal 模式先合并双架构。
 if [ "${UNIVERSAL_SKIP_BUILD:-}" != "1" ]; then
   # 前端产物要由调用方先构建好（vite:build），统一应用会把 dist 嵌进二进制。
-  for target in x86_64-apple-darwin aarch64-apple-darwin; do
+  for target in "${targets[@]}"; do
     if ! rustup target list --installed | grep -qx "$target"; then
       echo "error: 缺少 Rust target $target，请先运行：" >&2
       echo "       rustup target add $target" >&2
@@ -25,10 +34,27 @@ if [ "${UNIVERSAL_SKIP_BUILD:-}" != "1" ]; then
     fi
   done
 
-  for target in x86_64-apple-darwin aarch64-apple-darwin; do
+  for target in "${targets[@]}"; do
     echo "==> 构建 $target" >&2
     cargo build --release --target "$target"
   done
+fi
+
+if [ "$MODE" = arm64 ]; then
+  for bin in "${BINARIES[@]}"; do
+    path="$ARM64_DIR/$bin"
+    if [ ! -x "$path" ]; then
+      echo "error: 缺少构建产物 $path" >&2
+      exit 1
+    fi
+    archs="$(lipo -archs "$path")"
+    if [ "$archs" != arm64 ]; then
+      echo "error: $bin 不是 arm64 二进制（实际架构：$archs）" >&2
+      exit 1
+    fi
+  done
+  BINARY_DIR="$ARM64_DIR" bash "$ROOT/scripts/installer/macos/package-dmg.sh" "$VERSION" arm64
+  exit 0
 fi
 
 rm -rf "$UNIVERSAL_DIR"
@@ -36,7 +62,7 @@ mkdir -p "$UNIVERSAL_DIR"
 
 for bin in "${BINARIES[@]}"; do
   x64="$ROOT/target/x86_64-apple-darwin/release/$bin"
-  arm64="$ROOT/target/aarch64-apple-darwin/release/$bin"
+  arm64="$ARM64_DIR/$bin"
   for path in "$x64" "$arm64"; do
     if [ ! -x "$path" ]; then
       echo "error: 缺少构建产物 $path" >&2

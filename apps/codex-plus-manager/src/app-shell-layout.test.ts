@@ -364,38 +364,16 @@ test("代理设置按归属拆开：本地服务与请求避震移到网关设�
   assert.match(functionSource("App"), /<SharedServiceSettings[\s\S]*?form=\{settingsForm\}/);
 });
 
-test("首页：状态、精选推荐、其他赞助商、常用入口；广告只在首页，首页是侧栏第一项和启动落脚页", () => {
+test("首页展示状态和常用入口，旧推荐路由跳转首页", () => {
   const app = functionSource("App");
-  assert.match(app, /\{route === "home" \? \(\n\s*<HomeScreen\n\s*ads=\{ads\}/);
-  assert.equal((text.match(/<HomeScreen\b/g) ?? []).length, 1);
-  assert.doesNotMatch(text, /SponsorBoard|FloatingSponsor/);
-  assert.doesNotMatch(functionSource("OverviewScreen"), /featuredAds|AdGrid/);
-  // 侧栏主模式第一项；旧「推荐内容」路由跳到首页，设置模式里不再有这一项。
-  assert.match(functionSource("AppSidebar"), /const general: SideEntry\[\] = \[\n\s*\{ key: "home", route: "home", label: t\("首页"\), icon: House, match: \["home", "recommendations"\] \},/);
-  assert.match(app, /target === "recommendations" \? "home" : target/);
-  assert.match(app, /if \(next === "home"\) await refreshAds\(true\);/);
-  assert.doesNotMatch(text.slice(text.indexOf("const settingsModeRoutes"), text.indexOf("const customizeRoutes")), /"recommendations"/);
   const home = functionSource("HomeScreen");
-  // 首页不能全是广告：先是状态，再是精选推荐和其他赞助商，最后常用入口。
-  const order = ['title={t("状态")}', 'title={t("精选推荐")}', 'title={t("更多赞助商")}', 'title={t("常用")}'].map((needle) => home.indexOf(needle));
-  assert.ok(order.every((index, position) => index > 0 && (position === 0 || index > order[position - 1])), String(order));
-  // 只管增强时不显示网关一行，入口也按使用模式过滤。
-  assert.match(home, /\{enhanceOnly \? null : \(/);
+  assert.match(app, /<HomeScreen/);
+  assert.match(app, /target === "recommendations" \? "home" : target/);
+  assert.doesNotMatch(app, /load_ads|refreshAds|sponsorHintClosed/);
+  assert.match(home, /title=\{t\("状态"\)\}/);
+  assert.match(home, /title=\{t\("常用"\)\}/);
+  assert.doesNotMatch(home, /home-hero|home-sponsor|刷新推荐/);
   assert.match(home, /shortcuts\.filter\(\(item\) => routeVisible\(focus, item\.route\)\)/);
-  // 推荐：置顶位不管几个都上横幅、一行均分宽度，不挪去别处；推荐池的赞助商不能上横幅；其他赞助商全部列出不折叠；同一家去重。卡片上不再单独标「推广」，赞助性质由这一节标题旁的说明交代。
-  assert.match(home, /const heroes = topAds;/);
-  assert.match(home, /const rest = pool\.filter\(\(ad\) => ad\.type === "sponsor"\);/);
-  assert.match(home, /gridTemplateColumns: `repeat\(\$\{heroes\.length\}, minmax\(0, 1fr\)\)`/);
-  assert.match(home, /\{rest\.map\(\(ad\) => \(/);
-  assert.doesNotMatch(home, /showAllAds|rest\.slice\(0, 3\)/);
-  assert.match(home, /!topIdentities\.has\(adIdentity\(ad\)\)/);
-  assert.match(home, /\.filter\(\(ad\) => ad\.type === "sponsor"\)/);
-  assert.doesNotMatch(home, /t\("推广"\)/);
-  assert.match(home, /aside=\{<span>\{t\("赞助商推荐：支持 Codex\+\+ 的服务"\)\}<\/span>\}/);
-  // 精选卡片不用 button：旧版 WebKit 里 button 做网格项会被大图撑宽、整页错位。
-  assert.match(home, /<div\n\s*className="home-hero"/);
-  assert.doesNotMatch(home, /<button[^>]*className="home-hero"/);
-  assert.match(functionSource("featuredAds"), /filter\(\(ad\) => !isExpiredAd\(ad\)\)/);
 });
 
 test("Codex 在「经网关」和「直连」之间一键切换：切到网关沿用上次接入设置，切回直连先预览还原", () => {

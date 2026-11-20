@@ -23,6 +23,15 @@ pub(crate) fn runtime_settings(settings: &BackendSettings) -> RuntimeSettings {
     }
 }
 
+/// 旧账号改写器仅作为预测功能的公共模块通道保留，不能随 Fast 设置启用。
+pub(crate) fn legacy_runtime_settings(settings: &BackendSettings) -> RuntimeSettings {
+    RuntimeSettings {
+        enhancements_enabled: settings.enhancements_enabled,
+        codex_app_native_fast_unlock: false,
+        native_fast_local_api_configured: false,
+    }
+}
+
 pub(crate) fn local_api_configured_from_home(home: &Path) -> bool {
     std::fs::read_to_string(home.join("config.toml"))
         .ok()

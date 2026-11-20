@@ -1,11 +1,6 @@
 use serde_json::{Value, json};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-pub const DEFAULT_AD_LIST_URLS: [&str; 3] = [
-    "https://ads.codexpp.cc/ads.json",
-    "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-    "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
-];
+// 旧管理器和桥接接口仍可读取清单，但此版本不配置广告源、不发送 HTTP 请求。
+pub const DEFAULT_AD_LIST_URLS: [&str; 0] = [];
 
 pub fn normalize_ad_payload(payload: Value) -> Value {
     let version = payload.get("version").and_then(Value::as_u64).unwrap_or(1);
@@ -85,30 +80,11 @@ pub fn cache_busted_ad_url(url: &str, version: u128) -> String {
     format!("{url}{separator}v={version}")
 }
 
-pub async fn fetch_ad_list_from_urls<S>(urls: &[S]) -> anyhow::Result<Value>
+pub async fn fetch_ad_list_from_urls<S>(_urls: &[S]) -> anyhow::Result<Value>
 where
     S: AsRef<str>,
 {
-    let client = crate::http_client::proxied_client("CodexPlusPlus")?;
-    let cache_bust = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    let mut last_error = None;
-    for url in urls {
-        let url = cache_busted_ad_url(url.as_ref(), cache_bust);
-        let result = async {
-            let response = client.get(url).send().await?.error_for_status()?;
-            let payload = response.json::<Value>().await?;
-            Ok::<_, anyhow::Error>(normalize_ad_payload(payload))
-        }
-        .await;
-        match result {
-            Ok(payload) => return Ok(payload),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ad list unavailable")))
+    Ok(json!({ "version": 1, "ads": [] }))
 }
 
 #[cfg(test)]

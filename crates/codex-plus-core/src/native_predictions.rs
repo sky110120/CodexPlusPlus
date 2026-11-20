@@ -32,10 +32,9 @@ pub(crate) fn runtime_settings_with_local_api(
     }
 }
 
-/// 任一原生模块补丁开启时才需要模块补丁通道。
+/// 仅输入预测需要旧模块补丁通道；Fast 使用 service_tier 配置。
 pub(crate) fn native_modules_requested(settings: &BackendSettings) -> bool {
-    settings.enhancements_enabled
-        && (settings.codex_app_native_fast_unlock || settings.codex_app_native_predictions)
+    settings.enhancements_enabled && settings.codex_app_native_predictions
 }
 
 #[cfg(test)]
@@ -63,6 +62,8 @@ mod tests {
         );
         settings.codex_app_native_predictions = false;
         settings.codex_app_native_fast_unlock = true;
+        assert!(!native_modules_requested(&settings));
+        settings.codex_app_native_predictions = true;
         assert!(native_modules_requested(&settings));
     }
 }

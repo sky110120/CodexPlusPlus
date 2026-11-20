@@ -84,7 +84,7 @@
     const rail = document.querySelector(codexPlusRailSelector);
     rail?.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailProviderId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}, #${codexPlusRailRemoteId}, #${codexPlusRailWeixinId}, #${codexPlusRailTasksId}`)) return;
+      if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailProviderId}, #${codexPlusRailExtensionsId}, #${codexPlusRailRemoteId}, #${codexPlusRailWeixinId}, #${codexPlusRailTasksId}`)) return;
       if (target?.closest(`[${codexPlusExtensionConstants.extensionAttribute}]`)) return;
       if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
     }, true);
@@ -190,7 +190,7 @@
     const template = codexPlusRailTemplateButton(rail);
     let cursor = anchor;
     // 内置几项先占位，第三方从它们之后开始排（按图标栏上的顺序列）。
-    [codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailSponsorId].forEach((id) => {
+    [codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId].forEach((id) => {
       const node = document.getElementById(id);
       if (node) cursor = node;
     });
@@ -262,25 +262,76 @@
     return document.execCommand("insertText", false, text);
   }
 
+  function codexPlusComposerFastPreferenceEnabled() {
+    return codexPlusBackendSettingsLoaded === true
+      && codexPlusBackendSettings.enhancementsEnabled === true
+      && codexPlusBackendSettings.codexAppNativeFastUnlock === true;
+  }
+
   function refreshCodexPlusComposerActions() {
     const items = codexPlusExtensionItems(codexPlusRegistry.composerActions);
-    const hosts = items.length ? codexPlusComposerActionHosts() : [];
+    const currentGeneration = codexPlusBackendGeneration === window.__codexPlusBackendGeneration;
+    const showFast = currentGeneration && codexPlusComposerFastPreferenceEnabled();
+    const hosts = items.length || showFast ? codexPlusComposerActionHosts() : [];
     const hostFooters = new Set(hosts.map((host) => host.footer));
     document.querySelectorAll("[data-codex-plus-composer-actions]").forEach((node) => {
-      if (!hostFooters.has(node.parentElement)) node.remove();
+      if (!items.length || !hostFooters.has(node.parentElement)) node.remove();
     });
-    if (!items.length) return;
-    if (!document.getElementById("codex-plus-composer-actions-style")) {
-      const style = document.createElement("style");
-      style.id = "codex-plus-composer-actions-style";
-      markCodexPlusExtensionNode(style, "builtin-composer-actions");
+    if (currentGeneration) {
+      const fastFooters = new Set();
+      document.querySelectorAll("[data-codex-plus-composer-fast-preference]").forEach((button) => {
+        const footer = button.parentElement;
+        if (!showFast || !hostFooters.has(footer) || fastFooters.has(footer)
+            || button.__codexPlusGeneration !== codexPlusBackendGeneration) {
+          button.remove();
+        } else {
+          fastFooters.add(footer);
+        }
+      });
+      if (showFast) for (const { footer } of hosts) {
+        if (fastFooters.has(footer)) continue;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "codex-plus-composer-action";
+        button.textContent = "Fast";
+        button.setAttribute("data-codex-plus-composer-fast-preference", "");
+        button.setAttribute("aria-label", "Fast：本机默认速度");
+        button.setAttribute("aria-haspopup", "dialog");
+        button.__codexPlusGeneration = codexPlusBackendGeneration;
+        markCodexPlusExtensionNode(button, "builtin-fast-preference");
+        attachCodexPlusRailTooltip(button, "Fast：本机默认速度", "top");
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration
+              && codexPlusComposerFastPreferenceEnabled()
+              && typeof openCodexPlusFastPreference === "function") {
+            openCodexPlusFastPreference(button);
+          }
+        });
+        const next = [...footer.children].find((node) =>
+          node.hasAttribute?.("data-codex-plus-composer-actions") || node.hasAttribute?.("data-dictation-controls"));
+        footer.insertBefore(button, next || null);
+      }
+    }
+    if (!items.length && !showFast) return;
+    let style = document.getElementById("codex-plus-composer-actions-style");
+    if (style?.dataset.fastPreference !== "true") {
+      if (!style) {
+        style = document.createElement("style");
+        style.id = "codex-plus-composer-actions-style";
+        markCodexPlusExtensionNode(style, "builtin-composer-actions");
+        document.head.append(style);
+      }
+      style.dataset.fastPreference = "true";
       style.textContent = `[data-codex-plus-composer-actions]{display:inline-flex;align-items:center;gap:2px;margin-inline:2px}
         .codex-plus-composer-action{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--color-token-text-primary,currentColor);opacity:.9;cursor:pointer;font-size:15px;line-height:1}
         .codex-plus-composer-action:hover{background:color-mix(in srgb,currentColor 12%,transparent);opacity:1}
         .codex-plus-composer-action:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-        .codex-plus-composer-action svg{width:16px;height:16px}`;
-      document.head.append(style);
+        .codex-plus-composer-action svg{width:16px;height:16px}
+        .codex-plus-composer-action[data-codex-plus-composer-fast-preference]{width:auto;min-width:44px;padding-inline:8px;margin-inline:2px;font-size:12px}`;
     }
+    if (!items.length) return;
     const renderKey = items.map((item) => `${item.id}|${item.label || ""}|${item.icon || ""}`).join("\n");
     for (const { footer, editor } of hosts) {
       let root = [...footer.children].find((node) => node.hasAttribute?.("data-codex-plus-composer-actions"));

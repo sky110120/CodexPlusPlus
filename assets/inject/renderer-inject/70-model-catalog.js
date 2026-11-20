@@ -407,6 +407,13 @@
         changed = true;
       }
     }
+    // 仅补充模型目录明确声明的服务档位，不改原生账号权限或 serviceTierAccess。
+    for (const [key, tiers] of Object.entries(codexPlusModelDeclaredTierMetadata(metadata, descriptor))) {
+      if (JSON.stringify(descriptor[key] ?? null) !== JSON.stringify(tiers)) {
+        descriptor[key] = tiers;
+        changed = true;
+      }
+    }
     return changed;
   }
 
@@ -429,7 +436,62 @@
       // 与此前的原生行为一致。
       ...(modalities ? { inputModalities: modalities } : {}),
       ...(original !== null ? { supportsImageDetailOriginal: original } : {}),
+      ...codexPlusModelDeclaredTierMetadata(metadata),
     };
+  }
+
+  function codexPlusModelTierIsFast(tier) {
+    // 只有缺失 ID 的旧项才按名称识别，不能因为显示名相同而删掉另一档。
+    const identity = codexPlusModelTierIdentity(tier)
+      || (typeof tier?.name === "string" ? tier.name.trim().toLowerCase() : "");
+    return identity === "priority" || identity === "fast";
+  }
+
+  function codexPlusModelTierIdentity(tier) {
+    const value = typeof tier === "string" ? tier : tier?.id;
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+  }
+
+  function codexPlusMergeModelTiers(native, declared, rejectFast) {
+    const merged = [];
+    const positions = new Map();
+    const valuesWithoutId = new Set();
+    const isRecord = (tier) => tier && typeof tier === "object" && !Array.isArray(tier);
+    for (const tier of [...native, ...declared]) {
+      if (rejectFast && codexPlusModelTierIsFast(tier)) continue;
+      const identity = codexPlusModelTierIdentity(tier);
+      if (!identity) {
+        const value = JSON.stringify(tier);
+        if (valuesWithoutId.has(value)) continue;
+        valuesWithoutId.add(value);
+      }
+      const position = positions.get(identity);
+      if (position === undefined) {
+        if (identity) positions.set(identity, merged.length);
+        merged.push(isRecord(tier) ? { ...tier } : tier);
+      } else if (isRecord(tier)) {
+        const previous = merged[position];
+        merged[position] = isRecord(previous) ? { ...previous, ...tier } : { ...tier };
+      }
+    }
+    return merged;
+  }
+
+  // 非空声明按 ID 更新档位；只有显式拒绝 Fast 时才过滤已有的 Fast 档位。
+  function codexPlusModelDeclaredTierMetadata(metadata, descriptor) {
+    const result = {};
+    const rejectFast = metadata?.prioritySupportOverride === false;
+    for (const [key, alias] of [
+      ["serviceTiers", "service_tiers"],
+      ["additionalSpeedTiers", "additional_speed_tiers"],
+    ]) {
+      const declared = [metadata?.[key], metadata?.[alias]]
+        .find((value) => Array.isArray(value) && value.length > 0);
+      const native = descriptor?.[key];
+      if (!declared && !(rejectFast && Array.isArray(native))) continue;
+      result[key] = codexPlusMergeModelTiers(Array.isArray(native) ? native : [], declared || [], rejectFast);
+    }
+    return result;
   }
 
   // 元数据里声明的输入模态（camelCase / snake_case 都认），没声明返回 null。

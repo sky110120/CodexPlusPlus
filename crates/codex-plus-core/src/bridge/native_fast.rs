@@ -50,12 +50,12 @@ struct ModuleSettings {
 impl ModuleSettings {
     fn load(settings: &crate::settings::BackendSettings) -> Self {
         Self {
-            fast: crate::native_fast::runtime_settings(settings),
+            fast: crate::native_fast::legacy_runtime_settings(settings),
             predictions: crate::native_predictions::runtime_settings(settings),
         }
     }
 
-    /// 只拦截开启的改写器需要的块；仅开 Fast 时保持原来只拦截 app-initial。
+    /// 只选择已启用的改写器需要的块。速度偏好按钮自身不使用模块改写器。
     fn prefixes(&self) -> Vec<&'static str> {
         let mut prefixes = Vec::new();
         let groups = [
@@ -98,7 +98,7 @@ pub(super) async fn install(
     websocket_url: &str,
     generation: BridgeGeneration,
 ) -> anyhow::Result<()> {
-    // 原生 Fast / 输入预测被拓展顶替时按「关」处理，交给拓展自己的 preload 脚本。
+    // 输入预测被拓展顶替时按「关」处理；Fast 不启用旧账号改写器。
     let settings = crate::builtin_takeover::load_effective_settings()?;
     if !crate::native_predictions::native_modules_requested(&settings) {
         return Ok(());
@@ -754,6 +754,30 @@ mod tests {
                 native_predictions_local_api_configured: local_api,
             },
         }
+    }
+
+    #[test]
+    fn configured_fast_never_enables_the_legacy_rewriter() {
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.enhancements_enabled = true;
+        settings.codex_app_native_fast_unlock = true;
+        let fast_only = ModuleSettings::load(&settings);
+        assert!(!fast_only.fast.codex_app_native_fast_unlock);
+        assert!(fast_only.prefixes().is_empty());
+
+        settings.codex_app_native_predictions = true;
+        let both = ModuleSettings::load(&settings);
+        assert!(!both.fast.codex_app_native_fast_unlock);
+        assert_eq!(both.prefixes(), PREDICTIONS_PREFIXES);
+        let script = bootstrap_script(both);
+        let (_, update) = script
+            .rsplit_once("\n;window.__codexPlusNativeFastUnlock.runtime.update(")
+            .unwrap();
+        let (payload, _) = update.split_once(");\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(payload).unwrap()["codexAppNativeFastUnlock"],
+            false
+        );
     }
 
     #[tokio::test]

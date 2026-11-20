@@ -760,7 +760,8 @@ setupPlatformPicker();
 setupLanguageSwitcher();
 setupHeroNetwork();
 setupReveal();
-setupSponsors();
+// 赞助商展示暂停；保留实现，避免启动时请求远端广告清单。
+// setupSponsors();
 updateRelease();
 updateRepositoryStats();
 

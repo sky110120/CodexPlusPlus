@@ -1,11 +1,7 @@
 name: Release assets
 
-# 发版入口是推送 v* tag（本地用 `node scripts/release.mjs <版本号>`）：
-#   prepare  校验版本号文件与 tag 一致，从 CHANGELOG.md 截取说明，建草稿 Release
-#   构建     Windows / macOS 并行构建，附件传到草稿
-#   收尾     生成 SHA256SUMS.txt 与 latest.json，附件齐了才公开发布
-# 草稿期间用户看不到这一版，某个平台失败也不会让「检查更新」读到缺附件的 Latest。
-# 手动在网页上发布 Release 不再触发构建；补跑某个平台用 workflow_dispatch。
+# tag 或手动触发时只构建 Apple Silicon DMG 并上传 workflow artifact。
+# 原发布链保留但停用：不创建 Release、不上传附件或生成更新索引。
 
 on:
   push:
@@ -14,28 +10,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在的版本标签，例如 v1.7.1"
+        description: "构建使用的已有版本标签，例如 v1.7.1"
         required: true
         type: string
-      platform:
-        description: "需要重新构建的平台"
-        default: all
-        type: choice
-        options:
-          - all
-          - windows
-          - macos
-          - linux
-      publish:
-        description: "Release 还是草稿时，附件与更新元数据齐备后公开发布"
-        default: false
-        type: boolean
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
-  contents: write
+  contents: read
 
 # 同一个 tag 的两轮不要并发上传附件。
 concurrency:
@@ -43,8 +26,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  arm64-artifact:
+    name: Build Apple Silicon artifact
+    uses: ./.github/workflows/pr-build.yml
+    with:
+      build_dmg: true
+      checkout_ref: ${{ inputs.tag || github.sha }}
+
   prepare:
     name: Prepare draft Release
+    # 暂停整条发布链，避免缺少其他平台附件时创建 Release 或更新索引。
+    # Apple Silicon artifact 由上面的可复用工作流构建。
+    if: ${{ false }}
     runs-on: ubuntu-latest
     outputs:
       is_draft: ${{ steps.release.outputs.is_draft }}

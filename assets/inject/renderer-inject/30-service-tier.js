@@ -1618,8 +1618,11 @@
 
   async function loadBackendSettingsState(timeoutMs = 0) {
     const seq = codexPlusBackendSettingsSeq;
+    const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
+    const fastRevision = fastWrite?.revision;
+    const fastWasPending = fastWrite?.pending;
     try {
-      const settings = await (timeoutMs > 0
+      let settings = await (timeoutMs > 0
         ? readCodexAppServerPreparation("/settings/get", {}, timeoutMs)
         : postJson("/settings/get", {}));
       if (!settings || typeof settings !== "object" || (!("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
@@ -1627,6 +1630,11 @@
       }
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
+      }
+      if (fastWasPending || fastRevision !== fastWrite?.revision) {
+        // 交叠的读取可能落在写入之前，不能覆盖 Fast 写入确认。
+        const { codexAppNativeFastUnlock: _staleFastPreference, ...otherSettings } = settings;
+        settings = otherSettings;
       }
       const previousSettings = codexPlusBackendSettings;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
@@ -1639,7 +1647,8 @@
       }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
         enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+        // 清退旧页面中的补丁；真实设置现在只控制本机默认速度入口。
+        codexAppNativeFastUnlock: false,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
       // 原生输入预测只接收自己的开关和本机 API 布尔投影。

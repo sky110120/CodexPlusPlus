@@ -1,22 +1,11 @@
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::thread;
-
 use codex_plus_core::ads::{
-    DEFAULT_AD_LIST_URLS, cache_busted_ad_url, fetch_ad_list_from_urls, normalize_ad_payload,
+    DEFAULT_AD_LIST_URLS, cache_busted_ad_url, fetch_ad_list, fetch_ad_list_from_urls, normalize_ad_payload,
 };
 use serde_json::json;
 
 #[test]
-fn default_ad_urls_prefer_cloudflare_and_keep_github_fallbacks() {
-    assert_eq!(
-        DEFAULT_AD_LIST_URLS,
-        [
-            "https://ads.codexpp.cc/ads.json",
-            "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-            "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
-        ]
-    );
+fn ad_sources_are_disabled() {
+    assert!(DEFAULT_AD_LIST_URLS.is_empty());
 }
 
 #[test]
@@ -195,60 +184,14 @@ fn ad_images_come_only_from_the_remote_list() {
 }
 
 #[tokio::test]
-async fn fetch_ad_list_tries_backup_url_when_primary_fails() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let thread = thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "client closed before sending complete headers");
-                request.extend_from_slice(&buffer[..read]);
-                assert!(request.len() <= 16 * 1024, "request headers are too large");
-            }
-            let request = String::from_utf8_lossy(&request);
-            if request.starts_with("GET /primary.json?") {
-                stream
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .unwrap();
-            } else {
-                assert!(request.starts_with("GET /backup.json?"), "{request}");
-                let body = json!({
-                    "version": 1,
-                    "ads": [{
-                        "id": "backup-ad",
-                        "type": "normal",
-                        "title": "Backup",
-                        "description": "Loaded from backup",
-                        "url": "https://example.test",
-                        "highlights": []
-                    }]
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-            stream.flush().unwrap();
+async fn old_ad_clients_get_an_empty_list_without_reading_any_source() {
+    struct UnreadableUrl;
+    impl AsRef<str> for UnreadableUrl {
+        fn as_ref(&self) -> &str {
+            panic!("disabled ad transport must not inspect or contact any source")
         }
-    });
-
-    let payload = fetch_ad_list_from_urls(&[
-        format!("http://127.0.0.1:{port}/primary.json"),
-        format!("http://127.0.0.1:{port}/backup.json"),
-    ])
-    .await
-    .unwrap();
-    thread.join().unwrap();
-
-    let ads = payload["ads"].as_array().unwrap();
-    assert!(ads.iter().any(|ad| ad["id"] == json!("backup-ad")));
+    }
+    let empty = json!({"version": 1, "ads": []});
+    assert_eq!(fetch_ad_list().await.unwrap(), empty);
+    assert_eq!(fetch_ad_list_from_urls(&[UnreadableUrl]).await.unwrap(), empty);
 }

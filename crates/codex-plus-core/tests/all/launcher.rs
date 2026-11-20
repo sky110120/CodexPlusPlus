@@ -1281,7 +1281,7 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
 #[tokio::test]
 async fn native_module_reload_runs_only_after_successful_opt_in_launch_injection() {
     let _state = crate::common::IsolatedTestState::new();
-    // Fast 与输入预测共用一次启动重载；任一开启都要重载，两者都关时不碰页面。
+    // 仅输入预测需要模块补丁重载；Fast 使用 service_tier 配置。
     for (enhancements, native_fast, native_predictions, injection_ok) in [
         (true, true, false, true),
         (true, false, false, true),
@@ -1323,7 +1323,7 @@ async fn native_module_reload_runs_only_after_successful_opt_in_launch_injection
         let reload = events.iter().position(|event| event == "native-modules:9229");
         assert_eq!(
             reload.is_some(),
-            enhancements && (native_fast || native_predictions) && injection_ok
+            enhancements && native_predictions && injection_ok
         );
         if let Some(reload) = reload {
             let injection = events

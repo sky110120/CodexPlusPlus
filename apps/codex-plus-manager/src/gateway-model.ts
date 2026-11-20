@@ -1356,17 +1356,15 @@ function toGatewayPreset(preset: ProviderPreset, section: PresetSection): Gatewa
 }
 
 /**
- * 「添加供应商」里的全部预设：赞助商单独一组放在最前（来自远端推荐清单，见 sponsorPresets），
- * 然后是厂商（官方 / 国内官方）、中转、本机。
+ * 「添加供应商」里的普通预设：厂商、中转、本机。
  */
-export function gatewayPresets(sponsors: ProviderPreset[] = []): GatewayPreset[] {
-  const sponsorIds = new Set(sponsors.map((preset) => preset.id));
-  const shared = PRESETS.filter((preset) => !sponsorIds.has(preset.id)).map((preset) =>
+export function gatewayPresets(): GatewayPreset[] {
+  // 不再从广告数据注入供应商。
+  const shared = PRESETS.map((preset) =>
     toGatewayPreset(preset, preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay"));
   const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
   const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
   return [
-    ...sponsors.map((preset) => toGatewayPreset(preset, "sponsor")),
     ...vendors,
     ...relays,
     ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local"),

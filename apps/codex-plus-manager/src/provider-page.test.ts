@@ -243,10 +243,10 @@ describe("供应商页（43 分片）", () => {
     assert.match(renderer, /\{ id: codexPlusRailProviderId, label: "供应商", iconMarkup: icons\.provider, withStatus: false, onActivate: openCodexPlusProviderPage \}/);
     assert.match(renderer, /\[codexPlusRailProviderId, "provider"\],/);
     assert.match(renderer, /if \(tab === codexPlusProviderTab\) return "provider";/);
-    assert.match(renderer, /\[codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailSponsorId, codexPlusRailPluginMarketId\]\.forEach/);
+    assert.match(renderer, /\[codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailPluginMarketId\]\.forEach/);
     // 两处图标栏点击监听都要排除新入口，否则点它会把刚打开的页面关掉。
-    assert.equal(renderer.split("#${codexPlusRailNavId}, #${codexPlusRailProviderId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}").length - 1, 2);
-    assert.match(renderer, /\[codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailSponsorId\]\.forEach\(\(id\) => \{/);
+    assert.equal(renderer.split("#${codexPlusRailNavId}, #${codexPlusRailProviderId}, #${codexPlusRailExtensionsId}, #${codexPlusRailRemoteId}").length - 1, 2);
+    assert.match(renderer, /\[codexPlusRailNavId, codexPlusRailProviderId, codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId\]\.forEach\(\(id\) => \{/);
     assert.match(renderer, /#\$\{codexPlusRailProviderId\} > button/);
     assert.match(pageSource, /data-codex-plus-active-tab="\$\{codexPlusProviderTab\}"/);
     assert.match(pageSource, /window\.__codexPlusExtensionPageCleanup = \(\) => \{/);

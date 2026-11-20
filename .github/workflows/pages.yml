@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "site/**"
+      - "apps/codex-plus-manager/src/**"
+      - "apps/codex-plus-manager/web-preview/**"
+      - "apps/codex-plus-manager/package.json"
+      - "apps/codex-plus-manager/package-lock.json"
       - "CHANGELOG.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -32,6 +36,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
+
+      - name: Build manager web preview
+        working-directory: apps/codex-plus-manager
+        run: |
+          npm ci
+          npm run vite:build -- --config web-preview/vite.config.ts
 
       - name: Refresh site data
         run: node site/scripts/build-data.mjs

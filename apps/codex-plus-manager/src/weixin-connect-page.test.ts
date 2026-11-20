@@ -123,7 +123,7 @@ test("Codex 左侧图标栏的「微信连接」入口：紧跟远程控制，�
   // 两处图标栏点击监听都要排除新入口，否则点它会把刚打开的页面关掉。
   assert.equal(renderer.split("#${codexPlusRailRemoteId}, #${codexPlusRailWeixinId}, #${codexPlusRailTasksId}`)) return;").length - 1, 2);
   assert.match(renderer, /#\$\{codexPlusRailWeixinId\} > button/, "扫描调度排除自己的节点");
-  assert.match(renderer, /codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId, codexPlusRailSponsorId\]\.forEach\(\(id\) => \{/, "第三方入口排在内置之后");
+  assert.match(renderer, /codexPlusRailRemoteId, codexPlusRailWeixinId, codexPlusRailTasksId, codexPlusRailExtensionsId\]\.forEach\(\(id\) => \{/, "第三方入口排在内置之后");
   assert.match(source, /data-codex-plus-active-tab="\$\{codexPlusWeixinConnectTab\}"/);
   assert.match(source, /markCodexPlusExtensionNode\(overlay, "builtin-weixin-connect"\)/);
   assert.match(source, /setCodexPlusSidebarNavActive\(true, "weixin"\)/);

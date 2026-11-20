@@ -44,8 +44,8 @@ test("in-app settings expose native Fast unlock without the retired service tier
   const catalog = JSON.parse(readFileSync(new URL("../../../crates/codex-plus-core/assets/enhancement-settings.json", import.meta.url), "utf8"));
   const nativeFast = catalog.items.find((item: { key: string }) => item.key === "codexAppNativeFastUnlock");
   assert.ok(nativeFast?.surfaces.includes("codex"));
-  assert.equal(nativeFast.title, "原生 Fast 强制解锁");
-  assert.match(nativeFast.description, /纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。/);
+  assert.equal(nativeFast.title, "Fast 速度按钮");
+  assert.match(nativeFast.description, /输入框下方的 Fast 按钮可设置本机 Codex 默认速度。实际档位与费用取决于模型和供应商；开启此选项本身不会更改速度。/);
   assert.match(source, /nativeFastUnlock: "codexAppNativeFastUnlock"/);
   assert.ok(!catalog.items.some((item: { key: string }) => /ServiceTier/.test(item.key)));
   assert.doesNotMatch(settingsPage, /data-codex-plus-setting="serviceTierControls"/);
@@ -69,6 +69,7 @@ test("backend loads and saves publish only native Fast policy flags and tolerate
       codexPlusBackendSettings: { enhancementsEnabled: true },
       codexPlusBackendSettingsLoaded: false,
       codexPlusBackendSettingsSeq: 0,
+      codexPlusFastPreferenceWrite: { pending: false, revision: 0 },
       postJson: async () => response,
       refreshCodexPlusBackendToggles: () => {},
     });
@@ -82,9 +83,9 @@ test("backend loads and saves publish only native Fast policy flags and tolerate
     response = { ...response, enhancementsEnabled: false, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: false };
     await context.setBackendSetting("codexAppNativeFastUnlock", false);
     assert.deepEqual(publications, surface === "helper" ? [
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true },
-      { enhancementsEnabled: true, codexAppNativeFastUnlock: true, nativeFastLocalApiConfigured: true },
-      { enhancementsEnabled: false, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: false },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: true },
+      { enhancementsEnabled: true, codexAppNativeFastUnlock: false, nativeFastLocalApiConfigured: true },
     ] : []);
   }
 });

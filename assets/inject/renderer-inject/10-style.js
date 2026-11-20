@@ -574,7 +574,7 @@
       .codex-plus-plugin-empty { padding: 40px 16px; text-align: center; color: var(--codex-plus-text-secondary); }
       @media (max-width: 600px) { .codex-plus-plugin-card { flex-direction: column; gap: 10px; } .codex-plus-plugin-install { align-self: flex-end; } }
       /*
-       * 新版导航图标栏里的 Codex++ / 拓展 / 推荐内容入口：原生按钮只放图标，
+       * 新版导航图标栏里的 Codex++ 入口：原生按钮只放图标，
        * 这里对齐它的尺寸。
        *
        * 用 [data-codex-plus-rail] 而不是逐个列 id——早先按 id 写，加第三个入口时
@@ -1138,7 +1138,6 @@
       .codex-plus-row:first-child { border-top: 0; }
       .codex-plus-row-title { font-weight: 550; line-height: 1.35; }
       .codex-plus-row-description { margin-top: 2px; color: #a1a1aa; font-size: 13px; line-height: 1.4; }
-      .codex-plus-row-description[data-codex-plus-native-fast-status][data-failed="true"] { color: #f59e0b; }
       .codex-plus-model-compat-warning { margin-top: 6px; color: #fbbf24; font-size: 13px; line-height: 1.45; }
       .codex-plus-toggle {
         width: 42px;
@@ -1223,77 +1222,6 @@
       .codex-plus-backend-label[data-status="ok"] { color: #34d399; }
       .codex-plus-backend-label[data-status="failed"] { color: #f87171; }
       .codex-plus-backend-label[data-status="degraded"] { color: #fbbf24; }
-      .codex-plus-sponsor-text { color: #d1d5db; font-size: 13px; line-height: 1.55; margin: 4px 0 12px; }
-      /*
-       * 推荐内容：网格卡片。
-       *
-       * 一张卡 = 图标 + 名称/简介 + 右上箭头 + 底部优惠条。用 auto-fill + minmax
-       * 让列数随宽度自适应（宽屏 4 列、窄屏递减），卡片等高对齐。
-       */
-      .codex-plus-ad-list {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
-        gap: 12px;
-      }
-      .codex-plus-ad-card {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        border: 1px solid rgba(255,255,255,.08);
-        border-radius: 12px;
-        background: rgba(255,255,255,.02);
-        color: inherit;
-        text-decoration: none;
-        padding: 16px;
-        transition: background .12s ease, border-color .12s ease;
-      }
-      .codex-plus-ad-card:hover,
-      .codex-plus-ad-card:focus-visible {
-        border-color: rgba(255,255,255,.18);
-        background: rgba(255,255,255,.05);
-        outline: none;
-      }
-      .codex-plus-ad-main { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
-      .codex-plus-ad-icon {
-        flex: 0 0 auto;
-        width: 36px;
-        height: 36px;
-        border-radius: 9px;
-        object-fit: contain;
-        background: rgba(255,255,255,.06);
-      }
-      /* 清单没给图时用名称首字占位，比空一块整齐。 */
-      .codex-plus-ad-icon-fallback {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        color: #f3f4f6;
-        font-size: 15px;
-        font-weight: 600;
-      }
-      .codex-plus-ad-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-      .codex-plus-ad-title { overflow: hidden; color: #f8fafc; font-size: 14px; font-weight: 600; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
-      /* 简介不再压成一行：卡片按内容撑高，最多 3 行，超出才省略。
-         nowrap 会让「提供 Claude 与 ...」这类较长简介只露前几个字。 */
-      .codex-plus-ad-description { display: -webkit-box; overflow: hidden; color: #a1a1aa; font-size: 13px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
-      .codex-plus-ad-arrow { flex: 0 0 auto; width: 14px; height: 14px; margin-top: 2px; color: #71717a; }
-      .codex-plus-ad-arrow svg { width: 14px; height: 14px; display: block; }
-      .codex-plus-ad-card:hover .codex-plus-ad-arrow,
-      .codex-plus-ad-card:focus-visible .codex-plus-ad-arrow { color: #f3f4f6; }
-      /* 底部优惠条：撑满卡片宽度，长文本截断。 */
-      .codex-plus-ad-promo {
-        display: block;
-        overflow: hidden;
-        border-radius: 8px;
-        background: rgba(255,255,255,.05);
-        color: #f5a97f;
-        font-size: 13px;
-        line-height: 1.35;
-        padding: 7px 10px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .codex-plus-ad-empty { border: 1px dashed rgba(255,255,255,.16); border-radius: 12px; color: #9ca3af; font-size: 13px; padding: 12px; text-align: center; }
       /*
        * 注入面板的语义色板：前景/背景必须取自同一套 token，且都要能被主题切换带走。
        *
@@ -1387,7 +1315,6 @@
       .codex-plus-about,
       .codex-plus-backend-label,
       .codex-plus-form-message,
-      .codex-plus-sponsor-text { color: var(--codex-plus-text-secondary); }
       .codex-delete-confirm-actions button,
       .codex-plus-action-button,
       .codex-plus-issue-button {
@@ -1479,28 +1406,6 @@
       .codex-plus-backend-indicator[data-status="checking"] { background: var(--codex-plus-warning); }
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="degraded"],
       .codex-plus-backend-indicator[data-status="degraded"] { background: var(--codex-plus-warning); }
-      .codex-plus-ad-card { border-color: var(--codex-plus-border-subtle); background: var(--codex-plus-bg-secondary); }
-      .codex-plus-ad-card:hover,
-      .codex-plus-ad-card:focus-visible { border-color: var(--codex-plus-border); background: var(--codex-plus-bg-hover); }
-      .codex-plus-ad-icon { background: var(--codex-plus-bg-hover); }
-      .codex-plus-ad-icon-fallback { color: var(--codex-plus-text); }
-      .codex-plus-ad-title { color: var(--codex-plus-text); }
-      .codex-plus-ad-description { color: var(--codex-plus-text-secondary); }
-      .codex-plus-ad-arrow { color: var(--codex-plus-text-tertiary); }
-      .codex-plus-ad-card:hover .codex-plus-ad-arrow,
-      .codex-plus-ad-card:focus-visible .codex-plus-ad-arrow { color: var(--codex-plus-text); }
-      /*
-       * 优惠条：暗底配橙色文字。
-       *
-       * 底色不能用 --codex-plus-danger-bg —— 它在当前主题下解析成浅粉（偏浅色主题
-       * 的值），压在深色卡片上非常刺眼。改成用警告色按低透明度混出来，深浅主题
-       * 都成立，也和原生「需要注意」的语义色同源。
-       */
-      .codex-plus-ad-promo {
-        background: color-mix(in srgb, var(--codex-plus-warning) 14%, transparent);
-        color: var(--codex-plus-warning);
-      }
-      .codex-plus-ad-empty { border-color: var(--codex-plus-border); color: var(--codex-plus-text-tertiary); }
       .codex-plus-form-message[data-status="ok"], .codex-plus-backend-label[data-status="ok"] { color: var(--codex-plus-success); }
       .codex-plus-form-message[data-status="failed"], .codex-plus-backend-label[data-status="failed"] { color: var(--codex-plus-danger); }
       .codex-plus-backend-label[data-status="degraded"] { color: var(--codex-plus-warning); }
@@ -2002,13 +1907,13 @@
         .codex-plus-task-sidebar :is(.codex-plus-task-sidebar-title, .codex-plus-task-sidebar-section, .codex-plus-task-sidebar-tip, .codex-plus-task-nav-label, .codex-plus-task-nav-count) { display: none; }
         .codex-plus-task-nav { justify-content: center; }
       }
-      /* 拓展与推荐内容使用原生插件页面的导航、标题和轻量列表布局。 */
-      .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) {
+      /* 拓展使用原生插件页面的导航、标题和轻量列表布局。 */
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] {
         background: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary)) !important;
         container: codex-plus-discovery-page / inline-size;
       }
-      .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) > .codex-plus-modal-header { display: none; }
-      .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) .codex-plus-modal-body {
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] > .codex-plus-modal-header { display: none; }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-modal-body {
         box-sizing: border-box;
         padding: 32px 32px 56px;
       }
@@ -2290,10 +2195,8 @@
         font-weight: 550;
         line-height: 24px;
       }
-      .codex-plus-extensions-grid,
-      .codex-plus-discovery .codex-plus-ad-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 32px; }
-      .codex-plus-extensions-grid > .codex-plus-extensions-detail-empty,
-      .codex-plus-discovery .codex-plus-ad-empty { grid-column: 1 / -1; }
+      .codex-plus-extensions-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 32px; }
+      .codex-plus-extensions-grid > .codex-plus-extensions-detail-empty { grid-column: 1 / -1; }
       .codex-plus-extension-card {
         display: flex;
         align-items: center;
@@ -2497,28 +2400,6 @@
       .codex-plus-discovery button:focus-visible,
       .codex-plus-discovery a:focus-visible,
       .codex-plus-extensions-nav-entry:focus-visible { outline: 2px solid var(--codex-plus-switch-on, #3485ff); outline-offset: 3px; }
-      .codex-plus-discovery .codex-plus-ad-card {
-        flex-direction: row;
-        align-items: center;
-        gap: 16px;
-        min-height: 72px;
-        min-width: 0;
-        box-sizing: border-box;
-        border: 0;
-        border-radius: 8px;
-        padding: 8px 0;
-        background: transparent;
-      }
-      .codex-plus-discovery .codex-plus-ad-card:hover,
-      .codex-plus-discovery .codex-plus-ad-card:focus-visible { background: transparent; }
-      .codex-plus-discovery .codex-plus-ad-main { flex: 1 1 auto; align-items: center; gap: 12px; }
-      .codex-plus-discovery .codex-plus-ad-icon { flex: 0 0 36px; border: 1px solid var(--codex-plus-border); border-radius: 10px; background: transparent; box-sizing: border-box; }
-      .codex-plus-discovery .codex-plus-ad-text { gap: 4px; }
-      .codex-plus-discovery .codex-plus-ad-title { font-size: 14px; font-weight: 500; line-height: 20px; }
-      .codex-plus-discovery .codex-plus-ad-description { font-size: 13px; line-height: 18px; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
-      .codex-plus-discovery .codex-plus-ad-promo { border-radius: 0; padding: 0; background: transparent; color: var(--codex-plus-text-secondary); font-size: 12px; line-height: 16px; white-space: normal; overflow-wrap: anywhere; }
-      .codex-plus-discovery .codex-plus-ad-arrow { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; margin: 0; color: var(--codex-plus-text-secondary); }
-      .codex-plus-discovery .codex-plus-ad-arrow svg { width: 16px; height: 16px; }
       @container codex-plus-discovery-page (max-width: 900px) {
         .codex-plus-discovery-header { flex-wrap: wrap; gap: 20px; }
         .codex-plus-discovery-toolbar { flex-basis: 100%; }
@@ -2527,12 +2408,11 @@
         .codex-plus-extensions-detail-columns { grid-template-columns: minmax(0, 1fr); }
       }
       @container codex-plus-discovery (max-width: 600px) {
-        .codex-plus-extensions-grid,
-        .codex-plus-discovery .codex-plus-ad-list { grid-template-columns: minmax(0, 1fr); }
+        .codex-plus-extensions-grid { grid-template-columns: minmax(0, 1fr); }
       }
       @container codex-plus-discovery-page (max-width: 700px) {
         .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav { width: 180px; flex-basis: 180px; }
-        .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) .codex-plus-modal-body { padding: 24px 20px 40px; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-modal-body { padding: 24px 20px 40px; }
       }
       @container codex-plus-discovery-page (max-width: 480px) {
         .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav { width: 56px; flex-basis: 56px; }
@@ -2546,7 +2426,7 @@
         .codex-plus-extensions-nav-entry .codex-plus-extensions-item-state { display: none; }
         .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-group-head,
         .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-empty { display: none; }
-        .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) .codex-plus-modal-body { padding: 24px 16px 40px; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-modal-body { padding: 24px 16px 40px; }
       }
     `;
       // 32 位 FNV-1a，只用来区分样式表内容。

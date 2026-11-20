@@ -226,7 +226,7 @@
         return;
       }
       case "openBrowser":
-        // Electron 里 <a target=_blank> 不会交给系统浏览器，统一走 window.open（同 40 分片的推荐卡片）。
+        // Electron 里 <a target=_blank> 不会交给系统浏览器，统一走 window.open。
         if (state.data?.url) window.open(state.data.url, "_blank", "noopener,noreferrer");
         return;
       case "startPairing":

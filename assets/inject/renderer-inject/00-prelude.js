@@ -402,11 +402,10 @@
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
   const codexPlusPageClass = "codex-plus-page-overlay";
   // 新版 Codex 在最左侧多出一条导航图标栏（navigation rail）。
-  // 三个入口分别挂进去：Codex++ 主页、「拓展」（原用户脚本）和「推荐内容」。
-  // 三者各自是一个独立页面，不再作为弹窗里的二级 tab。
+  // 内置入口各自打开独立页面，不再作为弹窗里的二级 tab。
   const codexPlusRailNavId = "codex-plus-rail-nav";
   const codexPlusRailExtensionsId = "codex-plus-rail-extensions";
-  const codexPlusRailSponsorId = "codex-plus-rail-sponsor";
+  const retiredCodexPlusSponsorRailId = "codex-plus-rail-sponsor";
   // 「供应商」：在 Codex 里直接增删改切 Codex 的供应商（43-provider-page.js）。
   const codexPlusRailProviderId = "codex-plus-rail-provider";
   // 「远程控制」：在 Codex 里开关远程控制、给手机配对、管理设备（45-remote-control-page.js）。
@@ -421,7 +420,6 @@
   const codexPlusRailSelector = "nav[data-app-navigation-rail]";
   const codexPlusRailDestinationSelector = "[data-sidebar-destination]";
   const codexPlusExtensionsTab = "extensions";
-  const codexPlusSponsorTab = "sponsor";
   const codexPlusProviderTab = "provider";
   const codexPlusRemoteControlTab = "remote-control";
   const codexPlusWeixinConnectTab = "weixin-connect";

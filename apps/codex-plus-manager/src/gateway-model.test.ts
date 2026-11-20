@@ -57,7 +57,6 @@ import {
   type GatewayAgentView,
   type GatewayPayload,
 } from "./gateway-model.ts";
-import type { ProviderPreset } from "./presets.ts";
 
 const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
 const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
@@ -704,23 +703,13 @@ test("普通供应商的价格与代理在详情里编辑，官方账号可在�
   assert.match(extras, /placeholder="http:\/\/127\.0\.0\.1:7890"/);
 });
 
-test("赞助商只来自远端推荐清单，单独一组放在「添加供应商」最前面", () => {
-  // 没拉到清单时没有赞助商，内置预设里也不再有赞助商。
-  assert.ok(!gatewayPresets().some((preset) => preset.section === "sponsor"));
-  for (const gone of ["jojocode-max", "runapi", "apikeyfun", "cccccc-api", "tokenmy", "vegaapi", "pateway", "therouter", "shengsuanyun", "ccsub"]) {
-    assert.ok(!gatewayPresets().some((preset) => preset.key === gone), gone);
-  }
-  const sponsor = (id: string, baseUrl: string): ProviderPreset => ({ id, name: id, category: "aggregator", baseUrl, protocol: "responses", model: "" });
-  // 与内置预设同 id 的赞助商只出现一次，放在赞助商组。
-  const presets = gatewayPresets([sponsor("vegaapi", "https://vegaapi.com/v1"), sponsor("openrouter", "https://openrouter.ai/api/v1")]);
-  assert.deepEqual(presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key), ["vegaapi", "openrouter"]);
-  assert.equal(presets[0].section, "sponsor");
-  assert.equal(presets.filter((preset) => preset.key === "openrouter").length, 1);
-  const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
-  assert.ok(relays.includes("siliconflow") && relays.includes("opencode-go"));
+test("供应商目录不包含广告预设", () => {
+  const presets = gatewayPresets();
+  assert.ok(!presets.some((preset) => preset.section === "sponsor"));
+  assert.ok(presets.some((preset) => preset.key === "openrouter"));
   const catalog = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
-  assert.ok(catalog.indexOf('key: "sponsor"') < catalog.indexOf('key: "subscription"'));
-  assert.match(catalog, /gatewayPresets\(sponsors\)/);
+  assert.doesNotMatch(catalog, /key: "sponsor"/);
+  assert.match(catalog, /gatewayPresets\(\)/);
 });
 
 test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当成不指定", () => {

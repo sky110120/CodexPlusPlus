@@ -26,6 +26,8 @@ concurrency:
 jobs:
   windows:
     name: Windows release deps
+    # 暂停 Windows 构建，保留原作业供日后恢复。
+    if: ${{ false }}
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -62,7 +64,8 @@ jobs:
     runs-on: macos-15
     strategy:
       matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+        # Intel: x86_64-apple-darwin
+        target: [aarch64-apple-darwin]
     env:
       # 与 release-assets.yml 保持一致：rust-cache 的环境哈希和 C 依赖的编译参数都要对得上。
       MACOSX_DEPLOYMENT_TARGET: "12.0"
