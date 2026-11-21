@@ -352,12 +352,12 @@ test("standalone quota unlock lives in its own group and stays editable when enh
     && node.arguments[0]?.getText(app) === "managerStandaloneGroup().id"));
 });
 
-test("Fast speed button is the only Fast enhancement toggle and explains model and provider limits", () => {
+test("native Fast unlock is the only Fast enhancement toggle and keeps the provider support notice", () => {
   const nativeFast = enhancementItem("codexAppNativeFastUnlock");
   assert.equal(nativeFast.control, "bool");
-  assert.equal(nativeFast.title, "Fast 速度按钮");
+  assert.equal(nativeFast.title, "原生 Fast 强制解锁");
   assert.notEqual(nativeFast.masterGated, false, "原生 Fast 受增强总开关控制");
-  assert.match(nativeFast.description, /输入框下方的 Fast 按钮.*本机 Codex 默认速度.*实际档位与费用.*开启此选项本身不会更改速度/);
+  assert.match(nativeFast.description, /纯 API Key.*原生 Fast.*供应商决定/);
   assert.notEqual(enhancementGroup(nativeFast.group).standalone, true);
   assert.deepEqual(nativeFast.surfaces, ["codex"]);
   assert.deepEqual(enhancementCatalog.items.filter((item) => /Fast/.test(item.title)).map((item) => item.key), ["codexAppNativeFastUnlock"]);

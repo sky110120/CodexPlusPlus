@@ -255,7 +255,6 @@ jobs:
           assets/inject/native-fast-module.test.cjs
           assets/inject/native-fast-settings.test.cjs
           assets/inject/native-fast-rspack.test.cjs
-          assets/inject/fast-preference.test.cjs
           assets/inject/native-predictions.test.cjs
           scripts/tests/check-native-fast.test.cjs
           docs/site.sponsors.test.cjs

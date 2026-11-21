@@ -67,7 +67,7 @@
   /**
    * 在 Codex 页面里改了一项设置后发公开事件 `settings/changed`，参数 `{ key, value, persisted }`：
    * key 是改动的设置字段（存在 Codex++ 后端的用后端字段名，如 codexAppCapacityAutoRetry；只存页面本地的用页面键名）；
-   * 乐观更新先发 persisted: false，写进后端后再发 persisted: true；Fast 入口只发已确认的值。
+   * 先按新值发一次 persisted: false（这时读设置已是新值），写进后端后再发一次 persisted: true。
    * 跟着设置走的内置拓展订阅它，内核不再逐个点名功能。
    */
   function emitCodexPlusSettingsChanged(key, value, persisted) {
@@ -112,8 +112,6 @@
       // 记下读之前的设置：loadBackendSettingsState 换成新对象，旧引用里还是上一次的值。
       // 下面的 typeof 守卫：本段会被切片到只给了少量依赖的沙箱里测。
       const previous = codexPlusBackendSettingsSnapshot();
-      const fastPreferenceWasEnabled = typeof codexPlusComposerFastPreferenceEnabled === "function"
-        && codexPlusComposerFastPreferenceEnabled();
       const loaded = await loadBackendSettingsState();
       if (loaded) {
         syncOfficialUsagePolicy();
@@ -130,11 +128,6 @@
         // 管理器里改的设置：设置页开着时，开关与随总开关切换的说明也跟着变。
         syncCodexPlusBackendToggleButtons();
         renderCodexPlusMenu();
-        if (typeof refreshCodexPlusComposerActions === "function"
-            && typeof codexPlusComposerFastPreferenceEnabled === "function"
-            && fastPreferenceWasEnabled !== codexPlusComposerFastPreferenceEnabled()) {
-          refreshCodexPlusComposerActions();
-        }
       }
       return loaded;
     } finally {
@@ -142,80 +135,31 @@
     }
   }
 
-  const codexPlusFastPreferenceWrite = { pending: false, revision: 0, needsRefresh: false };
-
   async function setBackendSetting(key, value) {
-    const fastPreference = key === "codexAppNativeFastUnlock";
-    const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
-    if (fastPreference && (!fastWrite || fastWrite.pending)) return;
-    const seq = fastPreference ? codexPlusBackendSettingsSeq : ++codexPlusBackendSettingsSeq;
-    const fastRevision = fastWrite?.revision;
-    const fastWasPending = fastWrite?.pending;
+    const seq = ++codexPlusBackendSettingsSeq;
     const previous = typeof codexPlusBackendSettingsSnapshot === "function" ? codexPlusBackendSettingsSnapshot() : null;
-    if (fastPreference) {
-      fastWrite.pending = true;
-      fastWrite.revision += 1;
-    } else {
-      codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
-      codexPlusBackendSettingsLoaded = true;
-      if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, false);
-      refreshCodexPlusBackendToggles();
-    }
+    codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
+    codexPlusBackendSettingsLoaded = true;
+    if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, false);
+    refreshCodexPlusBackendToggles();
     try {
-      let settings;
-      try {
-        settings = await postJson("/settings/set", { [key]: value });
-        if (fastPreference && (settings?.status === "failed" || typeof settings?.[key] !== "boolean" || settings[key] !== value)) {
-          throw new Error("Fast preference not confirmed");
-        }
-      } catch (error) {
-        if (!fastPreference) throw error;
-        if (typeof showToast === "function") showToast("未能确认 Fast 按钮设置，请重试。", { type: "warn" });
-        return;
-      }
-      if (fastPreference) {
-        // 并发保存时保留上次已核实的供应商状态，交给下一次心跳重新读取。
-        const current = seq === codexPlusBackendSettingsSeq;
-        if (!current) fastWrite.needsRefresh = true;
-        codexPlusBackendSettings = {
-          ...codexPlusBackendSettings,
-          [key]: value,
-          ...(current ? {
-            nativeFastLocalApiConfigured: settings?.nativeFastLocalApiConfigured === true,
-            nativeFastProviderCompatible: settings?.nativeFastProviderCompatible === true,
-          } : {}),
-        };
-      } else {
-        if (seq !== codexPlusBackendSettingsSeq) return;
-        const {
-          codexAppNativeFastUnlock: _fastPreference,
-          nativeFastLocalApiConfigured,
-          nativeFastProviderCompatible,
-          ...otherSettings
-        } = settings ?? {};
-        if (!fastWasPending && fastRevision === fastWrite?.revision) {
-          otherSettings.nativeFastLocalApiConfigured = nativeFastLocalApiConfigured === true;
-          otherSettings.nativeFastProviderCompatible = nativeFastProviderCompatible === true;
-        }
-        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...otherSettings };
-      }
-      globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
-        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
-          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
-        nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
-      });
-      globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
-        nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
-      });
-      if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, true);
-      if (!fastPreference && previous && typeof emitCodexPlusRelaySettingsEvents === "function") {
-        emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
+      const settings = await postJson("/settings/set", { [key]: value });
+      if (seq === codexPlusBackendSettingsSeq) {
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+          nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
+        });
+        globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+          nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
+        });
+        if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, true);
+        if (previous && typeof emitCodexPlusRelaySettingsEvents === "function") emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
       }
     } finally {
-      if (fastPreference) fastWrite.pending = false;
       refreshCodexPlusBackendToggles();
     }
   }
@@ -233,28 +177,6 @@
       button.setAttribute("aria-checked", enabled);
     });
     syncCodexPlusSettingsCatalogDescriptions();
-    syncCodexPlusFastPreferenceControls();
-  }
-
-  function syncCodexPlusFastPreferenceControls() {
-    if (typeof codexPlusComposerFastPreferenceEnabled !== "function"
-        || codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
-    const enabled = codexPlusComposerFastPreferenceEnabled();
-    document.querySelectorAll("[data-codex-plus-fast-preference-control]").forEach((node) => {
-      if (node.hidden === enabled) node.hidden = !enabled;
-      if (!enabled) return;
-      const button = node.querySelector("[data-codex-plus-fast-preference-settings]");
-      if (!button || button.__codexPlusGeneration === codexPlusBackendGeneration) return;
-      button.__codexPlusGeneration = codexPlusBackendGeneration;
-      // 设置页可能在重注入前就已打开，在按钮上更新当前代处理器。
-      button.onclick = (event) => {
-        event.preventDefault();
-        if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration
-            && codexPlusComposerFastPreferenceEnabled()
-            && typeof openCodexPlusFastPreference === "function") openCodexPlusFastPreference(button);
-      };
-    });
-    if (!enabled && typeof closeCodexPlusFastPreference === "function") closeCodexPlusFastPreference();
   }
 
   /** 刷新设置页的开关与菜单。跟着设置走的功能由内置拓展订阅 settings/loaded、settings/changed 自己对齐，这里不点名。 */
@@ -384,7 +306,6 @@
         const weixinRevision = nextStatus.weixinDesktopSyncRevision ?? null;
         const settingsStale = !revision
           || !codexPlusBackendSettingsLoaded
-          || codexPlusFastPreferenceWrite.needsRefresh
           || revision !== codexPlusBackendSettingsRevision
           || weixinRevision !== codexPlusWeixinSyncRevision;
         if (settingsStale) {
@@ -1893,6 +1814,30 @@
       const description = item ? codexPlusSettingsCatalogDescription(item) : "";
       if (item && node.textContent !== description) node.textContent = description;
     });
+    syncCodexPlusNativeFastStatus();
+  }
+
+  // 原生 Fast 的自检结果：补丁是否真的打进了当前 Codex。Codex 更新后结构变了时，
+  // 用户在这里就能看到「暂未适配」和原因，不用再猜按钮为什么不见了。
+  function codexPlusNativeFastStatusText() {
+    if (codexPlusBackendSettings.enhancementsEnabled === false || codexPlusBackendSettings.codexAppNativeFastUnlock !== true) return "";
+    const state = window.__codexPlusNativeFastPatchState;
+    if (window.__codexPlusNativeFastCompiled === "v1" || state === "patched") return "已生效：当前 Codex 版本已适配。";
+    if (state === "failed" || state === "unsupported") {
+      const reason = String(window.__codexPlusNativeFastFailureReason || window.__codexPlusNativeFastModuleDiagnostics?.reason || "").slice(0, 120);
+      return `当前 Codex 版本暂未适配，Fast 开关不会出现${reason ? `（${reason}）` : ""}。请把 codex-plus.log 里 bridge.native_module_patch_prepared 那一行反馈给我们。`;
+    }
+    return "";
+  }
+
+  function syncCodexPlusNativeFastStatus() {
+    document.querySelectorAll("[data-codex-plus-native-fast-status]").forEach((node) => {
+      const text = codexPlusNativeFastStatusText();
+      const failed = String(!!text && !text.startsWith("已生效"));
+      if (node.textContent !== text) node.textContent = text;
+      if (node.hidden !== !text) node.hidden = !text;
+      if (node.dataset.failed !== failed) node.dataset.failed = failed;
+    });
   }
 
   // 与管理器增强页一致：「（实验）」从标题里拿出来做成小标签；说明里写了要重启 Codex 的，标题旁加「需重启」。
@@ -1916,10 +1861,7 @@
       const binding = localKey ? `data-codex-plus-setting="${escapeHtml(localKey)}"` : `data-codex-backend-setting="${escapeHtml(item.key)}"`;
       const toggle = `<button type="button" class="codex-plus-toggle" ${binding} role="switch" aria-checked="false" aria-label="${title}"><span></span></button>`;
       const inputs = (Array.isArray(item.codexInputs) ? item.codexInputs : []).map(renderCodexPlusSettingsCatalogInput).join("");
-      const fastPreference = item.key === "codexAppNativeFastUnlock"
-        ? '<span data-codex-plus-fast-preference-control hidden><button type="button" class="codex-plus-menu-trigger" data-codex-plus-fast-preference-settings aria-haspopup="dialog">设置默认速度</button></span>'
-        : "";
-      control = inputs || fastPreference ? `<div class="codex-plus-width-control">${inputs}${fastPreference}${toggle}</div>` : toggle;
+      control = inputs ? `<div class="codex-plus-width-control">${inputs}${toggle}</div>` : toggle;
     }
     // 不认识的控件类型宁可不显示，也不显示一个点了不生效的行。
     if (!control) return "";
@@ -1931,7 +1873,7 @@
     const param = options.param ? " data-codex-plus-builtin-param=\"true\"" : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}"${builtin}${param}>
-                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
+                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div>${item.key === "codexAppNativeFastUnlock" ? '<div class="codex-plus-row-description" data-codex-plus-native-fast-status="true" role="status" hidden></div>' : ""}</div>
                   ${control}
                 </div>`;
   }

@@ -1324,10 +1324,7 @@ fn settings_payload_value(
         &settings.active_relay_profile(),
     );
     settings.dictation = crate::dictation::effective_settings(&settings);
-    let fast_auth = crate::native_fast::CustomResponsesAuth::from_home(
-        &crate::codex_home::default_codex_home_dir(),
-    );
-    let native_fast = crate::native_fast::runtime_settings_with_auth(&settings, fast_auth);
+    let native_fast = crate::native_fast::runtime_settings(&settings);
     // 页面心跳比较这两项，发拓展事件 relayProfile/switched、modelCatalog/changed（见 40-backend-settings.js）。
     let active_relay_profile_public = public_active_relay_profile(&settings);
     let catalog_fingerprint = model_catalog_fingerprint(&settings);
@@ -1396,11 +1393,7 @@ fn settings_payload_value(
             "nativeFastLocalApiConfigured".to_string(),
             Value::Bool(native_fast.native_fast_local_api_configured),
         );
-        object.insert(
-            "nativeFastProviderCompatible".to_string(),
-            Value::Bool(fast_auth.supports_native_fast()),
-        );
-        // 输入预测仍只使用严格的无原生登录判定。
+        // 原生输入预测与 Fast 共用同一份本机自定义 API 判定，只读一次 config.toml。
         object.insert(
             "nativePredictionsLocalApiConfigured".to_string(),
             Value::Bool(native_fast.native_fast_local_api_configured),
@@ -1747,26 +1740,13 @@ fn backend_status_value(
         let revision = settings
             .as_ref()
             .map(|settings| {
-                let mut revision = settings.settings_revision.clone();
                 // 多开实例的设置独立保存，但 Agent 发布的网关目录仍可更新。
                 if settings.active_relay_id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
                     && let Some(catalog_revision) = crate::model_catalog::gateway_catalog_revision(home)
                 {
-                    revision.push_str(&format!(":{catalog_revision:016x}"));
+                    return format!("{}:{catalog_revision:016x}", settings.settings_revision);
                 }
-                // 外部编辑 config.toml 也能使 Fast 的派生状态变化。
-                if !revision.is_empty()
-                    && settings.enhancements_enabled
-                    && settings.codex_app_native_fast_unlock
-                {
-                    use crate::native_fast::CustomResponsesAuth;
-                    revision.push_str(match CustomResponsesAuth::from_home(home) {
-                        CustomResponsesAuth::NotVerified => ":fast=0",
-                        CustomResponsesAuth::NoOpenAiLoginRequired => ":fast=1",
-                        CustomResponsesAuth::ProviderBearer => ":fast=2",
-                    });
-                }
-                revision
+                settings.settings_revision.clone()
             })
             .unwrap_or_default();
         object.insert("settingsRevision".to_string(), Value::from(revision));

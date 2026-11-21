@@ -22,8 +22,9 @@ test("public README variants do not expose sponsor or affiliate links", () => {
 });
 
 test("site entry scripts do not request or render the remote sponsor list", () => {
-  const docsScript = visibleJs(read("docs/site.js"));
-  const siteScript = visibleJs(read("site/js/site.js"));
-  assert.doesNotMatch(docsScript, /^\s*setupSponsors\(\);\s*$/m);
-  assert.doesNotMatch(siteScript, /ads\.codexpp\.cc\/ads\.json|function sponsors\(/i);
+  for (const file of ["docs/site.js", "site/js/site.js"]) {
+    const script = visibleJs(read(file));
+    assert.doesNotMatch(script, /ads\.codexpp\.cc\/ads\.json|function sponsors\(/i, file);
+    assert.doesNotMatch(script, /^\s*setupSponsors\(\);\s*$/m, file);
+  }
 });

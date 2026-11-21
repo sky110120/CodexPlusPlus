@@ -2,7 +2,6 @@
 
 use crate::settings::BackendSettings;
 use serde::Serialize;
-use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,14 +32,10 @@ pub(crate) fn runtime_settings_with_local_api(
     }
 }
 
-/// Fast 和输入预测共享模块通道，分别按各自的开关和适用条件启用。
+/// 任一原生模块补丁开启时才需要模块补丁通道。
 pub(crate) fn native_modules_requested(settings: &BackendSettings) -> bool {
-    native_modules_requested_in_home(settings, &crate::codex_home::default_codex_home_dir())
-}
-
-pub(crate) fn native_modules_requested_in_home(settings: &BackendSettings, home: &Path) -> bool {
-    (settings.enhancements_enabled && settings.codex_app_native_predictions)
-        || crate::native_fast::native_module_requested_in_home(settings, home)
+    settings.enhancements_enabled
+        && (settings.codex_app_native_fast_unlock || settings.codex_app_native_predictions)
 }
 
 #[cfg(test)]
@@ -66,5 +61,8 @@ mod tests {
                 "nativePredictionsLocalApiConfigured": true,
             })
         );
+        settings.codex_app_native_predictions = false;
+        settings.codex_app_native_fast_unlock = true;
+        assert!(native_modules_requested(&settings));
     }
 }

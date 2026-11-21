@@ -299,12 +299,12 @@
         <div class="card-body">
           <h3>Codex enhancements</h3>
           <ul>
-            <li>Plugin marketplace unlock, model whitelist, Fast speed button</li>
+            <li>Plugin marketplace unlock, model whitelist, native Fast with an API key</li>
             <li>Undoable session deletes, Markdown export, turn rewind</li>
             <li>Dictation, composer predictions, paste fix, next-step suggestions</li>
           </ul>
         </div>
-        <a class="card-shot" href="assets/codex-enhance-en.webp" data-zoom><img src="assets/codex-enhance-en.webp" alt="Codex enhancements: plugin marketplace unlock, model whitelist, Fast speed button, composer predictions, and session deletion switches" loading="lazy"></a>
+        <a class="card-shot" href="assets/codex-enhance-en.webp" data-zoom><img src="assets/codex-enhance-en.webp" alt="Codex enhancements: plugin marketplace unlock, model whitelist, native Fast, composer predictions, and session deletion switches" loading="lazy"></a>
       </article>
       <article class="card reveal">
         <div class="card-body">
@@ -331,8 +331,8 @@
     <div class="minis">
       <article class="mini reveal">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>
-        <h4>Fast speed button</h4>
-        <p>The Fast button below the composer sets Codex's default speed on this device; the tier and cost depend on the model and provider.</p>
+        <h4>Native Fast with an API key</h4>
+        <p>Standard / ⚡ Fast controls with a pure API key.</p>
       </article>
       <article class="mini reveal">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg>
@@ -820,8 +820,8 @@ your-model<span class="h">[128000]</span></pre>
           <div class="faq-a"><p>Enhancements are only attached to an official app launched from <b>Codex++</b>. If you opened Codex yourself, the Codex row in the sidebar says it is not attached and its button becomes "Restart &amp; attach"; click it. If the menu is still missing, check the app path, launch status and diagnostic logs under Settings → Codex (which includes install &amp; maintenance) and Settings → Logs &amp; Diagnostics. On macOS you can also turn on "Auto-takeover of the official app" so Codex++ takes over when you open the official app yourself.</p></div>
         </details>
         <details class="faq-item" id="faq-native-fast">
-          <summary>Why is the Fast button below the composer missing?<span class="faq-x" aria-hidden="true"></span></summary>
-          <div class="faq-a"><p>Enable the “Fast speed button” option and check that the model declares Fast (priority) support. In direct mode, enable this in Codex → Connection &amp; providers and save the model and provider. In gateway mode, every member of a model group must support Fast. Then use the Fast button below the composer to set Codex's default speed on this device. Enabling the option alone does not change the speed; the actual tier and cost depend on the model and provider.</p></div>
+          <summary>Why is the native Fast switch still missing?<span class="faq-x" aria-hidden="true"></span></summary>
+          <div class="faq-a"><p>Confirm that you saved and restarted Codex through Codex++. In direct mode, open the model's settings under Codex → Connection &amp; providers, set “Fast (priority) support”, then save both the model and provider before restarting. In gateway mode, a model group supports Fast when every member does. Only declare support that your provider actually offers; unlocking the client control does not change service limits or billing.</p></div>
         </details>
         <details class="faq-item">
           <summary>Can enhancements be disabled? Will they survive official app updates?<span class="faq-x" aria-hidden="true"></span></summary>

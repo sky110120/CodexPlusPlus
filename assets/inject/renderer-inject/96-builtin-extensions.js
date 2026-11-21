@@ -66,7 +66,7 @@
       // 以下由 Rust 侧（启动、注入、本地代理）按设置项生效，多数要重启 Codex，页面侧只登记。被顶替时 Rust 侧按
       // 「关」处理（builtin_takeover），顶替它的拓展用 preload（页面最早期脚本）、launch（启动前后）、网关中间件写等价功能。
       { id: "model-whitelist-unlock", name: "模型白名单解锁" },
-      { id: "native-fast-unlock", name: "Fast 速度按钮" },
+      { id: "native-fast-unlock", name: "原生 Fast 强制解锁" },
       { id: "native-predictions", name: "原生输入预测" },
       { id: "reported-usage-compaction", name: "按上报用量判断压缩（实验）" },
       { id: "reasoning-collapse", name: "第三方模型回答完自动折叠过程" },

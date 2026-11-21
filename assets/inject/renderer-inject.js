@@ -1893,6 +1893,7 @@
       .codex-plus-row:first-child { border-top: 0; }
       .codex-plus-row-title { font-weight: 550; line-height: 1.35; }
       .codex-plus-row-description { margin-top: 2px; color: #a1a1aa; font-size: 13px; line-height: 1.4; }
+      .codex-plus-row-description[data-codex-plus-native-fast-status][data-failed="true"] { color: #f59e0b; }
       .codex-plus-model-compat-warning { margin-top: 6px; color: #fbbf24; font-size: 13px; line-height: 1.45; }
       .codex-plus-toggle {
         width: 42px;
@@ -2069,7 +2070,7 @@
       .codex-plus-row-description,
       .codex-plus-about,
       .codex-plus-backend-label,
-      .codex-plus-form-message,
+      .codex-plus-form-message { color: var(--codex-plus-text-secondary); }
       .codex-delete-confirm-actions button,
       .codex-plus-action-button,
       .codex-plus-issue-button {
@@ -6429,12 +6430,8 @@
 
   async function loadBackendSettingsState(timeoutMs = 0) {
     const seq = codexPlusBackendSettingsSeq;
-    const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
-    const fastRevision = fastWrite?.revision;
-    const fastWasPending = fastWrite?.pending;
-    let staleFastSnapshot = false;
     try {
-      let settings = await (timeoutMs > 0
+      const settings = await (timeoutMs > 0
         ? readCodexAppServerPreparation("/settings/get", {}, timeoutMs)
         : postJson("/settings/get", {}));
       if (!settings || typeof settings !== "object" || (!("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
@@ -6443,20 +6440,8 @@
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
       }
-      staleFastSnapshot = fastWasPending || fastRevision !== fastWrite?.revision;
-      if (staleFastSnapshot) {
-        // 交叠的读取不能覆盖 Fast 开关和同一快照里的供应商判定。
-        const {
-          codexAppNativeFastUnlock: _staleFastPreference,
-          nativeFastLocalApiConfigured: _staleFastLocalApi,
-          nativeFastProviderCompatible: _staleFastProvider,
-          ...otherSettings
-        } = settings;
-        settings = otherSettings;
-      }
       const previousSettings = codexPlusBackendSettings;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
-      if (fastWrite && !staleFastSnapshot) fastWrite.needsRefresh = false;
       codexPlusBackendSettingsLoaded = true;
       if (typeof initializeCodexGatewayBaseline === "function") {
         void initializeCodexGatewayBaseline(codexGatewayRecoveryEnabled());
@@ -6465,9 +6450,8 @@
         refreshCodexModelCatalogForSettings(previousSettings, codexPlusBackendSettings);
       }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
-        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
-          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
       // 原生输入预测只接收自己的开关和本机 API 布尔投影。
@@ -6500,7 +6484,7 @@
         errorMessage: String(error?.message || error),
       }));
     }
-    return !staleFastSnapshot;
+    return true;
   }
   // 原生准备会话时会读取本地配置；该 fetch 没有默认超时，丢失响应会同时
   // 挂住恢复和发送队列。只约束这一个只读接口，不接管原生恢复/提交生命周期。
@@ -7301,7 +7285,7 @@
   /**
    * 在 Codex 页面里改了一项设置后发公开事件 `settings/changed`，参数 `{ key, value, persisted }`：
    * key 是改动的设置字段（存在 Codex++ 后端的用后端字段名，如 codexAppCapacityAutoRetry；只存页面本地的用页面键名）；
-   * 乐观更新先发 persisted: false，写进后端后再发 persisted: true；Fast 入口只发已确认的值。
+   * 先按新值发一次 persisted: false（这时读设置已是新值），写进后端后再发一次 persisted: true。
    * 跟着设置走的内置拓展订阅它，内核不再逐个点名功能。
    */
   function emitCodexPlusSettingsChanged(key, value, persisted) {
@@ -7346,8 +7330,6 @@
       // 记下读之前的设置：loadBackendSettingsState 换成新对象，旧引用里还是上一次的值。
       // 下面的 typeof 守卫：本段会被切片到只给了少量依赖的沙箱里测。
       const previous = codexPlusBackendSettingsSnapshot();
-      const fastPreferenceWasEnabled = typeof codexPlusComposerFastPreferenceEnabled === "function"
-        && codexPlusComposerFastPreferenceEnabled();
       const loaded = await loadBackendSettingsState();
       if (loaded) {
         syncOfficialUsagePolicy();
@@ -7364,11 +7346,6 @@
         // 管理器里改的设置：设置页开着时，开关与随总开关切换的说明也跟着变。
         syncCodexPlusBackendToggleButtons();
         renderCodexPlusMenu();
-        if (typeof refreshCodexPlusComposerActions === "function"
-            && typeof codexPlusComposerFastPreferenceEnabled === "function"
-            && fastPreferenceWasEnabled !== codexPlusComposerFastPreferenceEnabled()) {
-          refreshCodexPlusComposerActions();
-        }
       }
       return loaded;
     } finally {
@@ -7376,80 +7353,31 @@
     }
   }
 
-  const codexPlusFastPreferenceWrite = { pending: false, revision: 0, needsRefresh: false };
-
   async function setBackendSetting(key, value) {
-    const fastPreference = key === "codexAppNativeFastUnlock";
-    const fastWrite = typeof codexPlusFastPreferenceWrite === "undefined" ? null : codexPlusFastPreferenceWrite;
-    if (fastPreference && (!fastWrite || fastWrite.pending)) return;
-    const seq = fastPreference ? codexPlusBackendSettingsSeq : ++codexPlusBackendSettingsSeq;
-    const fastRevision = fastWrite?.revision;
-    const fastWasPending = fastWrite?.pending;
+    const seq = ++codexPlusBackendSettingsSeq;
     const previous = typeof codexPlusBackendSettingsSnapshot === "function" ? codexPlusBackendSettingsSnapshot() : null;
-    if (fastPreference) {
-      fastWrite.pending = true;
-      fastWrite.revision += 1;
-    } else {
-      codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
-      codexPlusBackendSettingsLoaded = true;
-      if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, false);
-      refreshCodexPlusBackendToggles();
-    }
+    codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
+    codexPlusBackendSettingsLoaded = true;
+    if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, false);
+    refreshCodexPlusBackendToggles();
     try {
-      let settings;
-      try {
-        settings = await postJson("/settings/set", { [key]: value });
-        if (fastPreference && (settings?.status === "failed" || typeof settings?.[key] !== "boolean" || settings[key] !== value)) {
-          throw new Error("Fast preference not confirmed");
-        }
-      } catch (error) {
-        if (!fastPreference) throw error;
-        if (typeof showToast === "function") showToast("未能确认 Fast 按钮设置，请重试。", { type: "warn" });
-        return;
-      }
-      if (fastPreference) {
-        // 并发保存时保留上次已核实的供应商状态，交给下一次心跳重新读取。
-        const current = seq === codexPlusBackendSettingsSeq;
-        if (!current) fastWrite.needsRefresh = true;
-        codexPlusBackendSettings = {
-          ...codexPlusBackendSettings,
-          [key]: value,
-          ...(current ? {
-            nativeFastLocalApiConfigured: settings?.nativeFastLocalApiConfigured === true,
-            nativeFastProviderCompatible: settings?.nativeFastProviderCompatible === true,
-          } : {}),
-        };
-      } else {
-        if (seq !== codexPlusBackendSettingsSeq) return;
-        const {
-          codexAppNativeFastUnlock: _fastPreference,
-          nativeFastLocalApiConfigured,
-          nativeFastProviderCompatible,
-          ...otherSettings
-        } = settings ?? {};
-        if (!fastWasPending && fastRevision === fastWrite?.revision) {
-          otherSettings.nativeFastLocalApiConfigured = nativeFastLocalApiConfigured === true;
-          otherSettings.nativeFastProviderCompatible = nativeFastProviderCompatible === true;
-        }
-        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...otherSettings };
-      }
-      globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled === true,
-        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true
-          && codexPlusBackendSettings.nativeFastProviderCompatible === true,
-        nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
-      });
-      globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
-        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
-        codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
-        nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
-      });
-      if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, true);
-      if (!fastPreference && previous && typeof emitCodexPlusRelaySettingsEvents === "function") {
-        emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
+      const settings = await postJson("/settings/set", { [key]: value });
+      if (seq === codexPlusBackendSettingsSeq) {
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+          nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
+        });
+        globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+          nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
+        });
+        if (typeof emitCodexPlusSettingsChanged === "function") emitCodexPlusSettingsChanged(key, value, true);
+        if (previous && typeof emitCodexPlusRelaySettingsEvents === "function") emitCodexPlusRelaySettingsEvents(previous, codexPlusBackendSettings);
       }
     } finally {
-      if (fastPreference) fastWrite.pending = false;
       refreshCodexPlusBackendToggles();
     }
   }
@@ -7467,28 +7395,6 @@
       button.setAttribute("aria-checked", enabled);
     });
     syncCodexPlusSettingsCatalogDescriptions();
-    syncCodexPlusFastPreferenceControls();
-  }
-
-  function syncCodexPlusFastPreferenceControls() {
-    if (typeof codexPlusComposerFastPreferenceEnabled !== "function"
-        || codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
-    const enabled = codexPlusComposerFastPreferenceEnabled();
-    document.querySelectorAll("[data-codex-plus-fast-preference-control]").forEach((node) => {
-      if (node.hidden === enabled) node.hidden = !enabled;
-      if (!enabled) return;
-      const button = node.querySelector("[data-codex-plus-fast-preference-settings]");
-      if (!button || button.__codexPlusGeneration === codexPlusBackendGeneration) return;
-      button.__codexPlusGeneration = codexPlusBackendGeneration;
-      // 设置页可能在重注入前就已打开，在按钮上更新当前代处理器。
-      button.onclick = (event) => {
-        event.preventDefault();
-        if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration
-            && codexPlusComposerFastPreferenceEnabled()
-            && typeof openCodexPlusFastPreference === "function") openCodexPlusFastPreference(button);
-      };
-    });
-    if (!enabled && typeof closeCodexPlusFastPreference === "function") closeCodexPlusFastPreference();
   }
 
   /** 刷新设置页的开关与菜单。跟着设置走的功能由内置拓展订阅 settings/loaded、settings/changed 自己对齐，这里不点名。 */
@@ -7618,7 +7524,6 @@
         const weixinRevision = nextStatus.weixinDesktopSyncRevision ?? null;
         const settingsStale = !revision
           || !codexPlusBackendSettingsLoaded
-          || codexPlusFastPreferenceWrite.needsRefresh
           || revision !== codexPlusBackendSettingsRevision
           || weixinRevision !== codexPlusWeixinSyncRevision;
         if (settingsStale) {
@@ -9127,6 +9032,30 @@
       const description = item ? codexPlusSettingsCatalogDescription(item) : "";
       if (item && node.textContent !== description) node.textContent = description;
     });
+    syncCodexPlusNativeFastStatus();
+  }
+
+  // 原生 Fast 的自检结果：补丁是否真的打进了当前 Codex。Codex 更新后结构变了时，
+  // 用户在这里就能看到「暂未适配」和原因，不用再猜按钮为什么不见了。
+  function codexPlusNativeFastStatusText() {
+    if (codexPlusBackendSettings.enhancementsEnabled === false || codexPlusBackendSettings.codexAppNativeFastUnlock !== true) return "";
+    const state = window.__codexPlusNativeFastPatchState;
+    if (window.__codexPlusNativeFastCompiled === "v1" || state === "patched") return "已生效：当前 Codex 版本已适配。";
+    if (state === "failed" || state === "unsupported") {
+      const reason = String(window.__codexPlusNativeFastFailureReason || window.__codexPlusNativeFastModuleDiagnostics?.reason || "").slice(0, 120);
+      return `当前 Codex 版本暂未适配，Fast 开关不会出现${reason ? `（${reason}）` : ""}。请把 codex-plus.log 里 bridge.native_module_patch_prepared 那一行反馈给我们。`;
+    }
+    return "";
+  }
+
+  function syncCodexPlusNativeFastStatus() {
+    document.querySelectorAll("[data-codex-plus-native-fast-status]").forEach((node) => {
+      const text = codexPlusNativeFastStatusText();
+      const failed = String(!!text && !text.startsWith("已生效"));
+      if (node.textContent !== text) node.textContent = text;
+      if (node.hidden !== !text) node.hidden = !text;
+      if (node.dataset.failed !== failed) node.dataset.failed = failed;
+    });
   }
 
   // 与管理器增强页一致：「（实验）」从标题里拿出来做成小标签；说明里写了要重启 Codex 的，标题旁加「需重启」。
@@ -9150,10 +9079,7 @@
       const binding = localKey ? `data-codex-plus-setting="${escapeHtml(localKey)}"` : `data-codex-backend-setting="${escapeHtml(item.key)}"`;
       const toggle = `<button type="button" class="codex-plus-toggle" ${binding} role="switch" aria-checked="false" aria-label="${title}"><span></span></button>`;
       const inputs = (Array.isArray(item.codexInputs) ? item.codexInputs : []).map(renderCodexPlusSettingsCatalogInput).join("");
-      const fastPreference = item.key === "codexAppNativeFastUnlock"
-        ? '<span data-codex-plus-fast-preference-control hidden><button type="button" class="codex-plus-menu-trigger" data-codex-plus-fast-preference-settings aria-haspopup="dialog">设置默认速度</button></span>'
-        : "";
-      control = inputs || fastPreference ? `<div class="codex-plus-width-control">${inputs}${fastPreference}${toggle}</div>` : toggle;
+      control = inputs ? `<div class="codex-plus-width-control">${inputs}${toggle}</div>` : toggle;
     }
     // 不认识的控件类型宁可不显示，也不显示一个点了不生效的行。
     if (!control) return "";
@@ -9165,7 +9091,7 @@
     const param = options.param ? " data-codex-plus-builtin-param=\"true\"" : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}"${builtin}${param}>
-                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
+                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div>${item.key === "codexAppNativeFastUnlock" ? '<div class="codex-plus-row-description" data-codex-plus-native-fast-status="true" role="status" hidden></div>' : ""}</div>
                   ${control}
                 </div>`;
   }
@@ -22197,10 +22123,9 @@ ${key} = ${value}`]);
         changed = true;
       }
     }
-    // 仅补充模型目录明确声明的服务档位，不改原生账号权限或 serviceTierAccess。
-    for (const [key, tiers] of Object.entries(codexPlusModelDeclaredTierMetadata(metadata, descriptor))) {
-      if (JSON.stringify(descriptor[key] ?? null) !== JSON.stringify(tiers)) {
-        descriptor[key] = tiers;
+    for (const [key, value] of Object.entries(codexPlusModelServiceTiers(metadata, descriptor))) {
+      if (JSON.stringify(descriptor[key]) !== JSON.stringify(value)) {
+        descriptor[key] = value;
         changed = true;
       }
     }
@@ -22222,66 +22147,32 @@ ${key} = ${value}`]);
       isDefault: false,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
+      ...codexPlusModelServiceTiers(metadata),
       // 图片输入能力只带目录/元数据里声明过的；没声明不写，不替未知模型宣称收图，
       // 与此前的原生行为一致。
       ...(modalities ? { inputModalities: modalities } : {}),
       ...(original !== null ? { supportsImageDetailOriginal: original } : {}),
-      ...codexPlusModelDeclaredTierMetadata(metadata),
     };
   }
 
-  function codexPlusModelTierIsFast(tier) {
-    // 只有缺失 ID 的旧项才按名称识别，不能因为显示名相同而删掉另一档。
-    const identity = codexPlusModelTierIdentity(tier)
-      || (typeof tier?.name === "string" ? tier.name.trim().toLowerCase() : "");
-    return identity === "priority" || identity === "fast";
-  }
-
-  function codexPlusModelTierIdentity(tier) {
-    const value = typeof tier === "string" ? tier : tier?.id;
-    return typeof value === "string" ? value.trim().toLowerCase() : "";
-  }
-
-  function codexPlusMergeModelTiers(native, declared, rejectFast) {
-    const merged = [];
-    const positions = new Map();
-    const valuesWithoutId = new Set();
-    const isRecord = (tier) => tier && typeof tier === "object" && !Array.isArray(tier);
-    for (const tier of [...native, ...declared]) {
-      if (rejectFast && codexPlusModelTierIsFast(tier)) continue;
-      const identity = codexPlusModelTierIdentity(tier);
-      if (!identity) {
-        const value = JSON.stringify(tier);
-        if (valuesWithoutId.has(value)) continue;
-        valuesWithoutId.add(value);
+  function codexPlusModelServiceTiers(metadata, descriptor) {
+    if (!metadata) return {};
+    const denyFast = metadata.prioritySupportOverride === false;
+    const fields = {};
+    // New-chat model queries use these descriptors before a thread exists.
+    for (const [key, id] of [["serviceTiers", "priority"], ["additionalSpeedTiers", "fast"]]) {
+      const declared = metadata[key];
+      if (Array.isArray(declared) && declared.length) {
+        fields[key] = structuredClone(declared);
       }
-      const position = positions.get(identity);
-      if (position === undefined) {
-        if (identity) positions.set(identity, merged.length);
-        merged.push(isRecord(tier) ? { ...tier } : tier);
-      } else if (isRecord(tier)) {
-        const previous = merged[position];
-        merged[position] = isRecord(previous) ? { ...previous, ...tier } : { ...tier };
+      if (denyFast) {
+        const existing = fields[key] ?? descriptor?.[key];
+        if (Array.isArray(existing)) {
+          fields[key] = existing.filter((tier) => String(typeof tier === "string" ? tier : tier?.id || "").trim().toLowerCase() !== id);
+        }
       }
     }
-    return merged;
-  }
-
-  // 非空声明按 ID 更新档位；只有显式拒绝 Fast 时才过滤已有的 Fast 档位。
-  function codexPlusModelDeclaredTierMetadata(metadata, descriptor) {
-    const result = {};
-    const rejectFast = metadata?.prioritySupportOverride === false;
-    for (const [key, alias] of [
-      ["serviceTiers", "service_tiers"],
-      ["additionalSpeedTiers", "additional_speed_tiers"],
-    ]) {
-      const declared = [metadata?.[key], metadata?.[alias]]
-        .find((value) => Array.isArray(value) && value.length > 0);
-      const native = descriptor?.[key];
-      if (!declared && !(rejectFast && Array.isArray(native))) continue;
-      result[key] = codexPlusMergeModelTiers(Array.isArray(native) ? native : [], declared || [], rejectFast);
-    }
-    return result;
+    return fields;
   }
 
   // 元数据里声明的输入模态（camelCase / snake_case 都认），没声明返回 null。
@@ -32765,76 +32656,25 @@ ${key} = ${value}`]);
     return document.execCommand("insertText", false, text);
   }
 
-  function codexPlusComposerFastPreferenceEnabled() {
-    return codexPlusBackendSettingsLoaded === true
-      && codexPlusBackendSettings.enhancementsEnabled === true
-      && codexPlusBackendSettings.codexAppNativeFastUnlock === true;
-  }
-
   function refreshCodexPlusComposerActions() {
     const items = codexPlusExtensionItems(codexPlusRegistry.composerActions);
-    const currentGeneration = codexPlusBackendGeneration === window.__codexPlusBackendGeneration;
-    const showFast = currentGeneration && codexPlusComposerFastPreferenceEnabled();
-    const hosts = items.length || showFast ? codexPlusComposerActionHosts() : [];
+    const hosts = items.length ? codexPlusComposerActionHosts() : [];
     const hostFooters = new Set(hosts.map((host) => host.footer));
     document.querySelectorAll("[data-codex-plus-composer-actions]").forEach((node) => {
-      if (!items.length || !hostFooters.has(node.parentElement)) node.remove();
+      if (!hostFooters.has(node.parentElement)) node.remove();
     });
-    if (currentGeneration) {
-      const fastFooters = new Set();
-      document.querySelectorAll("[data-codex-plus-composer-fast-preference]").forEach((button) => {
-        const footer = button.parentElement;
-        if (!showFast || !hostFooters.has(footer) || fastFooters.has(footer)
-            || button.__codexPlusGeneration !== codexPlusBackendGeneration) {
-          button.remove();
-        } else {
-          fastFooters.add(footer);
-        }
-      });
-      if (showFast) for (const { footer } of hosts) {
-        if (fastFooters.has(footer)) continue;
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "codex-plus-composer-action";
-        button.textContent = "Fast";
-        button.setAttribute("data-codex-plus-composer-fast-preference", "");
-        button.setAttribute("aria-label", "Fast：本机默认速度");
-        button.setAttribute("aria-haspopup", "dialog");
-        button.__codexPlusGeneration = codexPlusBackendGeneration;
-        markCodexPlusExtensionNode(button, "builtin-fast-preference");
-        attachCodexPlusRailTooltip(button, "Fast：本机默认速度", "top");
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration
-              && codexPlusComposerFastPreferenceEnabled()
-              && typeof openCodexPlusFastPreference === "function") {
-            openCodexPlusFastPreference(button);
-          }
-        });
-        const next = [...footer.children].find((node) =>
-          node.hasAttribute?.("data-codex-plus-composer-actions") || node.hasAttribute?.("data-dictation-controls"));
-        footer.insertBefore(button, next || null);
-      }
-    }
-    if (!items.length && !showFast) return;
-    let style = document.getElementById("codex-plus-composer-actions-style");
-    if (style?.dataset.fastPreference !== "true") {
-      if (!style) {
-        style = document.createElement("style");
-        style.id = "codex-plus-composer-actions-style";
-        markCodexPlusExtensionNode(style, "builtin-composer-actions");
-        document.head.append(style);
-      }
-      style.dataset.fastPreference = "true";
+    if (!items.length) return;
+    if (!document.getElementById("codex-plus-composer-actions-style")) {
+      const style = document.createElement("style");
+      style.id = "codex-plus-composer-actions-style";
+      markCodexPlusExtensionNode(style, "builtin-composer-actions");
       style.textContent = `[data-codex-plus-composer-actions]{display:inline-flex;align-items:center;gap:2px;margin-inline:2px}
         .codex-plus-composer-action{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--color-token-text-primary,currentColor);opacity:.9;cursor:pointer;font-size:15px;line-height:1}
         .codex-plus-composer-action:hover{background:color-mix(in srgb,currentColor 12%,transparent);opacity:1}
         .codex-plus-composer-action:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-        .codex-plus-composer-action svg{width:16px;height:16px}
-        .codex-plus-composer-action[data-codex-plus-composer-fast-preference]{width:auto;min-width:44px;padding-inline:8px;margin-inline:2px;font-size:12px}`;
+        .codex-plus-composer-action svg{width:16px;height:16px}`;
+      document.head.append(style);
     }
-    if (!items.length) return;
     const renderKey = items.map((item) => `${item.id}|${item.label || ""}|${item.icon || ""}`).join("\n");
     for (const { footer, editor } of hosts) {
       let root = [...footer.children].find((node) => node.hasAttribute?.("data-codex-plus-composer-actions"));
@@ -33138,447 +32978,6 @@ ${key} = ${value}`]);
       markCodexPlusExtensionNode(item, definition.scriptKey);
       moreMenu.appendChild(item);
     });
-  }
-  // 只经本机 app-server 写默认档位；当前会话、模型支持和账户权限仍由 Codex 决定。
-  // 26.1117 的 preload 直接投递本窗口的 mcp-response，不需要从前端分块寻找客户端。
-  function codexPlusFastPreferenceClient() {
-    const host = window.electronBridge;
-    if (typeof host?.sendMessageFromView !== "function") {
-      throw codexPlusFastPreferenceError("本机 Codex 配置服务尚未连接，请重新读取。");
-    }
-    async function sendRequest(method, params) {
-      if (method !== "config/read" && method !== "config/batchWrite") throw new Error("Invalid method");
-      const nonce = window.crypto.randomUUID?.() ?? window.crypto.getRandomValues(new Uint32Array(4)).join("-");
-      const id = `${method}:codex-plus-${nonce}`;
-      return new Promise((resolve, reject) => {
-        function cleanup() {
-          window.clearTimeout(timer);
-          window.removeEventListener("message", receive);
-        }
-        function fail(error) {
-          cleanup();
-          reject(error);
-        }
-        function receive(event) {
-          const data = event.data;
-          if (event.source !== window || event.origin !== window.location.origin
-              || data?.type !== "mcp-response" || data.hostId !== "local" || data.message?.id !== id) return;
-          cleanup();
-          if (data.message.error != null) reject(data.message.error);
-          else resolve(data.message.result);
-        }
-        const timer = window.setTimeout(() => fail(new Error("No config response")), 10_000);
-        window.addEventListener("message", receive);
-        try {
-          Promise.resolve(host.sendMessageFromView({
-            type: "mcp-request", hostId: "local", request: { id, method, params }, coalesce: false,
-          })).catch(fail);
-        } catch (error) {
-          fail(error);
-        }
-      });
-    }
-    return { sendRequest };
-  }
-
-  function codexPlusFastPreferenceError(message) {
-    const error = new Error(message);
-    error.fastPreferenceMessage = message;
-    return error;
-  }
-
-  function codexPlusFastPreferenceTier(config) {
-    if (!config || typeof config !== "object" || Array.isArray(config)) {
-      throw codexPlusFastPreferenceError("Codex 返回的速度配置不完整。");
-    }
-    const tier = config.service_tier;
-    if (tier == null) return null;
-    if (typeof tier !== "string") throw codexPlusFastPreferenceError("无法识别当前速度配置。");
-    return tier === "fast" ? "priority" : tier;
-  }
-
-  async function codexPlusReadFastPreference(client) {
-    let response;
-    try {
-      response = await client.sendRequest("config/read", { includeLayers: true, cwd: null });
-    } catch {
-      throw codexPlusFastPreferenceError("无法读取本机速度设置，请重新读取。");
-    }
-    const users = Array.isArray(response?.layers) ? response.layers.filter((layer) =>
-      layer?.name?.type === "user" && layer.name.profile == null && layer.disabledReason == null) : [];
-    const user = users.length === 1 ? users[0] : null;
-    if (typeof user?.name?.file !== "string" || !user.name.file.trim()
-        || typeof user.version !== "string" || !user.version.trim()) {
-      throw codexPlusFastPreferenceError("Codex 未提供唯一可写的用户默认配置及版本。");
-    }
-    return {
-      tier: codexPlusFastPreferenceTier(response.config),
-      stored: codexPlusFastPreferenceTier(user.config),
-      file: user.name.file,
-      version: user.version,
-    };
-  }
-
-  async function codexPlusWriteFastPreference(client, snapshot, desired) {
-    if (![null, "default", "priority"].includes(desired)
-        || typeof snapshot?.file !== "string" || !snapshot.file
-        || typeof snapshot.version !== "string" || !snapshot.version) {
-      throw codexPlusFastPreferenceError("速度选项或配置版本无效，请重新读取。");
-    }
-    let ack;
-    try {
-      ack = await client.sendRequest("config/batchWrite", {
-        edits: [{ keyPath: "service_tier", value: desired, mergeStrategy: "replace" }],
-        filePath: snapshot.file,
-        expectedVersion: snapshot.version,
-        reloadUserConfig: true,
-      });
-    } catch (error) {
-      const code = error?.data?.config_write_error_code ?? error?.error?.data?.config_write_error_code;
-      if (/config.?version.?conflict/i.test(String(code))
-          || /version conflict|modified since last read/i.test(String(error?.message))) {
-        throw codexPlusFastPreferenceError("配置版本已变更，请重新读取后再选择速度。");
-      }
-      throw codexPlusFastPreferenceError("Codex 未确认保存结果，请重新读取当前设置。");
-    }
-    if (ack?.status !== "ok" && ack?.status !== "okOverridden") {
-      throw codexPlusFastPreferenceError("Codex 未确认保存结果，请重新读取当前设置。");
-    }
-    let actual;
-    try {
-      actual = await codexPlusReadFastPreference(client);
-    } catch {
-      throw codexPlusFastPreferenceError("Codex 已接收写入，但未能回读核实，请重新读取。");
-    }
-    const overridden = ack.status === "okOverridden";
-    if (actual.file !== snapshot.file || actual.stored !== desired
-        || (!overridden && desired !== null && actual.tier !== desired)) {
-      throw codexPlusFastPreferenceError("回读的速度设置与写入不一致，请重新读取。");
-    }
-    return { ...actual, overridden };
-  }
-  /* Fast 偏好弹窗：只通过本机 app-server 的 Fast preference helpers 读写。 */
-  const codexPlusFastDialogKey = "__codexPlusFastPreferenceDialog";
-  const codexPlusFastDialogStyleId = "codex-plus-fast-preference-dialog-style";
-
-  // 整页重新注入时，先关闭旧作用域持有的弹窗并使其异步回调失效。
-  try { if (typeof window[codexPlusFastDialogKey] === "function") window[codexPlusFastDialogKey](false); } catch {}
-  let codexPlusFastDialogState = null;
-
-  const codexPlusFastChoices = [
-    ["inherit", null, "跟随默认", "保留 Codex 的默认速度选择。"],
-    ["fast", "priority", "Fast", "将 Fast 设为本机 Codex 的默认速度。"],
-    ["standard", "default", "标准", "将标准速度设为本机 Codex 的默认速度。"],
-  ];
-
-  function codexPlusFastDialogEnabled() {
-    return typeof codexPlusComposerFastPreferenceEnabled === "function"
-      && codexPlusComposerFastPreferenceEnabled() === true;
-  }
-
-  function codexPlusFastDialogCurrent(state, operation = null) {
-    if (!state || state.closed || codexPlusFastDialogState !== state
-        || window[codexPlusFastDialogKey] !== state.close) return false;
-    if (state.generation !== window.__codexPlusBackendGeneration || !codexPlusFastDialogEnabled()) {
-      state.close();
-      return false;
-    }
-    return operation === null || operation === state.operation;
-  }
-
-  function codexPlusFastDialogInstallStyle() {
-    if (document.getElementById(codexPlusFastDialogStyleId)) return;
-    const style = document.createElement("style");
-    style.id = codexPlusFastDialogStyleId;
-    if (typeof markCodexPlusExtensionNode === "function") markCodexPlusExtensionNode(style, "builtin-fast-preference");
-    else style.setAttribute("data-codex-plus-ext", "builtin-fast-preference");
-    style.textContent = `
-      dialog.codex-plus-fast-preference { width:min(520px,calc(100vw - 32px)); max-width:calc(100vw - 32px); max-height:calc(100dvh - 32px); padding:0; border:0; overflow:visible; background:transparent; color:inherit; }
-      dialog.codex-plus-fast-preference::backdrop { background:var(--modal-backdrop-dim-shadow,rgba(0,0,0,.32)); backdrop-filter:blur(1px); }
-      dialog.codex-plus-fast-preference .codex-plus-modal-content { box-sizing:border-box; width:100%; max-width:100%; max-height:calc(100dvh - 32px); }
-      dialog.codex-plus-fast-preference .codex-plus-modal-header { padding:16px 20px 10px; }
-      dialog.codex-plus-fast-preference .codex-plus-modal-title { font-size:16px; }
-      .codex-plus-fast-preference-body { display:grid; gap:12px; padding:8px 20px 18px; overflow:auto; }
-      .codex-plus-fast-preference-copy { margin:0; color:var(--codex-plus-text-secondary); line-height:1.5; }
-      .codex-plus-fast-preference-status { display:grid; gap:3px; padding:10px 12px; border:1px solid var(--codex-plus-border); border-radius:var(--border-radius-lg,8px); }
-      .codex-plus-fast-preference-status p { margin:0; }
-      .codex-plus-fast-preference-effective { color:var(--codex-plus-text-secondary); }
-      .codex-plus-fast-preference-options { display:grid; gap:7px; min-width:0; margin:0; padding:0; border:0; }
-      .codex-plus-fast-preference-options legend { margin-bottom:5px; padding:0; font-weight:600; }
-      .codex-plus-fast-preference-option { display:flex; align-items:flex-start; gap:9px; padding:9px 11px; border:1px solid var(--codex-plus-border); border-radius:var(--border-radius-lg,8px); cursor:pointer; }
-      .codex-plus-fast-preference-option[data-selected="true"] { border-color:var(--color-token-text-accent,var(--codex-plus-text-accent,#4267e8)); background:var(--codex-plus-bg-selected); }
-      .codex-plus-fast-preference-option input { flex:0 0 auto; margin:3px 0 0; accent-color:var(--color-token-text-accent,var(--codex-plus-text-accent,#4267e8)); }
-      .codex-plus-fast-preference-option-copy { display:grid; gap:2px; }
-      .codex-plus-fast-preference-option-detail { color:var(--codex-plus-text-secondary); }
-      .codex-plus-fast-preference-message { min-height:1.4em; margin:0; color:var(--codex-plus-text-secondary); white-space:pre-wrap; }
-      .codex-plus-fast-preference-message[data-tone="error"] { color:var(--codex-plus-danger,#b42318); }
-      .codex-plus-fast-preference-actions { display:flex; justify-content:flex-end; gap:8px; }
-      .codex-plus-fast-preference-actions button { min-height:32px; padding:5px 12px; border:1px solid var(--codex-plus-border); border-radius:var(--border-radius-lg,8px); background:var(--codex-plus-bg-secondary); color:var(--codex-plus-text); font:inherit; cursor:pointer; }
-      .codex-plus-fast-preference-actions button:hover:not(:disabled) { background:var(--codex-plus-bg-hover); }
-      .codex-plus-fast-preference-actions button[data-primary="true"] { border-color:var(--codex-plus-text-accent,#4267e8); background:var(--codex-plus-text-accent,#4267e8); color:var(--codex-plus-text-on-accent,#fff); }
-      .codex-plus-fast-preference-actions button:disabled { cursor:default; opacity:.55; }
-      dialog.codex-plus-fast-preference :focus-visible { outline:2px solid var(--color-token-text-accent,var(--codex-plus-text-accent,#4267e8)); outline-offset:2px; }
-      @media (max-width:480px) { dialog.codex-plus-fast-preference { width:calc(100vw - 24px); max-width:calc(100vw - 24px); } dialog.codex-plus-fast-preference .codex-plus-modal-header { padding:14px 16px 8px; } .codex-plus-fast-preference-body { padding:8px 16px 16px; } }
-    `;
-    (document.head || document.documentElement).append(style);
-  }
-
-  function codexPlusFastDialogChoice(value) {
-    if (value === null) return "inherit";
-    if (typeof value !== "string") return "";
-    const normalized = value.toLowerCase();
-    return normalized === "priority" ? "fast" : normalized === "default" ? "standard" : "";
-  }
-
-  function codexPlusFastDialogLabel(value) {
-    if (value === null) return "由 Codex / 模型决定";
-    if (typeof value !== "string") return "未确认";
-    switch (value.toLowerCase()) {
-      case "priority":
-      case "fast": return "Fast";
-      case "default":
-      case "standard": return "标准";
-      case "ultrafast":
-      case "ultra-fast":
-      case "ultra_fast": return "Ultra Fast（超快）";
-      case "flex": return "Flex（灵活）";
-      default: return "其他档位";
-    }
-  }
-
-  function codexPlusFastDialogSafeError(error) {
-    const message = typeof error?.fastPreferenceMessage === "string"
-      ? error.fastPreferenceMessage.trim().replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 240)
-      : "";
-    return message || "读取或保存 Fast 速度偏好失败，请重试。";
-  }
-
-  function codexPlusFastDialogUsable(snapshot) {
-    return !!snapshot && typeof snapshot === "object"
-      && Object.prototype.hasOwnProperty.call(snapshot, "tier")
-      && (snapshot.stored === null || typeof snapshot.stored === "string");
-  }
-
-  function codexPlusFastDialogMessage(state, text, tone = "") {
-    const node = state.dialog.querySelector("[data-fast-pref-message]");
-    if (!node) return;
-    node.textContent = text;
-    node.setAttribute("role", tone === "error" ? "alert" : "status");
-    if (tone) node.dataset.tone = tone;
-    else delete node.dataset.tone;
-  }
-
-  function codexPlusFastDialogBusy(state, busy) {
-    state.busy = busy;
-    state.dialog.setAttribute("aria-busy", String(busy));
-    state.dialog.querySelectorAll("input[name='codex-plus-fast-choice']").forEach((input) => {
-      input.disabled = busy || !state.snapshot;
-    });
-    const apply = state.dialog.querySelector("[data-fast-pref-apply]");
-    if (apply) apply.disabled = busy || !state.snapshot || state.desired === state.snapshot.stored;
-    const retry = state.dialog.querySelector("[data-fast-pref-retry]");
-    if (retry) retry.hidden = !state.needsRetry;
-  }
-
-  function codexPlusFastDialogRender(state, snapshot, overridden = false) {
-    state.snapshot = snapshot;
-    state.desired = snapshot.stored;
-    state.needsRetry = false;
-    const saved = snapshot.stored === null ? "跟随默认" : codexPlusFastDialogLabel(snapshot.stored);
-    const effective = codexPlusFastDialogLabel(snapshot.tier);
-    const overriddenNow = overridden === true || (snapshot.stored != null && snapshot.stored !== snapshot.tier);
-    state.dialog.querySelector("[data-fast-pref-saved]").textContent = `保存的选择：${saved}。`;
-    state.dialog.querySelector("[data-fast-pref-effective]").textContent = overriddenNow
-      ? `当前配置：${effective}（被更高优先级配置覆盖）。`
-      : `当前配置：${effective}。`;
-    const selected = codexPlusFastDialogChoice(snapshot.stored);
-    state.dialog.querySelectorAll("input[name='codex-plus-fast-choice']").forEach((input) => {
-      input.checked = input.value === selected;
-      input.closest("label")?.setAttribute("data-selected", String(input.checked));
-    });
-    codexPlusFastDialogMessage(state, overriddenNow ? "已保存偏好；当前配置由更高优先级配置决定。" : "", overriddenNow ? "success" : "");
-    codexPlusFastDialogBusy(state, false);
-  }
-
-  function codexPlusFastDialogCloseState(state, restoreFocus = true) {
-    if (!state || state.closed) return;
-    state.closed = true;
-    state.operation += 1;
-    state.observer?.disconnect();
-    state.dialog.removeEventListener("cancel", state.onCancel);
-    state.dialog.removeEventListener("close", state.onNativeClose);
-    state.dialog.removeEventListener("click", state.onDialogClick);
-    window.removeEventListener("keydown", state.onEscape, true);
-    if (state.dialog.open) { try { state.dialog.close(); } catch {} }
-    state.dialog.remove();
-    if (window[codexPlusFastDialogKey] === state.close) delete window[codexPlusFastDialogKey];
-    if (codexPlusFastDialogState === state) codexPlusFastDialogState = null;
-    if (!restoreFocus || state.generation !== window.__codexPlusBackendGeneration) return;
-    const target = state.button?.isConnected ? state.button : state.previousFocus?.isConnected ? state.previousFocus : null;
-    try { target?.focus?.({ preventScroll: true }); } catch { try { target?.focus?.(); } catch {} }
-  }
-
-  async function codexPlusFastDialogRead(state, notice = "") {
-    if (!codexPlusFastDialogCurrent(state)) return;
-    const operation = ++state.operation;
-    state.snapshot = null;
-    state.desired = null;
-    state.needsRetry = false;
-    codexPlusFastDialogBusy(state, true);
-    state.dialog.querySelector("[data-fast-pref-saved]").textContent = "保存的选择：读取中…";
-    state.dialog.querySelector("[data-fast-pref-effective]").textContent = "当前配置：读取中…";
-    codexPlusFastDialogMessage(state, notice || "正在读取本机速度偏好…", notice ? "error" : "");
-    try {
-      if (typeof codexPlusFastPreferenceClient !== "function" || typeof codexPlusReadFastPreference !== "function") throw new Error();
-      const client = state.client || codexPlusFastPreferenceClient();
-      if (!codexPlusFastDialogCurrent(state, operation)) return;
-      if (!client) throw new Error();
-      state.client = client;
-      const snapshot = await codexPlusReadFastPreference(client);
-      if (!codexPlusFastDialogCurrent(state, operation)) return;
-      if (!codexPlusFastDialogUsable(snapshot)) throw new Error();
-      codexPlusFastDialogRender(state, snapshot);
-      if (notice) codexPlusFastDialogMessage(state, notice, "error");
-    } catch (error) {
-      if (!codexPlusFastDialogCurrent(state, operation)) return;
-      state.snapshot = null;
-      state.desired = null;
-      state.needsRetry = true;
-      state.dialog.querySelector("[data-fast-pref-saved]").textContent = "保存的选择：暂不可读取。";
-      state.dialog.querySelector("[data-fast-pref-effective]").textContent = "当前配置：暂不可读取。";
-      codexPlusFastDialogMessage(state, notice ? `${notice} ${codexPlusFastDialogSafeError(error)}` : codexPlusFastDialogSafeError(error), "error");
-      codexPlusFastDialogBusy(state, false);
-    }
-  }
-
-  async function codexPlusFastDialogApply(state) {
-    if (!codexPlusFastDialogCurrent(state) || state.busy || !state.snapshot
-        || state.desired === state.snapshot.stored) return;
-    if (typeof codexPlusWriteFastPreference !== "function" || !state.client) {
-      await codexPlusFastDialogRead(state, "本机速度偏好服务暂不可用，请重试。");
-      return;
-    }
-    const operation = ++state.operation;
-    const snapshot = state.snapshot;
-    const desired = state.desired;
-    state.snapshot = null;
-    state.needsRetry = false;
-    codexPlusFastDialogBusy(state, true);
-    codexPlusFastDialogMessage(state, "正在保存设置…");
-    try {
-      const result = await codexPlusWriteFastPreference(state.client, snapshot, desired);
-      if (!codexPlusFastDialogCurrent(state, operation)) return;
-      if (!codexPlusFastDialogUsable(result)) throw new Error();
-      codexPlusFastDialogRender(state, result, result.overridden === true);
-      codexPlusFastDialogMessage(state, result.overridden === true
-        ? "已保存选择，但当前配置仍由更高优先级配置决定。"
-        : "速度偏好已保存。", "success");
-    } catch (error) {
-      if (!codexPlusFastDialogCurrent(state, operation)) return;
-      await codexPlusFastDialogRead(state, `保存未完成。${codexPlusFastDialogSafeError(error)}`);
-    }
-  }
-
-  function codexPlusFastDialogCreate(button) {
-    const dialog = document.createElement("dialog");
-    dialog.className = "codex-plus-fast-preference";
-    dialog.setAttribute("aria-labelledby", "codex-plus-fast-dialog-title");
-    dialog.setAttribute("aria-describedby", "codex-plus-fast-dialog-copy");
-    dialog.innerHTML = `
-      <div class="codex-plus-modal-content">
-        <header class="codex-plus-modal-header">
-          <h2 class="codex-plus-modal-title" id="codex-plus-fast-dialog-title">Fast 速度偏好</h2>
-          <button class="codex-plus-modal-close" type="button" data-fast-pref-close aria-label="关闭">×</button>
-        </header>
-        <div class="codex-plus-fast-preference-body">
-          <p class="codex-plus-fast-preference-copy" id="codex-plus-fast-dialog-copy">设置本机 Codex 的默认速度。实际档位与费用取决于模型和供应商；更改偏好本身不会改变当前速度。</p>
-          <section class="codex-plus-fast-preference-status" aria-label="速度偏好与当前配置">
-            <p data-fast-pref-saved>保存的选择：读取中…</p>
-            <p class="codex-plus-fast-preference-effective" data-fast-pref-effective>当前配置：读取中…</p>
-          </section>
-          <fieldset class="codex-plus-fast-preference-options" data-fast-pref-options>
-            <legend>保存的默认偏好</legend>
-            ${codexPlusFastChoices.map(([value, , label, detail]) => `
-              <label class="codex-plus-fast-preference-option">
-                <input type="radio" name="codex-plus-fast-choice" value="${value}">
-                <span class="codex-plus-fast-preference-option-copy"><strong>${label}</strong><span class="codex-plus-fast-preference-option-detail">${detail}</span></span>
-              </label>`).join("")}
-          </fieldset>
-          <p class="codex-plus-fast-preference-message" data-fast-pref-message role="status" aria-live="polite"></p>
-          <footer class="codex-plus-fast-preference-actions">
-            <button type="button" data-fast-pref-retry hidden>重新读取</button>
-            <button type="button" data-fast-pref-close>关闭</button>
-            <button type="button" data-fast-pref-apply data-primary="true" disabled>保存</button>
-          </footer>
-        </div>
-      </div>`;
-    if (typeof markCodexPlusExtensionNode === "function") markCodexPlusExtensionNode(dialog, "builtin-fast-preference");
-    else dialog.setAttribute("data-codex-plus-ext", "builtin-fast-preference");
-
-    const state = {
-      button, dialog, generation: codexPlusBackendGeneration, previousFocus: document.activeElement,
-      snapshot: null, client: null, desired: null, operation: 0, busy: false, closed: false, needsRetry: false, observer: null,
-      close: (restoreFocus = true) => codexPlusFastDialogCloseState(state, restoreFocus),
-    };
-    dialog.querySelectorAll("input[name='codex-plus-fast-choice']").forEach((input) => input.addEventListener("change", () => {
-      if (!codexPlusFastDialogCurrent(state) || state.busy || !state.snapshot) return;
-      state.desired = codexPlusFastChoices.find(([value]) => value === input.value)?.[1];
-      dialog.querySelectorAll(".codex-plus-fast-preference-option").forEach((label) => {
-        label.dataset.selected = String(label.querySelector("input")?.checked === true);
-      });
-      codexPlusFastDialogBusy(state, false);
-      codexPlusFastDialogMessage(state, "");
-    }));
-    dialog.querySelector("[data-fast-pref-apply]").addEventListener("click", () => { void codexPlusFastDialogApply(state); });
-    dialog.querySelector("[data-fast-pref-retry]").addEventListener("click", () => { void codexPlusFastDialogRead(state); });
-    dialog.querySelectorAll("[data-fast-pref-close]").forEach((close) => close.addEventListener("click", () => state.close()));
-    state.onCancel = (event) => { event.preventDefault(); state.close(); };
-    state.onEscape = (event) => {
-      if (event.key !== "Escape" || state.closed || !dialog.open) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      state.close();
-    };
-    state.onNativeClose = () => { if (!state.closed) state.close(); };
-    state.onDialogClick = (event) => { if (event.target === dialog) state.close(); };
-    dialog.addEventListener("cancel", state.onCancel);
-    dialog.addEventListener("close", state.onNativeClose);
-    dialog.addEventListener("click", state.onDialogClick);
-    window.addEventListener("keydown", state.onEscape, true);
-    return state;
-  }
-
-  function closeCodexPlusFastPreference() {
-    if (codexPlusFastDialogState) codexPlusFastDialogState.close();
-    else if (typeof window[codexPlusFastDialogKey] === "function") window[codexPlusFastDialogKey]();
-  }
-
-  async function openCodexPlusFastPreference(button) {
-    if (!button || !codexPlusFastDialogEnabled()
-        || codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
-    const current = codexPlusFastDialogState;
-    if (current && !current.closed && current.dialog?.open
-        && current.generation === window.__codexPlusBackendGeneration) {
-      codexPlusFastDialogState = current;
-      (current.dialog.querySelector("input[name='codex-plus-fast-choice']:checked")
-        || current.dialog.querySelector("[data-fast-pref-close]"))?.focus?.({ preventScroll: true });
-      return;
-    }
-    current?.close?.(false);
-    codexPlusFastDialogState = null;
-    document.getElementById("codex-plus-fast-preference-dialog")?.remove();
-    codexPlusFastDialogInstallStyle();
-    const state = codexPlusFastDialogCreate(button);
-    state.dialog.id = "codex-plus-fast-preference-dialog";
-    codexPlusFastDialogState = state;
-    window[codexPlusFastDialogKey] = state.close;
-    document.body.append(state.dialog);
-    try { state.dialog.showModal(); } catch { state.close(false); return; }
-    state.observer = new MutationObserver(() => {
-      if (state.generation !== window.__codexPlusBackendGeneration || !codexPlusFastDialogEnabled()) state.close();
-    });
-    state.observer.observe(document.body, { childList: true, subtree: true });
-    void codexPlusFastDialogRead(state);
   }
   /**
    * 消息插槽与侧边面板。
@@ -39512,7 +38911,7 @@ ${key} = ${value}`]);
       // 以下由 Rust 侧（启动、注入、本地代理）按设置项生效，多数要重启 Codex，页面侧只登记。被顶替时 Rust 侧按
       // 「关」处理（builtin_takeover），顶替它的拓展用 preload（页面最早期脚本）、launch（启动前后）、网关中间件写等价功能。
       { id: "model-whitelist-unlock", name: "模型白名单解锁" },
-      { id: "native-fast-unlock", name: "Fast 速度按钮" },
+      { id: "native-fast-unlock", name: "原生 Fast 强制解锁" },
       { id: "native-predictions", name: "原生输入预测" },
       { id: "reported-usage-compaction", name: "按上报用量判断压缩（实验）" },
       { id: "reasoning-collapse", name: "第三方模型回答完自动折叠过程" },

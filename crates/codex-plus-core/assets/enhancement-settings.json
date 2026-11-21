@@ -9,7 +9,7 @@
     {
       "id": "plugins",
       "title": "模型与插件",
-      "description": "插件市场、模型列表、Fast 速度按钮与 Codex 实验开关。",
+      "description": "插件市场、模型列表、原生 Fast 与 Codex 实验开关。",
       "managerTab": "general"
     },
     {
@@ -134,11 +134,12 @@
       "builtin": "native-fast-unlock",
       "group": "plugins",
       "control": "bool",
-      "title": "Fast 速度按钮",
-      "description": "输入框下方的 Fast 按钮可设置本机 Codex 默认速度。实际档位与费用取决于模型和供应商；开启此选项本身不会更改速度。",
+      "title": "原生 Fast 强制解锁",
+      "description": "纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。",
       "surfaces": [
         "codex"
-      ]
+      ],
+      "restart": true
     },
     {
       "key": "codexAppNativePredictions",

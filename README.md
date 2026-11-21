@@ -195,7 +195,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
     <td valign="top"><strong>📈 用量状态栏</strong><br>输出吞吐、缓存命中与上下文占用。</td>
   </tr>
   <tr>
-    <td valign="top"><strong>⚡ Fast 速度按钮</strong><br>输入框下方的 Fast 按钮可设置本机 Codex 默认速度；档位与费用取决于模型和供应商。</td>
+    <td valign="top"><strong>⚡ API Key 原生 Fast</strong><br>纯 API Key 也能用 Standard / Fast 控件。</td>
     <td valign="top"><strong>🧰 MCP、Skills 与插件市场</strong><br>MCP、Skills 按 Agent 启用；Codex 插件市场可装可卸。</td>
   </tr>
   <tr>
@@ -309,7 +309,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
 
 <table>
   <tr>
-    <td width="50%" valign="top"><strong>Codex 增强</strong><br><img src="docs/images/readme-preview/codex-enhance.webp" alt="Codex 增强：插件市场解锁、模型白名单、Fast 速度按钮、输入预测、会话删除等开关" width="100%"></td>
+    <td width="50%" valign="top"><strong>Codex 增强</strong><br><img src="docs/images/readme-preview/codex-enhance.webp" alt="Codex 增强：插件市场解锁、模型白名单、原生 Fast、输入预测、会话删除等开关" width="100%"></td>
     <td width="50%" valign="top"><strong>Claude 增强版</strong><br><img src="docs/images/readme-preview/claude-enhance.webp" alt="Claude 增强版：受管增强版已准备，可开关界面汉化、语音输入与 Computer Use" width="100%"></td>
   </tr>
   <tr>
@@ -366,13 +366,13 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
 **鲸鱼功能来源与鸣谢：**原始功能、完整界面引擎、鲸鱼角色及内置音效/动图来自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)，本项目将其适配为 Codex++ 内置功能；Codex 桌面版技术路线另参考 [Yang-huai406/Codex-Whale-Public](https://github.com/Yang-huai406/Codex-Whale-Public)。原始代码与素材声明见随项目保留的 [LICENSE](assets/inject/upstream/whale-widget/LICENSE) 和 [PROVENANCE.md](assets/inject/upstream/whale-widget/PROVENANCE.md)，素材不重新声明为本项目原创。
 
 <details>
-  <summary><strong>如何设置本机 Codex 默认速度</strong></summary>
+  <summary><strong>纯 API Key 如何开启原生 Fast</strong></summary>
 
-1. 打开「Codex → 内置拓展」，开启顶部的「启用内置拓展」总开关与「Fast 速度按钮」（默认关闭）。
+1. 打开「Codex → 内置拓展」，开启顶部的「启用内置拓展」总开关与「原生 Fast 强制解锁」（默认关闭）。
 2. 直连模式在「Codex → 连接与供应商」中为该模型设置「Fast（priority）支持」并保存；网关模式下模型组里每个成员都支持 Fast 时，选这个组也能开 Fast。
-3. 在输入框下方打开 **Fast** 按钮，设置本机 Codex 的默认速度。开启「Fast 速度按钮」选项本身不会更改速度。
+3. 从 Codex++ 重启 Codex，在模型菜单中选择 **⚡ Fast**。
 
-实际档位与费用取决于模型和供应商。
+实际可用性与计费由供应商决定。
 
 </details>
 
@@ -389,7 +389,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
 
 **3. 接入 Agent**：打开「网关 → Agent 接入」，给要用的 Agent 打开开关并选默认模型。Claude Code、Grok 接入后照常在终端里用。
 
-**4. 启动 Codex**：点 Codex 页右上角的「启动 Codex」或侧栏 Codex 行的启动按钮。依赖注入的设置改完后，大部分增强需从 Codex++ 重启 Codex 才生效。
+**4. 启动 Codex**：点 Codex 页右上角的「启动 Codex」或侧栏 Codex 行的启动按钮。依赖注入的设置（大部分增强、Fast 解锁等）改完后需从 Codex++ 重启 Codex 才生效。
 
 不想用网关？直连模式照旧：在「Codex → 连接与供应商」顶部把「连接方式」切到「直连」，选供应商后启动即可。完整步骤见官网 [使用教程](https://codexpp.cc/guide.html)。
 

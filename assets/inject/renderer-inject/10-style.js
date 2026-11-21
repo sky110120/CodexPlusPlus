@@ -1138,6 +1138,7 @@
       .codex-plus-row:first-child { border-top: 0; }
       .codex-plus-row-title { font-weight: 550; line-height: 1.35; }
       .codex-plus-row-description { margin-top: 2px; color: #a1a1aa; font-size: 13px; line-height: 1.4; }
+      .codex-plus-row-description[data-codex-plus-native-fast-status][data-failed="true"] { color: #f59e0b; }
       .codex-plus-model-compat-warning { margin-top: 6px; color: #fbbf24; font-size: 13px; line-height: 1.45; }
       .codex-plus-toggle {
         width: 42px;
@@ -1314,7 +1315,7 @@
       .codex-plus-row-description,
       .codex-plus-about,
       .codex-plus-backend-label,
-      .codex-plus-form-message,
+      .codex-plus-form-message { color: var(--codex-plus-text-secondary); }
       .codex-delete-confirm-actions button,
       .codex-plus-action-button,
       .codex-plus-issue-button {

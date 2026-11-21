@@ -299,12 +299,12 @@
         <div class="card-body">
           <h3>Codex 增强</h3>
           <ul>
-            <li>插件市场解锁、模型白名单、Fast 速度按钮</li>
+            <li>插件市场解锁、模型白名单、纯 API Key 原生 Fast</li>
             <li>会话删除可撤销、Markdown 导出、轮次回退</li>
             <li>语音输入、输入预测、粘贴修复、下一步建议</li>
           </ul>
         </div>
-        <a class="card-shot" href="assets/codex-enhance.webp" data-zoom><img src="assets/codex-enhance.webp" alt="Codex 增强：插件市场解锁、模型白名单、Fast 速度按钮、输入预测、会话删除等开关" loading="lazy"></a>
+        <a class="card-shot" href="assets/codex-enhance.webp" data-zoom><img src="assets/codex-enhance.webp" alt="Codex 增强：插件市场解锁、模型白名单、原生 Fast、输入预测、会话删除等开关" loading="lazy"></a>
       </article>
       <article class="card reveal">
         <div class="card-body">
@@ -331,8 +331,8 @@
     <div class="minis">
       <article class="mini reveal">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>
-        <h4>Fast 速度按钮</h4>
-        <p>输入框下方的 Fast 按钮可设置本机 Codex 默认速度；档位与费用取决于模型和供应商。</p>
+        <h4>API Key 原生 Fast</h4>
+        <p>纯 API Key 也能用 Standard / ⚡ Fast 控件。</p>
       </article>
       <article class="mini reveal">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg>
@@ -820,8 +820,8 @@ your-model<span class="h">[128000]</span></pre>
           <div class="faq-a"><p>增强脚本只挂载到从 <b>Codex++</b> 启动的官方应用上。自己打开的 Codex，侧栏 Codex 行会提示「未挂载」，它的按钮变成「重启并挂载」，点一下即可。仍然没有时，到「设置 → Codex」（含安装维护）和「设置 → 日志与诊断」检查应用路径、启动状态和诊断日志。macOS 上也可以打开「自动接管官方 App」，自己双击启动官方 App 时由 Codex++ 接管。</p></div>
         </details>
         <details class="faq-item" id="faq-native-fast">
-          <summary>为什么看不到输入框下方的 Fast 按钮？<span class="faq-x" aria-hidden="true"></span></summary>
-          <div class="faq-a"><p>确认已开启「Fast 速度按钮」选项，并检查模型的 Fast（priority）支持。直连模式在「Codex → 连接与供应商」中为模型启用该支持并保存；网关模式下，模型组里的每个成员都支持 Fast 时即可使用。然后从输入框下方的 Fast 按钮设置本机 Codex 默认速度。开启选项本身不会更改速度；实际档位与费用取决于模型和供应商。</p></div>
+          <summary>开启原生 Fast 后，为什么仍然看不到开关？<span class="faq-x" aria-hidden="true"></span></summary>
+          <div class="faq-a"><p>先确认已经保存，并通过 Codex++ 重启 Codex。直连模式在「Codex → 连接与供应商」中打开该模型的配置，设置「Fast（priority）支持」，保存模型与供应商后重启；网关模式下模型组里每个成员都支持 Fast 时，选这个组也能开 Fast。此功能只恢复客户端入口，服务限制与计费仍以供应商为准。</p></div>
         </details>
         <details class="faq-item">
           <summary>增强功能可以关闭吗？官方应用更新后还能用吗？<span class="faq-x" aria-hidden="true"></span></summary>

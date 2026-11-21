@@ -212,9 +212,6 @@ let detectedPlatform = "windows";
 let releaseAssets = new Map();
 let releaseVersion = null;
 let repositoryStars = null;
-let sponsorState = "loading";
-let sponsorCount = 0;
-let sponsorsLoading = false;
 
 const translate = (text) => currentLanguage === "en" ? (translations[text] || text) : text;
 
@@ -284,7 +281,6 @@ const updateDynamicLabels = () => {
     element.textContent = releaseVersion || translate("GitHub 最新发布");
   });
   releaseAssets.forEach(({ asset, legacyMacBuilds }, platform) => setPlatformAsset(platform, asset, legacyMacBuilds));
-  updateSponsorStatus();
 
   if (Number.isFinite(repositoryStars)) {
     const compact = new Intl.NumberFormat(currentLanguage === "zh" ? "zh-CN" : "en-US", {
@@ -384,6 +380,10 @@ const updateRepositoryStats = async () => {
   }
 };
 
+/* 赞助商广告停用，保留清单和渲染实现供维护。
+let sponsorState = "loading";
+let sponsorCount = 0;
+let sponsorsLoading = false;
 // 与管理工具共用远端清单，不保留需要单独维护的品牌名单或图片映射。
 const sponsorSources = [
   "https://ads.codexpp.cc/ads.json",
@@ -544,6 +544,7 @@ const setupSponsors = () => {
   document.querySelector("[data-sponsor-retry]")?.addEventListener("click", updateSponsors);
   updateSponsors();
 };
+*/
 
 const platformFromDevice = () => {
   const platform = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent;

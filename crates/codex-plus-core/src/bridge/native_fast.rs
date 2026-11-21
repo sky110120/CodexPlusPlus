@@ -57,7 +57,7 @@ impl ModuleSettings {
         }
     }
 
-    /// 只选择已启用的改写器需要的块。
+    /// 只拦截开启的改写器需要的块；仅开 Fast 时保持原来只拦截 app-initial。
     fn prefixes(&self) -> Vec<&'static str> {
         let mut prefixes = Vec::new();
         let groups = [
@@ -100,16 +100,16 @@ pub(super) async fn install(
     websocket_url: &str,
     generation: BridgeGeneration,
 ) -> anyhow::Result<()> {
-    // Fast / 输入预测被拓展顶替时按「关」处理。
+    // 原生 Fast / 输入预测被拓展顶替时按「关」处理，交给拓展自己的 preload 脚本。
     let settings = crate::builtin_takeover::load_effective_settings()?;
-    let module_settings = ModuleSettings::load(&settings);
-    let prefixes = module_settings.prefixes();
-    if prefixes.is_empty() {
+    if !crate::native_predictions::native_modules_requested(&settings) {
         return Ok(());
     }
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
     let mut state = InterceptorState::default();
+    let module_settings = ModuleSettings::load(&settings);
+    let prefixes = module_settings.prefixes();
     let bootstrap = bootstrap_script(module_settings);
     let initialized = async {
         let location = evaluate(&mut session, "location.protocol").await?;
@@ -851,32 +851,6 @@ mod tests {
                 codex_app_native_predictions: predictions,
                 native_predictions_local_api_configured: local_api,
             },
-        }
-    }
-
-    #[test]
-    fn configured_fast_requires_a_local_custom_api() {
-        use crate::native_fast::CustomResponsesAuth::{NoOpenAiLoginRequired, NotVerified, ProviderBearer};
-        let mut settings = crate::settings::BackendSettings::default();
-        settings.enhancements_enabled = true;
-        settings.codex_app_native_fast_unlock = true;
-        for (auth, local_api, predictions, prefixes) in [
-            (NotVerified, false, false, &[][..]),
-            (NotVerified, false, true, PREDICTIONS_PREFIXES),
-            (NoOpenAiLoginRequired, true, false, FAST_PREFIXES),
-            (NoOpenAiLoginRequired, true, true, PREDICTIONS_PREFIXES),
-            (ProviderBearer, false, false, FAST_PREFIXES),
-        ] {
-            settings.codex_app_native_predictions = predictions;
-            let modules = ModuleSettings {
-                fast: crate::native_fast::runtime_settings_with_auth(&settings, auth),
-                predictions: crate::native_predictions::runtime_settings_with_local_api(
-                    &settings, local_api,
-                ),
-            };
-            assert_eq!(modules.prefixes(), prefixes);
-            assert_eq!(modules.fast.codex_app_native_fast_unlock, auth.supports_native_fast());
-            assert_eq!(modules.fast.native_fast_local_api_configured, local_api);
         }
     }
 

@@ -13,70 +13,25 @@ pub(crate) struct RuntimeSettings {
     pub native_fast_local_api_configured: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CustomResponsesAuth {
-    NotVerified,
-    NoOpenAiLoginRequired,
-    ProviderBearer,
-}
-
-impl CustomResponsesAuth {
-    pub(crate) fn from_home(home: &Path) -> Self {
-        std::fs::read_to_string(home.join("config.toml"))
-            .ok()
-            .map_or(Self::NotVerified, |contents| {
-                custom_responses_auth_from_config(&contents)
-            })
-    }
-
-    pub(crate) fn supports_native_fast(self) -> bool {
-        self != Self::NotVerified
-    }
-
-    fn allows_missing_account(self) -> bool {
-        self == Self::NoOpenAiLoginRequired
-    }
-}
-
 pub(crate) fn runtime_settings(settings: &BackendSettings) -> RuntimeSettings {
-    runtime_settings_with_auth(
-        settings,
-        CustomResponsesAuth::from_home(&crate::codex_home::default_codex_home_dir()),
-    )
-}
-
-pub(crate) fn runtime_settings_with_auth(
-    settings: &BackendSettings,
-    auth: CustomResponsesAuth,
-) -> RuntimeSettings {
     RuntimeSettings {
         enhancements_enabled: settings.enhancements_enabled,
-        codex_app_native_fast_unlock: settings.codex_app_native_fast_unlock
-            && auth.supports_native_fast(),
-        native_fast_local_api_configured: auth.allows_missing_account(),
+        codex_app_native_fast_unlock: settings.codex_app_native_fast_unlock,
+        native_fast_local_api_configured: local_api_configured_from_home(
+            &crate::codex_home::default_codex_home_dir(),
+        ),
     }
-}
-
-/// 只为本机自定义 Responses 供应商适配原生入口。官方会话继续使用 Codex 自己的权限判断。
-pub(crate) fn native_module_requested_in_home(settings: &BackendSettings, home: &Path) -> bool {
-    settings.enhancements_enabled
-        && settings.codex_app_native_fast_unlock
-        && CustomResponsesAuth::from_home(home).supports_native_fast()
 }
 
 pub(crate) fn local_api_configured_from_home(home: &Path) -> bool {
-    CustomResponsesAuth::from_home(home).allows_missing_account()
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .is_some_and(|contents| local_api_configured_from_config(&contents))
 }
 
-#[cfg(test)]
 fn local_api_configured_from_config(contents: &str) -> bool {
-    custom_responses_auth_from_config(contents).allows_missing_account()
-}
-
-fn custom_responses_auth_from_config(contents: &str) -> CustomResponsesAuth {
-    use CustomResponsesAuth::{NoOpenAiLoginRequired, NotVerified, ProviderBearer};
     let Ok(document) = contents.parse::<DocumentMut>() else {
-        return NotVerified;
+        return false;
     };
     // 不从管理器的选中档案猜身份：关闭配置同步或外部编辑后，实际生效的配置可能不同。
     let profile = match document.get("profile") {
@@ -89,7 +44,7 @@ fn custom_responses_auth_from_config(contents: &str) -> CustomResponsesAuth {
                     .get(name)?
                     .as_table_like()
             }) else {
-                return NotVerified;
+                return false;
             };
             Some(profile)
         }
@@ -101,14 +56,14 @@ fn custom_responses_auth_from_config(contents: &str) -> CustomResponsesAuth {
         .map(str::trim)
         .filter(|id| !id.is_empty())
     else {
-        return NotVerified;
+        return false;
     };
     // 官方登录与 Bedrock 继续遵循原生身份门控，不能借配置覆盖放行空账号。
     if ["openai", "amazon-bedrock", "amazonBedrock"]
         .iter()
         .any(|reserved| provider_id.eq_ignore_ascii_case(reserved))
     {
-        return NotVerified;
+        return false;
     }
     let Some(provider) = document
         .get("model_providers")
@@ -116,45 +71,19 @@ fn custom_responses_auth_from_config(contents: &str) -> CustomResponsesAuth {
         .and_then(|providers| providers.get(provider_id))
         .and_then(Item::as_table_like)
     else {
-        return NotVerified;
+        return false;
     };
-    if provider.get("wire_api").and_then(Item::as_str) != Some("responses") {
-        return NotVerified;
+    // 只接受明确声明的 Responses API 连接。配置缺失、无效或身份未知时不放行。
+    if provider.get("requires_openai_auth").and_then(Item::as_bool) != Some(false)
+        || provider.get("wire_api").and_then(Item::as_str) != Some("responses")
+    {
+        return false;
     }
-    let Some(url) = provider
+    provider
         .get("base_url")
         .and_then(Item::as_str)
         .and_then(|value| reqwest::Url::parse(value.trim()).ok())
-        .filter(|url| matches!(url.scheme(), "http" | "https"))
-    else {
-        return NotVerified;
-    };
-    let Some(host) = url.host_str() else {
-        return NotVerified;
-    };
-    let host = host.trim_end_matches('.');
-    if ["openai.com", "chatgpt.com"].iter().any(|domain| {
-        host == *domain
-            || host
-                .strip_suffix(*domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    }) {
-        return NotVerified;
-    }
-    match provider.get("requires_openai_auth").and_then(Item::as_bool) {
-        Some(false) => NoOpenAiLoginRequired,
-        // 明确配置第三方 Bearer 的直连档案仍可使用原生 API key 身份；不替空账号放行，
-        // 不改登录设置，也不修改 Codex 的 requirements 或模型服务档位。
-        Some(true)
-            if provider
-                .get("experimental_bearer_token")
-                .and_then(Item::as_str)
-                .is_some_and(|token| !token.trim().is_empty()) =>
-        {
-            ProviderBearer
-        }
-        _ => NotVerified,
-    }
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 #[cfg(test)]
@@ -180,19 +109,6 @@ experimental_bearer_token = "private-fixture-token"
             "experimental_bearer_token = \"private-fixture-token\"",
             "env_key = \"CUSTOM_API_KEY\""
         )));
-        let with_login = CUSTOM.replace(
-            "requires_openai_auth = false",
-            "requires_openai_auth = true",
-        );
-        assert_eq!(
-            custom_responses_auth_from_config(&with_login),
-            CustomResponsesAuth::ProviderBearer
-        );
-        assert!(!local_api_configured_from_config(&with_login));
-        assert!(
-            !custom_responses_auth_from_config(&with_login.replace("private-fixture-token", " "))
-                .supports_native_fast()
-        );
     }
 
     #[test]
@@ -229,19 +145,6 @@ experimental_bearer_token = "private-fixture-token"
             assert!(!local_api_configured_from_config(
                 &CUSTOM.replace("custom", provider)
             ));
-        }
-        for host in ["api.openai.com", "chatgpt.com", "chatgpt.com."] {
-            let config = CUSTOM.replace("provider.example", host);
-            let with_login = config.replace(
-                "requires_openai_auth = false",
-                "requires_openai_auth = true",
-            );
-            for config in [config, with_login] {
-                assert_eq!(
-                    custom_responses_auth_from_config(&config),
-                    CustomResponsesAuth::NotVerified
-                );
-            }
         }
     }
 

@@ -1281,16 +1281,16 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
 #[tokio::test]
 async fn native_module_reload_runs_only_after_successful_opt_in_launch_injection() {
     let _state = crate::common::IsolatedTestState::new();
-    for (enhancements, native_fast, native_predictions, injection_ok, requires_auth) in [
-        (true, true, false, true, false),
-        (true, true, false, true, true),
-        (true, false, false, true, false),
-        (false, true, false, true, false),
-        (true, true, false, false, false),
-        (true, false, true, true, true),
-        (false, false, true, true, false),
-        (true, true, true, true, false),
-        (true, false, true, false, false),
+    // Fast 与输入预测共用一次启动重载；任一开启都要重载，两者都关时不碰页面。
+    for (enhancements, native_fast, native_predictions, injection_ok) in [
+        (true, true, false, true),
+        (true, false, false, true),
+        (false, true, false, true),
+        (true, true, false, false),
+        (true, false, true, true),
+        (false, false, true, true),
+        (true, true, true, true),
+        (true, false, true, false),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let app_dir = temp.path().join("Codex.app");
@@ -1303,15 +1303,6 @@ async fn native_module_reload_runs_only_after_successful_opt_in_launch_injection
             relay_profiles_enabled: false,
             ..BackendSettings::default()
         });
-        std::fs::write(
-            hooks.codex_home_dir().join("config.toml"),
-            format!(
-                "model_provider = \"custom\"\n[model_providers.custom]\n\
-                 wire_api = \"responses\"\nrequires_openai_auth = {requires_auth}\n\
-                 base_url = \"https://provider.example/v1\"\n",
-            ),
-        )
-        .unwrap();
         if !injection_ok {
             hooks = hooks.with_inject_error("fixture injection unavailable");
         }
@@ -1332,7 +1323,7 @@ async fn native_module_reload_runs_only_after_successful_opt_in_launch_injection
         let reload = events.iter().position(|event| event == "native-modules:9229");
         assert_eq!(
             reload.is_some(),
-            enhancements && (native_predictions || native_fast && !requires_auth) && injection_ok
+            enhancements && (native_fast || native_predictions) && injection_ok
         );
         if let Some(reload) = reload {
             let injection = events

@@ -94,128 +94,37 @@ test("reinjection removes the retired composer Fast badge", () => {
   assert.doesNotMatch(fragment("90-action-groups.js"), /function installCodexServiceTierBadge/);
 });
 
-const modelTierRenderer = (metadata: Record<string, unknown>, modelReasoningEfforts: () => unknown) => {
-  const source = fragment("70-model-catalog.js");
-  const context = vm.createContext({
-    codexPlusModelMetadata: () => metadata,
-    modelReasoningEfforts,
-    codexModelCatalog: { provider_name: "Provider" },
-  });
-  vm.runInContext([
-    "codexPlusModelTierIsFast", "codexPlusModelTierIdentity", "codexPlusMergeModelTiers",
-    "codexPlusModelDeclaredTierMetadata", "applyCodexPlusModelMetadata", "codexPlusModelDescriptor",
-    "codexPlusModelInputModalities", "codexPlusModelImageDetailOriginal",
-  ].map((name) => extract(source, name)).join("\n"), context);
-  return context;
-};
-const plain = (value: unknown) => JSON.parse(JSON.stringify(value));
-
-test("declared Fast merges into native descriptors without replacing other tiers or account access", () => {
+test("Fast flows into new-chat descriptors without changing native names or reasoning defaults", () => {
   const metadata: Record<string, unknown> = {
     prioritySupportOverride: true,
     serviceTiers: [{ id: "priority", name: "Fast", description: "Provider-declared priority" }],
-    additionalSpeedTiers: ["fast", "FAST"],
+    additionalSpeedTiers: ["fast"],
     supportedReasoningEfforts: [],
   };
-  const context = modelTierRenderer(metadata, () => { throw new Error("Fast does not configure reasoning choices"); });
-  const descriptor: Record<string, unknown> = {
-    displayName: "Native Grok", description: "Native details", defaultReasoningEffort: "high",
-    supportedReasoningEfforts: [{ reasoningEffort: "high" }], serviceTierAccess: true,
-    serviceTiers: [
-      { id: "flex", name: "Flex" },
-      { id: "priority", name: "Native priority", description: "Native description", usageMultiplier: 2 },
-      { id: "ultrafast", name: "Ultrafast", nativeBadge: "Beta" },
-    ],
-    additionalSpeedTiers: ["ultrafast", "slow", "ULTRAFAST"],
-  };
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), true);
-  assert.deepEqual(plain(descriptor.serviceTiers), [
-    { id: "flex", name: "Flex" },
-    { id: "priority", name: "Fast", description: "Provider-declared priority", usageMultiplier: 2 },
-    { id: "ultrafast", name: "Ultrafast", nativeBadge: "Beta" },
-  ]);
-  assert.deepEqual(plain(descriptor.additionalSpeedTiers), ["ultrafast", "slow", "fast"]);
-  assert.equal(descriptor.displayName, "Native Grok");
-  assert.equal(descriptor.description, "Native details");
-  assert.equal(descriptor.defaultReasoningEffort, "high");
-  assert.equal(descriptor.serviceTierAccess, true);
-  const stableTiers = descriptor.serviceTiers;
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), false);
-  assert.equal(descriptor.serviceTiers, stableTiers, "repeated injection leaves the descriptor unchanged");
-
+  const context = vm.createContext({
+    codexPlusModelMetadata: () => metadata,
+    codexModelCatalog: {},
+    structuredClone,
+    modelReasoningEfforts: () => { throw new Error("Fast does not configure reasoning choices"); },
+  });
+  vm.runInContext(["applyCodexPlusModelMetadata", "codexPlusModelDescriptor", "codexPlusModelServiceTiers", "codexPlusModelInputModalities", "codexPlusModelImageDetailOriginal"]
+    .map((name) => extract(fragment("70-model-catalog.js"), name)).join("\n"), context);
+  const descriptor = { displayName: "Native Grok", description: "Native details", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] };
+  const original = structuredClone(descriptor);
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), true);
+  assert.deepEqual(descriptor, { ...original, serviceTiers: metadata.serviceTiers, additionalSpeedTiers: ["fast"] });
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), false);
   context.modelReasoningEfforts = () => [];
-  const created = plain(context.codexPlusModelDescriptor("grok-custom"));
-  assert.deepEqual(created.serviceTiers, metadata.serviceTiers);
-  assert.deepEqual(created.additionalSpeedTiers, ["fast"]);
-  assert.equal("serviceTierAccess" in created, false);
-
+  const inserted = context.codexPlusModelDescriptor("chatgpt/gpt-6.2-astra");
+  assert.deepEqual(inserted.serviceTiers, metadata.serviceTiers);
+  assert.deepEqual(inserted.additionalSpeedTiers, ["fast"]);
   Object.assign(metadata, { displayName: "Explicit name", description: "Explicit details", defaultReasoningEffort: "low" });
   assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), true);
   assert.equal(descriptor.displayName, "Explicit name");
   assert.equal(descriptor.description, "Explicit details");
   assert.equal(descriptor.defaultReasoningEffort, "low");
-});
-
-test("empty model tier metadata does not erase tiers already present on a native descriptor", () => {
-  const metadata: Record<string, unknown> = { serviceTiers: [], additionalSpeedTiers: [] };
-  const context = modelTierRenderer(metadata, () => { throw new Error("no reasoning declaration"); });
-  const descriptor: Record<string, unknown> = {
-    serviceTiers: [{ id: "priority", name: "Fast" }],
-    additionalSpeedTiers: ["fast"],
-  };
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), false);
-  assert.deepEqual(descriptor.serviceTiers, [{ id: "priority", name: "Fast" }]);
-  assert.deepEqual(descriptor.additionalSpeedTiers, ["fast"]);
-});
-
-test("explicit Fast denial filters declarations and cached descriptor tiers but preserves other tiers", () => {
-  const metadata: Record<string, unknown> = {
-    prioritySupportOverride: false,
-    service_tiers: [
-      { id: "priority", name: "Fast" },
-      { id: "flex", name: "Flex" },
-      { id: "fast", name: "Fast" },
-      { id: "economy", name: "Economy" },
-    ],
-    additionalSpeedTiers: ["fast", "batch"],
-  };
-  const context = modelTierRenderer(metadata, () => []);
-  const descriptor: Record<string, unknown> = {
-    serviceTiers: [
-      { id: "priority", name: "Fast" },
-      { name: "Fast" },
-      { id: "native", name: "Native" },
-      { id: "flex", name: "Fast", qualifier: "Native Flex metadata" },
-      { id: "ultrafast", name: "Ultrafast" },
-    ],
-    additionalSpeedTiers: ["FAST", "native-speed", "ultrafast"],
-    serviceTierAccess: true,
-  };
-
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), true);
-  assert.deepEqual(plain(descriptor.serviceTiers), [
-    { id: "native", name: "Native" },
-    { id: "flex", name: "Flex", qualifier: "Native Flex metadata" },
-    { id: "ultrafast", name: "Ultrafast" },
-    { id: "economy", name: "Economy" },
-  ]);
-  assert.deepEqual(plain(descriptor.additionalSpeedTiers), ["native-speed", "ultrafast", "batch"]);
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), false);
-  assert.equal(descriptor.serviceTierAccess, true);
-
-  const created = plain(context.codexPlusModelDescriptor("grok-custom"));
-  assert.deepEqual(created.serviceTiers, [{ id: "flex", name: "Flex" }, { id: "economy", name: "Economy" }]);
-  assert.deepEqual(created.additionalSpeedTiers, ["batch"]);
-  assert.equal("serviceTierAccess" in created, false);
-});
-
-test("a Fast denial with no nonempty declaration filters only native Fast tiers", () => {
-  const context = modelTierRenderer({ prioritySupportOverride: false, serviceTiers: [] }, () => []);
-  const descriptor = {
-    serviceTiers: [{ id: "priority", name: "Fast" }, { id: "custom", name: "Fast" }, { id: "ultrafast", name: "Ultrafast" }],
-    additionalSpeedTiers: ["priority", "ultrafast", "flex"],
-  };
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "model"), true);
-  assert.deepEqual(plain(descriptor.serviceTiers), [{ id: "custom", name: "Fast" }, { id: "ultrafast", name: "Ultrafast" }]);
-  assert.deepEqual(plain(descriptor.additionalSpeedTiers), ["ultrafast", "flex"]);
+  Object.assign(metadata, { prioritySupportOverride: false, serviceTiers: [], additionalSpeedTiers: [] });
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), true);
+  assert.equal(JSON.stringify(Reflect.get(descriptor, "serviceTiers")), "[]");
+  assert.equal(JSON.stringify(Reflect.get(descriptor, "additionalSpeedTiers")), "[]");
 });
